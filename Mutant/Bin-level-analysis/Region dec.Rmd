@@ -1,0 +1,184 @@
+---
+title: "Region dec"
+output: html_document
+date: "2025-12-02"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(Matrix)
+library(spacexr)
+library(Matrix.utils)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(ggspavis)
+library(presto)
+library(clusterProfiler)
+```
+
+```{r}
+# 1. Extract Single-Cell Annotations
+# Adjust 'cell_type_column' if your Seurat metadata column has a different name
+cell_type_column <- "region_prediction"
+cell_types <- seurat_filtered@meta.data[[cell_type_column]]
+cell_types <- as.factor(cell_types)
+
+# Ensure the names of the cell types vector match the cell barcodes of the filtered matrix
+names(cell_types) <- colnames(sc_counts_filtered)
+
+# 2. Extract Spatial Coordinates
+# Ensure the coordinates are extracted and ordered to match the spots in the filtered matrix
+coords <- GetTissueCoordinates(seurat_obj)
+coords <- coords[colnames(spatial_counts_filtered), ] # Reorder/filter to match spots
+coords2 <- coords[, c("x", "y")]
+```
+
+```{r}
+## 1. Specify the Cell Type Column 
+sc_meta_data <- seurat_filtered@meta.data
+
+if (!cell_type_column %in% colnames(sc_meta_data)) {
+    stop(paste0("ERROR: Column '", cell_type_column, 
+                "' not found in seurat_filtered@meta.data."))
+}
+
+cell_types_raw <- sc_meta_data[[cell_type_column]]
+
+## 2. Robust Filtering Logic
+unassigned_placeholders <- c("", "NA", "Unassigned", "Unknown", "None", "-")
+
+is_valid_row <- !is.na(cell_types_raw) & 
+                !(as.character(cell_types_raw) %in% unassigned_placeholders)
+
+valid_meta_data <- sc_meta_data[is_valid_row, ]
+
+valid_barcodes <- rownames(valid_meta_data)
+
+if (length(valid_barcodes) == 0) {
+    stop("FATAL ERROR: All cells were filtered out by the 'unassigned_placeholders' check.")
+}
+
+## 3. Final Preparation of Single-Cell Components
+sc_counts_filtered_valid <- sc_counts_filtered[, intersect(colnames(sc_counts_filtered), valid_barcodes)]
+
+final_barcodes <- colnames(sc_counts_filtered_valid)
+
+cell_types <- factor(valid_meta_data[final_barcodes, cell_type_column])
+names(cell_types) <- final_barcodes
+
+if (length(levels(cell_types)) < 2) {
+    stop(paste0("Error: Only ", length(levels(cell_types)), 
+                " cell type(s) remain. RCTD requires at least two cell types."))
+}
+
+cat("Success! Reference data prepared with", length(final_barcodes), 
+    "cells and", length(levels(cell_types)), "cell types.\n")
+
+```
+
+```{r}
+## 4. Prepare colData and SummarizedExperiment
+ref_colData <- data.frame(
+    row.names = final_barcodes,
+    cell_type = cell_types 
+)
+
+reference_experiment <- SummarizedExperiment(
+    assays = list(counts = sc_counts_filtered_valid),
+    colData = ref_colData
+)
+
+all_spatial_meta <- seurat_obj@meta.data
+
+spatial_colData <- all_spatial_meta[colnames(spatial_counts_filtered), ]
+
+cat("Spatial colData created for", nrow(spatial_colData), "spots.\n")
+
+# 3. Create the SpatialExperiment object with the fixed numeric matrix
+spatial_experiment <- SpatialExperiment(
+    assays = list(counts = spatial_counts_filtered),
+    colData = spatial_colData,
+    spatialCoords = as.matrix(coords2) # spatialCoords must be a numeric matrix
+)
+
+cat("SpatialExperiment object created successfully after coordinate conversion!\n")
+```
+
+```{r}
+
+myRCTD <- spacexr::createRctd(
+    spatial_experiment = spatial_experiment,
+    reference_experiment = reference_experiment,
+    cell_type_col = "cell_type"
+ 
+)
+
+# 2. Run the deconvolution
+myRCTD <- spacexr::runRctd(myRCTD)
+
+cat("RCTD deconvolution complete. Results are stored in 'myRCTD'.\n")
+```
+
+```{r}
+# Extract the main proportion matrix (Cell types x Spots)
+# NOTE: The way you access assays in a SummarizedExperiment/SpatialExperiment is
+# generally with 'assay()' or '@assays$'
+proportions_df <- as.data.frame(assay(myRCTD, "weights"))
+head(proportions_df[, 1:5])
+```
+
+```{r}
+# Extract the spot classification vector
+spot_classes <- colData(myRCTD)$spot_class
+print("Spot Classification Summary:")
+print(table(spot_classes))
+
+# Ensure the classification column is a factor
+colData(myRCTD)$spot_class <- as.factor(colData(myRCTD)$spot_class)
+
+# Use the correct argument: 'annotate', and disable the filter
+plotCoords(myRCTD, annotate = "spot_class", point_size = 1.5, in_tissue = NULL) +
+    ggplot2::ggtitle("RCTD Spot Classifications")
+```
+
+```{r}
+# NEW LINE: Get the list of all cell types from the assay row names
+all_plottable_cell_types <- rownames(assay(myRCTD, "weights"))
+
+# Print the list to the console so you can see them:
+print(all_plottable_cell_types)
+```
+
+```{r}
+# 1. Define the cell type and ensure its proportion data is in colData
+cell_type_to_plot <- "R1" 
+colData(myRCTD)[[cell_type_to_plot]] <- assay(myRCTD, "weights")[cell_type_to_plot, ]
+
+# 2. Prepare data frame: Combine colData (metadata) and spatialCoords
+plot_data <- data.frame(
+    colData(myRCTD),
+    spatialCoords(myRCTD)
+)
+```
+
+```{r}
+ggplot(plot_data, aes(x = x, y = y, color = !!rlang::sym(cell_type_to_plot))) +
+    geom_point(size = 1.5) +
+    scale_color_viridis_c(name = "Proportion") + # Use a continuous color scale
+    coord_fixed() + # Ensures the spatial aspect ratio is correct
+    theme_void() + # Removes axes and background for a clean spatial look
+    ggtitle(paste0("Proportion of ", cell_type_to_plot))
+```

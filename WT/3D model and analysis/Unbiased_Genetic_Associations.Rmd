@@ -1,0 +1,419 @@
+---
+title: "Unbiased Genetic Topological Association Discovery (ST)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(viridis)
+library(Matrix)
+```
+
+## 1. Introduction
+
+Instead of relying on physical 3D mesh distances to find topological contacts, this script discovers them in a **purely unbiased, genetics-driven way**. We tile the gut (10–90% pseudotime) with overlapping 5% sliding windows (step = 2.5%), compute a pseudo-bulk expression profile per window, and then calculate pairwise Spearman correlations between all windows that are at least 10% apart. Unexpectedly high correlations between distant windows indicate genetically similar regions that may be in physical contact.
+
+## 2. Load ST Data
+
+```{r load_data}
+st_path <- "../Random data/merged_guts.rds"
+st_obj <- readRDS(st_path)
+st_obj <- subset(st_obj, cells = grep("^Gut3_", Cells(st_obj), value = TRUE))
+
+valid_spots <- !is.na(st_obj$Spatial_Pseudotime)
+st_obj <- subset(st_obj, cells = Cells(st_obj)[valid_spots])
+
+if ("SCT" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "SCT"
+} else if ("Segmented" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "Segmented"
+}
+
+cell_pt <- st_obj$Spatial_Pseudotime
+cat("Loaded", ncol(st_obj), "spots with valid pseudotime.\n")
+```
+
+## 3. Define Sliding Windows and Build Pseudo-Bulk Matrix
+
+```{r build_pseudobulk}
+# Window parameters
+win_size <- 3      # 3% pseudotime width (finer resolution)
+step_size <- 1     # 1% step (dense tiling)
+pt_min <- 0
+pt_max <- 100
+
+# Generate window starts
+win_starts <- seq(pt_min, pt_max - win_size, by = step_size)
+win_labels <- paste0(win_starts, "-", win_starts + win_size, "%")
+
+cat("Number of sliding windows:", length(win_starts), "\n")
+
+# Select variable genes for the comparison (top 2000 HVGs)
+st_obj <- FindVariableFeatures(st_obj, nfeatures = 2000)
+hvg <- VariableFeatures(st_obj)
+
+# Pre-extract the expression matrix once (huge optimization vs. repeated subsetting)
+expr_mat <- GetAssayData(st_obj, layer = "data")[hvg, ]
+
+# Build pseudo-bulk matrix: genes x windows (mean expression per window)
+pseudobulk <- matrix(0, nrow = length(hvg), ncol = length(win_starts))
+rownames(pseudobulk) <- hvg
+colnames(pseudobulk) <- win_labels
+
+spot_counts <- integer(length(win_starts))
+
+for (i in seq_along(win_starts)) {
+  w_start <- win_starts[i]
+  w_end   <- w_start + win_size
+  in_window <- which(cell_pt >= w_start & cell_pt < w_end)
+  spot_counts[i] <- length(in_window)
+  
+  if (length(in_window) >= 3) {
+    pseudobulk[, i] <- Matrix::rowMeans(expr_mat[, in_window, drop = FALSE])
+  }
+}
+
+# Remove windows with too few spots
+valid_windows <- spot_counts >= 3
+cat("Valid windows (>= 5 spots):", sum(valid_windows), "/", length(win_starts), "\n")
+
+pseudobulk <- pseudobulk[, valid_windows]
+win_starts_valid <- win_starts[valid_windows]
+win_labels_valid <- win_labels[valid_windows]
+```
+
+## 4. Compute Pairwise Spearman Correlation (Distant Windows Only)
+
+```{r compute_correlations}
+n_windows <- ncol(pseudobulk)
+min_dist <- 10 # Minimum pseudotime distance between window midpoints
+
+# Full correlation matrix (Spearman) — vectorized, extremely fast
+cor_mat <- cor(pseudobulk, method = "spearman")
+rownames(cor_mat) <- win_labels_valid
+colnames(cor_mat) <- win_labels_valid
+
+# Mask out pairs that are too close (< 10% midpoint distance)
+midpoints <- win_starts_valid + win_size / 2
+midpoint_dist <- as.matrix(dist(midpoints))
+
+# Set close pairs to NA so they don't distract in the heatmap
+cor_mat_distant <- cor_mat
+cor_mat_distant[midpoint_dist < min_dist] <- NA
+```
+
+## 5. Full Correlation Heatmap
+
+This heatmap shows the Spearman correlation between **all** windows. The diagonal and near-diagonal (neighboring windows) are expected to be high. The interesting signal is off-diagonal hotspots between distant windows.
+
+```{r plot_full_heatmap, fig.width=10, fig.height=8}
+# For the full heatmap, keep all values but annotate the diagonal proximity
+pheatmap(cor_mat, 
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         breaks = seq(-1, 1, length.out = 101),
+         main = "Pairwise Spearman Correlation (All Sliding Windows)",
+         fontsize_row = 7, fontsize_col = 7,
+         border_color = NA)
+```
+
+## 6. Distant-Only Correlation Heatmap
+
+Now we mask out all pairs within 10% pseudotime of each other (the trivially correlated neighbors), revealing only the long-range genetic similarities.
+
+```{r plot_distant_heatmap, fig.width=10, fig.height=8}
+pheatmap(cor_mat_distant, 
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         breaks = seq(-1, 1, length.out = 101),
+         na_col = "grey95",
+         main = "Distant Windows Only (>= 10% Apart)",
+         fontsize_row = 7, fontsize_col = 7,
+         border_color = NA)
+```
+
+## 7. Identify Top Genetic Associations
+
+```{r top_associations}
+# Extract the upper triangle of distant correlations
+cor_distant_upper <- cor_mat_distant
+cor_distant_upper[lower.tri(cor_distant_upper, diag = TRUE)] <- NA
+
+# Convert to long format
+assoc_df <- data.frame(
+  Window1 = rep(win_labels_valid, each = n_windows),
+  Window2 = rep(win_labels_valid, times = n_windows),
+  Midpoint1 = rep(midpoints, each = n_windows),
+  Midpoint2 = rep(midpoints, times = n_windows),
+  Correlation = as.vector(cor_distant_upper)
+) %>% 
+  filter(!is.na(Correlation)) %>%
+  mutate(Distance = abs(Midpoint2 - Midpoint1)) %>%
+  arrange(desc(Correlation))
+
+cat("\n=== Top 15 Genetically Associated Distant Windows ===\n")
+print(head(assoc_df, 15))
+```
+
+## 8. Scatter Plot of Correlation vs. Distance
+
+This plot reveals whether certain long-range distances show unexpectedly high correlations (above the baseline trend), which would indicate genetically-driven topological associations.
+
+```{r scatter_cor_vs_dist, fig.width=8, fig.height=5}
+ggplot(assoc_df, aes(x = Distance, y = Correlation)) +
+  geom_point(alpha = 0.4, size = 2, color = "steelblue") +
+  geom_smooth(method = "loess", span = 0.5, color = "firebrick", se = TRUE) +
+  geom_hline(yintercept = mean(assoc_df$Correlation, na.rm = TRUE), 
+             linetype = "dashed", color = "grey40") +
+  theme_minimal() +
+  labs(title = "Spearman Correlation vs. Pseudotime Distance",
+       subtitle = "Points above the trend suggest genetically-driven topological contact",
+       x = "Pseudotime Distance Between Windows (%)",
+       y = "Spearman Correlation")
+```
+
+## 9. Highlight Significant Outlier Pairs
+
+We flag pairs whose correlation is more than 2 standard deviations above the mean for their distance bin. These are the candidate genetic topological associations.
+
+```{r find_outliers, fig.width=10, fig.height=8}
+# Bin by distance (5% bins)
+assoc_df$dist_bin <- cut(assoc_df$Distance, breaks = seq(10, max(assoc_df$Distance) + 5, by = 5))
+
+# Calculate z-score within each distance bin
+assoc_df <- assoc_df %>%
+  group_by(dist_bin) %>%
+  mutate(
+    bin_mean = mean(Correlation, na.rm = TRUE),
+    bin_sd = sd(Correlation, na.rm = TRUE),
+    z_score = (Correlation - bin_mean) / bin_sd
+  ) %>%
+  ungroup()
+
+outliers <- assoc_df %>% filter(z_score > 2) %>% arrange(desc(z_score))
+
+cat("\n=== Significant Genetic Associations (z > 2 within distance bin) ===\n")
+if(nrow(outliers) > 0) {
+  print(outliers %>% select(Window1, Window2, Distance, Correlation, z_score))
+} else {
+  cat("No significant outlier pairs found at z > 2 threshold.\n")
+  cat("Showing top pairs with z > 1.5:\n")
+  outliers <- assoc_df %>% filter(z_score > 1.5) %>% arrange(desc(z_score))
+  print(outliers %>% select(Window1, Window2, Distance, Correlation, z_score))
+}
+
+# Re-plot the heatmap highlighting outlier pairs
+if(nrow(outliers) > 0) {
+  highlight_mat <- matrix(NA, nrow = n_windows, ncol = n_windows)
+  rownames(highlight_mat) <- win_labels_valid
+  colnames(highlight_mat) <- win_labels_valid
+  
+  for (r in 1:nrow(outliers)) {
+    w1 <- outliers$Window1[r]
+    w2 <- outliers$Window2[r]
+    highlight_mat[w1, w2] <- outliers$Correlation[r]
+    highlight_mat[w2, w1] <- outliers$Correlation[r]
+  }
+  
+  pheatmap(highlight_mat, 
+           cluster_rows = FALSE, cluster_cols = FALSE,
+           color = colorRampPalette(c("white", "darkorange", "firebrick3"))(50),
+           na_col = "grey95",
+           main = "Significant Genetic Associations (Outlier Pairs)",
+           fontsize_row = 7, fontsize_col = 7,
+           border_color = NA)
+}
+```
+
+## 10. Cluster Genetic Associations and Map to 3D Mesh
+
+To visualize these genetic hotspots on the 3D model, we cluster the outlier pairs (to group adjacent sliding windows into continuous regions) and map them to the 3D mesh.
+
+```{r load_mesh_and_cluster, rgl=TRUE}
+library(dbscan)
+library(Rvcg)
+library(rgl)
+
+# 1. Cluster Outliers
+if(nrow(outliers) == 0) {
+  outliers <- assoc_df %>% filter(z_score > 1.5)
+}
+
+if(nrow(outliers) > 0) {
+  # Cluster based on their midpoints
+  eps_val <- 4  # 4% pseudotime clustering window
+  clusters <- dbscan::dbscan(outliers[, c("Midpoint1", "Midpoint2")], eps = eps_val, minPts = 1)
+  outliers$cluster <- clusters$cluster
+  
+  num_clusters <- length(unique(outliers$cluster))
+  cat(paste("Grouped into", num_clusters, "distinct genetic association regions.\n"))
+  
+  contact_regions_list <- list()
+  for (c in unique(outliers$cluster)) {
+    c_pairs <- outliers %>% filter(cluster == c)
+    # Windows are win_size wide, centered on Midpoint
+    seg1_min <- min(c_pairs$Midpoint1) - (win_size/2)
+    seg1_max <- max(c_pairs$Midpoint1) + (win_size/2)
+    seg2_min <- min(c_pairs$Midpoint2) - (win_size/2)
+    seg2_max <- max(c_pairs$Midpoint2) + (win_size/2)
+    
+    contact_regions_list[[as.character(c)]] <- list(
+      seg1 = c(seg1_min, seg1_max),
+      seg2 = c(seg2_min, seg2_max)
+    )
+  }
+  
+  # 2. Load 3D Mesh
+  blender_dir <- "/home/mattia/Thesis/3D model"
+  swc_dir <- "/mnt/d/BlackieGasparEtAl2024-sourceData/BlackieGasparEtAl2024-sourceData/OregonR/Centrelines"
+  
+  gut_mesh <- vcgImport(file.path(blender_dir, "gut.obj"))
+  
+  swc_file <- file.path(swc_dir, "M4T.swc")
+  centreline <- read.table(swc_file, comment.char = "#")
+  colnames(centreline) <- c("id", "type", "x", "y", "z", "radius", "parent")
+  
+  c_pts <- centreline[, c("x", "y", "z")]
+  gut_pts <- t(gut_mesh$vb[1:3, ])
+  
+  c_center <- colMeans(c_pts)
+  gut_center <- colMeans(gut_pts)
+  
+  c_aligned <- sweep(c_pts, 2, c_center, "-")
+  c_aligned <- c_aligned * 1.20 # Scale
+  c_aligned <- sweep(c_aligned, 2, gut_center, "+")
+  
+  centreline$x <- c_aligned[, "x"]
+  centreline$y <- c_aligned[, "y"]
+  centreline$z <- c_aligned[, "z"]
+  
+  pts <- as.matrix(centreline[, c("x", "y", "z")])
+  dists <- sqrt(rowSums((pts[-1,] - pts[-nrow(pts),])^2))
+  centreline$cum_dist <- c(0, cumsum(dists))
+  centreline$pct_length <- centreline$cum_dist / max(centreline$cum_dist)
+  
+  pt_nodes <- (centreline$pct_length - 0.05) / 0.90 * 100
+  
+  cat("Mapping mesh vertices...\n")
+  nearest_node_idx <- integer(nrow(gut_pts))
+  for(i in 1:nrow(gut_pts)) {
+    dsq <- (pts[,1] - gut_pts[i,1])^2 + 
+           (pts[,2] - gut_pts[i,2])^2 + 
+           (pts[,3] - gut_pts[i,3])^2
+    nearest_node_idx[i] <- which.min(dsq)
+  }
+  
+  # For each region, find matching nodes
+  for (c in names(contact_regions_list)) {
+    bounds <- contact_regions_list[[c]]
+    contact_regions_list[[c]]$nodes1 <- which(pt_nodes >= bounds$seg1[1] & pt_nodes <= bounds$seg1[2])
+    contact_regions_list[[c]]$nodes2 <- which(pt_nodes >= bounds$seg2[1] & pt_nodes <= bounds$seg2[2])
+  }
+  
+  # 3. Plot Individual Meshes per Association
+  for (c in names(contact_regions_list)) {
+    bounds <- contact_regions_list[[c]]
+    
+    v_colors <- rep("grey80", nrow(gut_pts))
+    v_colors[nearest_node_idx %in% bounds$nodes1] <- "firebrick1"
+    v_colors[nearest_node_idx %in% bounds$nodes2] <- "dodgerblue1"
+    
+    gut_mesh_assoc <- gut_mesh
+    gut_mesh_assoc$material$color <- v_colors
+    
+    open3d()
+    shade3d(gut_mesh_assoc, alpha = 0.9)
+    lines3d(centreline$x, centreline$y, centreline$z, color = "black", lwd = 2, alpha = 0.5)
+    aspect3d("iso")
+    view3d(theta = 45, phi = 30, zoom = 0.8)
+    text3d(x = min(gut_pts[,1]), y = max(gut_pts[,2]), z = max(gut_pts[,3]), 
+           texts = paste("Genetic Association:", c), col = "black", cex = 2)
+           
+    # Explicitly print the widget so it appears in the RStudio Viewer when run inside a loop!
+    print(rglwidget())
+  }
+}
+```
+
+## 11. Differential Expression of Genetic Associations
+
+```{r dge_and_plot, fig.width=8, fig.height=4}
+if(nrow(outliers) > 0) {
+  window <- 2 
+  for (c in names(contact_regions_list)) {
+    assoc_name <- paste0("GenCluster_", c)
+    cat(paste("\n\n###", assoc_name, "\n"))
+    
+    bounds <- contact_regions_list[[c]]
+    
+    # --- DIFFERENTIAL GENE EXPRESSION ---
+    
+    is_in_seg1 <- !is.na(cell_pt) & (cell_pt >= (bounds$seg1[1] - window) & cell_pt <= (bounds$seg1[2] + window))
+    is_in_seg2 <- !is.na(cell_pt) & (cell_pt >= (bounds$seg2[1] - window) & cell_pt <= (bounds$seg2[2] + window))
+    
+    cells_in_seg1 <- colnames(st_obj)[is_in_seg1]
+    cells_in_seg2 <- colnames(st_obj)[is_in_seg2]
+    cells_in_contact <- unique(c(cells_in_seg1, cells_in_seg2))
+    cells_out <- colnames(st_obj)[!colnames(st_obj) %in% cells_in_contact]
+    
+    if (length(cells_in_contact) > 10 && length(cells_out) > 10) {
+      ident_vec <- rep("Rest", ncol(st_obj))
+      names(ident_vec) <- colnames(st_obj)
+      ident_vec[cells_in_contact] <- "Contact"
+      Idents(st_obj) <- ident_vec
+      
+      markers <- FindMarkers(st_obj, ident.1 = "Contact", ident.2 = "Rest", 
+                             min.pct = 0.20, logfc.threshold = 0.40, return.thresh = 0.05, only.pos = TRUE)
+      
+      if(nrow(markers) > 0) {
+        markers <- markers %>% filter((pct.1 - pct.2) > 0.15)
+      }
+      
+      if(nrow(markers) > 0) {
+        expr_data <- GetAssayData(st_obj, layer = "data")[rownames(markers), , drop=FALSE]
+        pct_seg1 <- rowMeans(expr_data[, cells_in_seg1, drop=FALSE] > 0)
+        pct_seg2 <- rowMeans(expr_data[, cells_in_seg2, drop=FALSE] > 0)
+        
+        valid_genes <- rownames(markers)[pct_seg1 >= 0.20 & pct_seg2 >= 0.20]
+        markers <- markers[valid_genes, ]
+        
+        top_markers <- markers %>% filter(p_val_adj < 0.05) %>% head(3)
+        
+        if(nrow(top_markers) > 0) {
+          for (gene in rownames(top_markers)) {
+            data_df <- FetchData(st_obj, vars = c(gene, "Spatial_Pseudotime"))
+            colnames(data_df) <- c("Expression", "Pseudotime")
+            data_df <- data_df[!is.na(data_df$Pseudotime), ]
+            
+            y_min <- min(data_df$Expression, na.rm = TRUE) - 0.5
+            y_max <- max(data_df$Expression, na.rm = TRUE) + 0.5
+            
+            p <- ggplot(data_df, aes(x = Pseudotime, y = Expression)) +
+              geom_point(alpha = 0.3, size = 1, color = "grey50") +
+              geom_smooth(method = "loess", span = 0.3, color = "darkblue", se = FALSE) +
+              geom_rect(aes(xmin = bounds$seg1[1] - window, xmax = bounds$seg1[2] + window, 
+                            ymin = y_min, ymax = y_max), fill = "firebrick1", alpha = 0.02, inherit.aes = FALSE) +
+              geom_rect(aes(xmin = bounds$seg2[1] - window, xmax = bounds$seg2[2] + window, 
+                            ymin = y_min, ymax = y_max), fill = "dodgerblue1", alpha = 0.02, inherit.aes = FALSE) +
+              theme_minimal() +
+              labs(title = paste(gene, "Expression -", assoc_name),
+                   subtitle = paste("Log2FC:", round(top_markers[gene, "avg_log2FC"], 2)))
+            
+            print(p)
+          }
+        } else {
+          cat("No significant co-expressed markers found.\n")
+        }
+      } else {
+        cat("No significant markers passed spatial thresholds.\n")
+      }
+    } else {
+      cat("Not enough cells for DGE.\n")
+    }
+  }
+}
+```

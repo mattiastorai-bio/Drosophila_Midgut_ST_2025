@@ -1,0 +1,346 @@
+---
+title: "Spatial Centerline Projection & Tissue Painting"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load necessary libraries
+library(Seurat)
+library(png)
+library(ggplot2)
+library(dplyr)
+library(mgcv)
+library(viridis)
+library(SpatialExperiment)
+library(cowplot)
+library(patchwork)
+```
+
+## 1. Parameters & Configuration
+
+```{r config}
+# Select the gene to plot
+target_gene <- "E(SPL)MBETA-HLH" # Change this gene as needed
+
+# File paths
+image_path <- "/home/mattia/Thesis/3D model/Immagine 2026-06-19 200559.png"
+sc_path <- "/home/mattia/Thesis/111125ST_def/Random data/sc_with_spatial_scores.rds"
+gut3_path <- "/home/mattia/Thesis/111125ST/Rfiles/gut3.rds"
+geom_cache_path <- "/home/mattia/Thesis/111125ST_def/Random data/gut3_tissue_geometry.rds"
+```
+
+## 2. Geometric Processing & Caching
+
+We segment the midgut image, extract the smoothed centerline, and divide the entire tissue profile into 100 sections.
+
+```{r geometry}
+if (file.exists(geom_cache_path)) {
+  cat("Loading cached tissue geometry...\n")
+  geom <- readRDS(geom_cache_path)
+  tissue_df <- geom$tissue
+  centerline_smoothed <- geom$centerline
+} else {
+  cat("Processing tissue geometry from scratch...\n")
+  
+  # 1. Process Image
+  img <- readPNG(image_path)
+  if (length(dim(img)) == 3) {
+    img_gray <- (img[,,1] + img[,,2] + img[,,3]) / 3
+  } else {
+    img_gray <- img
+  }
+  
+  tissue_mask <- img_gray < 0.9
+  coords <- which(tissue_mask, arr.ind = TRUE)
+  tissue_df <- data.frame(x = coords[, "col"], y = coords[, "row"])
+  
+  centerline_raw <- tissue_df %>%
+    group_by(x) %>%
+    summarize(y = median(y), .groups = "drop")
+  
+  gam_model <- gam(y ~ s(x, bs = "cs", k = 20), data = centerline_raw)
+  
+  x_seq <- seq(min(centerline_raw$x), max(centerline_raw$x), length.out = 1000)
+  centerline_smoothed <- data.frame(
+    x = x_seq,
+    y = predict(gam_model, newdata = data.frame(x = x_seq))
+  )
+  
+  centerline_smoothed$dist <- 0
+  for (i in 2:nrow(centerline_smoothed)) {
+    dx <- centerline_smoothed$x[i] - centerline_smoothed$x[i-1]
+    dy <- centerline_smoothed$y[i] - centerline_smoothed$y[i-1]
+    centerline_smoothed$dist[i] <- centerline_smoothed$dist[i-1] + sqrt(dx^2 + dy^2)
+  }
+  
+  max_dist <- max(centerline_smoothed$dist)
+  centerline_smoothed$Section <- (centerline_smoothed$dist / max_dist) * 100
+  
+  # 2. Map Tissue Pixels
+  cat("Mapping tissue pixels to centerline sections...\n")
+  cl_x <- centerline_smoothed$x
+  cl_y <- centerline_smoothed$y
+  cl_sec <- centerline_smoothed$Section
+  
+  pixel_sections <- numeric(nrow(tissue_df))
+  for (i in seq_len(nrow(tissue_df))) {
+    dists <- (cl_x - tissue_df$x[i])^2 + (cl_y - tissue_df$y[i])^2
+    pixel_sections[i] <- cl_sec[which.min(dists)]
+  }
+  tissue_df$Section <- pixel_sections
+  
+  # Cache geometry
+  saveRDS(list(tissue = tissue_df, centerline = centerline_smoothed), geom_cache_path)
+}
+
+# Image dimension bounds for perfect alignment
+img <- readPNG(image_path)
+img_h <- nrow(img)
+img_w <- ncol(img)
+
+# Setup original image plot precisely scaled to coordinate grid
+p_orig <- ggplot() +
+  annotation_raster(img, xmin = 1, xmax = img_w, ymin = img_h, ymax = 1) +
+  coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+  scale_y_reverse() +
+  theme_void() +
+  labs(title = "Original Histology")
+
+# Plot spatial scores (0-100) mapped over the tissue
+ggplot(tissue_df, aes(x = x, y = y, color = Section)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_path(data = centerline_smoothed, aes(x = x, y = y), color = "red", linewidth = 1.5) +
+  scale_color_viridis(option = "turbo") +
+  coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+  scale_y_reverse() +
+  theme_minimal() +
+  labs(title = "Tissue Profile Colored by Section Score (0-100)", x = "Anterior -> Posterior", y = "Dorsal/Ventral")
+```
+
+## 3. Painting Tissue from Single-Cell Data
+
+```{r paint_sc, fig.height=8, fig.width=10}
+# Load Single Cell Object
+if (!exists("sc_obj")) { sc_obj <- readRDS(sc_path) }
+
+sc_expr <- FetchData(sc_obj, vars = target_gene)
+sc_df <- data.frame(
+  Pseudotime = sc_obj@meta.data$Smoothed_Pseudotime,
+  Expression = sc_expr[[1]]
+)
+
+cat(paste("Fitting SC expression model for", target_gene, "...\n"))
+expr_gam_sc <- gam(Expression ~ s(Pseudotime, bs = "cs"), data = sc_df)
+
+section_bins <- data.frame(Section = seq(0, 100, length.out = 101))
+section_bins$SC_Predicted_Expr <- predict(expr_gam_sc, newdata = data.frame(Pseudotime = section_bins$Section))
+section_bins$SC_Predicted_Expr[section_bins$SC_Predicted_Expr < 0] <- 0
+section_bins$SC_ZScore <- as.numeric(scale(section_bins$SC_Predicted_Expr))
+if(any(is.na(section_bins$SC_ZScore))) section_bins$SC_ZScore[is.na(section_bins$SC_ZScore)] <- 0
+
+# Merge and Plot
+tissue_df$Rounded_Section <- round(tissue_df$Section)
+tissue_painted_sc <- tissue_df %>%
+  left_join(section_bins, by = c("Rounded_Section" = "Section"))
+
+p_tissue_sc <- ggplot(tissue_painted_sc, aes(x = x, y = y, color = SC_ZScore)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  scale_color_viridis(option = "magma", name = "SC Expr (Z-Score)", limits = c(0, 2), oob = scales::squish) +
+  coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+  scale_y_reverse() +
+  theme_void() +
+  labs(title = paste("Painted Tissue (Single-Cell):", target_gene))
+
+# Perfectly align the plots using patchwork
+(p_orig / p_tissue_sc) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+## 4. Painting Tissue from Spatial Data
+
+```{r paint_spatial, fig.height=8, fig.width=10}
+# Load Spatial Object
+if (!exists("gut3")) { gut3 <- readRDS(gut3_path) }
+
+# Extract expression and spatial pseudotime
+if (inherits(gut3, "SpatialExperiment")) {
+  library(SummarizedExperiment)
+  if (target_gene %in% rownames(gut3)) {
+    if ("logcounts" %in% assayNames(gut3)) {
+      expr_vals <- as.numeric(assay(gut3, "logcounts")[target_gene, ])
+    } else {
+      expr_vals <- as.numeric(assay(gut3, "counts")[target_gene, ])
+    }
+  } else {
+    expr_vals <- rep(0, ncol(gut3))
+  }
+  sp_pseudotime <- colData(gut3)[["spe_gut_3_Pseudotime_Score"]]
+} else {
+  expr_vals <- FetchData(gut3, vars = target_gene)[[1]]
+  sp_pseudotime <- gut3@meta.data$spe_gut_3_Pseudotime_Score
+}
+
+spatial_df <- data.frame(
+  Pseudotime = sp_pseudotime,
+  Expression = expr_vals
+)
+
+cat(paste("Fitting Spatial expression model for", target_gene, "...\n"))
+expr_gam_sp <- gam(Expression ~ s(Pseudotime, bs = "cs"), data = spatial_df)
+
+section_bins$SP_Predicted_Expr <- predict(expr_gam_sp, newdata = data.frame(Pseudotime = section_bins$Section))
+section_bins$SP_Predicted_Expr[section_bins$SP_Predicted_Expr < 0] <- 0
+section_bins$SP_ZScore <- as.numeric(scale(section_bins$SP_Predicted_Expr))
+if(any(is.na(section_bins$SP_ZScore))) section_bins$SP_ZScore[is.na(section_bins$SP_ZScore)] <- 0
+
+# Merge and Plot
+tissue_painted_sp <- tissue_df %>%
+  left_join(section_bins, by = c("Rounded_Section" = "Section"))
+
+p_tissue_sp <- ggplot(tissue_painted_sp, aes(x = x, y = y, color = SP_ZScore)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  scale_color_viridis(option = "magma", name = "Spatial Expr (Z-Score)", limits = c(0, 2), oob = scales::squish) +
+  coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+  scale_y_reverse() +
+  theme_void() +
+  labs(title = paste("Painted Tissue (Spatial):", target_gene))
+
+# Perfectly align the plots using patchwork
+(p_orig / p_tissue_sp) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+## 5. Painting Tissue from a Gene List (SC and Spatial)
+
+This section takes a list of genes, loops through them, and generates an aligned Single-Cell and Spatial plot for each gene. Plots are also saved to the figures directory.
+
+```{r paint_gene_list, fig.height=12, fig.width=10}
+# Load gene list from the TF reference file
+#tf_file <- "/mnt/c/Users/matti/Desktop/Master/Thesis/Reference genome/FlyBase_Fields_download.txt"
+tf_data <- read.delim(tf_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names=FALSE)
+
+# The third column is SYMBOL. Proceed as previously: full capital, remove '-'
+symbols <- tf_data[[3]]
+gene_list <- toupper(gsub("-", "", symbols))
+
+# Ensure objects are loaded
+if (!exists("sc_obj")) { sc_obj <- readRDS(sc_path) }
+
+# Remove ISC, EB, dEC, and daEC from single cell data before plotting
+cells_to_remove <- c("ISC", "EB", "dEC", "daEC")
+if (any(sc_obj$celltype %in% cells_to_remove)) {
+  sc_obj_plot <- subset(sc_obj, subset = celltype %in% cells_to_remove == FALSE)
+} else {
+  sc_obj_plot <- sc_obj
+}
+
+if (!exists("gut3")) { gut3 <- readRDS(gut3_path) }
+
+tissue_df$Rounded_Section <- round(tissue_df$Section)
+
+# Create output directory for these specific plots
+dir.create("../figures/centerline_projections", showWarnings = FALSE, recursive = TRUE)
+
+for (current_gene in gene_list) {
+  cat(paste("\n==================================================\n"))
+  cat(paste("Processing Gene:", current_gene, "\n"))
+  
+  # --- 5.1 Single-Cell Score ---
+  if (current_gene %in% rownames(sc_obj_plot)) {
+    sc_expr <- FetchData(sc_obj_plot, vars = current_gene)[[1]]
+    sc_df <- data.frame(
+      Pseudotime = sc_obj_plot@meta.data$Smoothed_Pseudotime,
+      Expression = sc_expr
+    )
+    
+    expr_gam_sc <- gam(Expression ~ s(Pseudotime, bs = "cs"), data = sc_df)
+    
+    section_bins <- data.frame(Section = seq(0, 100, length.out = 101))
+    section_bins$SC_Predicted_Expr <- predict(expr_gam_sc, newdata = data.frame(Pseudotime = section_bins$Section))
+    section_bins$SC_Predicted_Expr[section_bins$SC_Predicted_Expr < 0] <- 0
+    section_bins$SC_ZScore <- as.numeric(scale(section_bins$SC_Predicted_Expr))
+    if(any(is.na(section_bins$SC_ZScore))) section_bins$SC_ZScore[is.na(section_bins$SC_ZScore)] <- 0
+  } else {
+    cat(paste("Gene", current_gene, "not found in Single-Cell object. Skipping SC plot.\n"))
+    section_bins <- data.frame(Section = seq(0, 100, length.out = 101), SC_ZScore = 0)
+  }
+  
+  # --- 5.2 Spatial Score ---
+  sp_found <- FALSE
+  if (inherits(gut3, "SpatialExperiment")) {
+    library(SummarizedExperiment)
+    if (current_gene %in% rownames(gut3)) {
+      if ("logcounts" %in% assayNames(gut3)) {
+        expr_vals <- as.numeric(assay(gut3, "logcounts")[current_gene, ])
+      } else {
+        expr_vals <- as.numeric(assay(gut3, "counts")[current_gene, ])
+      }
+      sp_found <- TRUE
+    }
+    sp_pseudotime <- colData(gut3)[["spe_gut_3_Pseudotime_Score"]]
+  } else {
+    if (current_gene %in% rownames(gut3)) {
+      expr_vals <- FetchData(gut3, vars = current_gene)[[1]]
+      sp_found <- TRUE
+    }
+    sp_pseudotime <- gut3@meta.data$spe_gut_3_Pseudotime_Score
+  }
+  
+  if (sp_found) {
+    spatial_df <- data.frame(Pseudotime = sp_pseudotime, Expression = expr_vals)
+    expr_gam_sp <- gam(Expression ~ s(Pseudotime, bs = "cs"), data = spatial_df)
+    
+    section_bins$SP_Predicted_Expr <- predict(expr_gam_sp, newdata = data.frame(Pseudotime = section_bins$Section))
+    section_bins$SP_Predicted_Expr[section_bins$SP_Predicted_Expr < 0] <- 0
+    section_bins$SP_ZScore <- as.numeric(scale(section_bins$SP_Predicted_Expr))
+    if(any(is.na(section_bins$SP_ZScore))) section_bins$SP_ZScore[is.na(section_bins$SP_ZScore)] <- 0
+  } else {
+    cat(paste("Gene", current_gene, "not found in Spatial object. Skipping SP plot.\n"))
+    if (!"SP_ZScore" %in% colnames(section_bins)) {
+      section_bins$SP_ZScore <- 0
+    }
+  }
+  
+  # --- 5.3 Merge and Plot ---
+  if (current_gene %in% rownames(sc_obj_plot) || sp_found) {
+    tissue_painted <- tissue_df %>%
+      left_join(section_bins, by = c("Rounded_Section" = "Section"))
+    
+    p_tissue_sc <- ggplot(tissue_painted, aes(x = x, y = y, color = SC_ZScore)) +
+      geom_point(size = 0.5, alpha = 0.8) +
+      scale_color_viridis(option = "magma", name = "SC Expr (Z-Score)", limits = c(0, 2), oob = scales::squish) +
+      coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+      scale_y_reverse() +
+      theme_void() +
+      labs(title = paste("Painted Tissue (Single-Cell):", current_gene))
+    
+    p_tissue_sp <- ggplot(tissue_painted, aes(x = x, y = y, color = SP_ZScore)) +
+      geom_point(size = 0.5, alpha = 0.8) +
+      scale_color_viridis(option = "magma", name = "Spatial Expr (Z-Score)", limits = c(0, 2), oob = scales::squish) +
+      coord_fixed(xlim = c(1, img_w), ylim = c(img_h, 1)) +
+      scale_y_reverse() +
+      theme_void() +
+      labs(title = paste("Painted Tissue (Spatial):", current_gene))
+    
+    # Perfectly align the plots using patchwork (3 panels)
+    combined_plot <- (p_orig / p_tissue_sc / p_tissue_sp) + 
+      plot_layout(guides = "collect") + 
+      plot_annotation(title = paste("Expression Profile:", current_gene), 
+                      theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))) & 
+      theme(legend.position = "bottom")
+    
+    # Save the plot
+    out_file <- paste0("../figures/centerline_projections/Spatial_Profile_", current_gene, ".png")
+    ggsave(out_file, combined_plot, width = 10, height = 12, bg = "white")
+    cat("Saved plot to:", out_file, "\n")
+    
+    # Print the plot to the notebook output
+    print(combined_plot)
+    
+  } else {
+    cat(paste("Gene", current_gene, "not found in either object. Skipping plot.\n"))
+  }
+}
+```
+```

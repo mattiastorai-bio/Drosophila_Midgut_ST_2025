@@ -1,0 +1,65 @@
+# R / RStudio
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# knitr / R Markdown output
+*_files/
+*_cache/
+*.html
+*.pdf
+*.docx
+
+# renv
+renv/library/
+renv/staging/
+renv/sandbox/
+renv/python/
+renv/local/
+
+# Large data files
+*.rds
+*.RDS
+*.rda
+*.RData
+*.h5
+*.h5ad
+*.h5seurat
+*.hdf5
+*.parquet
+*.feather
+*.arrow
+*.loom
+
+# Spatial data
+*.mtx
+*.mtx.gz
+*.barcodes.tsv*
+*.features.tsv*
+*.genes.tsv*
+
+# 3D model files
+*.obj
+
+# Image outputs
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.tif
+*.svg
+*.eps
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp files
+*~
+*.swp
+*.swo
+*.tmp

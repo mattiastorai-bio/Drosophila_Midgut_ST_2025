@@ -1,0 +1,255 @@
+---
+title: "Gene Expression Concordance Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(readr)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Dm.eg.db)
+library(ggpubr)
+
+# ------------------------------------------------------------------------------
+# 1. Load Data
+# ------------------------------------------------------------------------------
+
+# Paths
+path_111125ST <- "../../111125ST_def/Random data/merged_guts.rds"
+path_03Slide4 <- "../Random data/merged_guts.rds"
+path_seg_rds  <- "../Random data/VisiumHD_Drosophila_Resolution_List.rds"
+path_mutant_csv <- "../Random data/Slide4_Segmented_Mutant_Selection.csv"
+path_wt_csv <- "../Random data/Slide4_Segmented_WT_Selection.csv"
+
+cat("Loading 111125ST_def merged_guts...\n")
+merged_111125ST <- readRDS(path_111125ST)
+
+cat("Loading 03Slide4 merged_guts...\n")
+merged_03Slide4 <- readRDS(path_03Slide4)
+
+# Create figures directory if it doesn't exist
+if (!dir.exists("../figures/concordance")) dir.create("../figures/concordance", recursive = TRUE)
+```
+
+## 1. Global Concordance (111125ST vs 03Slide4)
+
+Comparison of average gene expression across all cells in both datasets.
+
+```{r global_concordance, fig.width=7, fig.height=6}
+# Set identities to a single value for global average
+Idents(merged_111125ST) <- "Global"
+avg_111125ST_mat <- AverageExpression(merged_111125ST, assays = "Segmented", slot = "data")$Segmented
+avg_111125ST <- data.frame(WT_111125ST = rowMeans(as.matrix(avg_111125ST_mat)), Gene = rownames(avg_111125ST_mat))
+
+Idents(merged_03Slide4) <- "Global"
+avg_03Slide4_mat <- AverageExpression(merged_03Slide4, assays = "Segmented", slot = "data")$Segmented
+avg_03Slide4 <- data.frame(Slide4_Global = rowMeans(as.matrix(avg_03Slide4_mat)), Gene = rownames(avg_03Slide4_mat))
+
+# Join datasets on common genes
+concordance_df <- inner_join(avg_111125ST, avg_03Slide4, by = "Gene")
+
+# Identify top 10 most different genes (outliers from diagonal)
+concordance_df <- concordance_df %>%
+    mutate(diff = abs(log1p(WT_111125ST) - log1p(Slide4_Global))) %>%
+    arrange(desc(diff))
+
+top10_global <- head(concordance_df, 10)
+
+# Determine axis limits for 1:1 scaling
+max_val <- max(log1p(concordance_df$WT_111125ST), log1p(concordance_df$Slide4_Global))
+
+# Plot
+p_global <- ggplot(concordance_df, aes(x = log1p(WT_111125ST), y = log1p(Slide4_Global))) +
+    geom_point(alpha = 0.5, size = 0.5, color = "steelblue") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", linetype = "dashed") +
+    geom_smooth(method = "lm", color = "darkred", linetype = "solid", size = 0.5) +
+    geom_text_repel(data = top10_global, aes(label = Gene), size = 3, box.padding = 0.5) +
+    stat_cor(method = "pearson", label.x = 0.5, label.y = max_val * 0.95) +
+    labs(title = "Global Gene Expression Concordance",
+         subtitle = "111125ST (WT) vs 03Slide4 (Apc Mutant/WT)",
+         x = "log1p(Avg Expression) - 111125ST",
+         y = "log1p(Avg Expression) - 03Slide4") +
+    xlim(0, max_val) + ylim(0, max_val) +
+    coord_fixed() +
+    theme_pubr()
+
+ggsave("../figures/concordance/Global_Concordance.png", p_global, width = 7, height = 7)
+print(p_global)
+```
+
+## 2. Selection-Specific Concordance
+
+For the mutant and WT selections, barcodes come from the **segmented** Seurat object, not from `merged_guts`. We load the segmented object and subset it.
+
+```{r load_segmented}
+cat("Loading segmented Seurat object...\n")
+vhd_list <- readRDS(path_seg_rds)
+seurat_seg <- vhd_list$seg
+seurat_seg <- NormalizeData(seurat_seg, verbose = FALSE)
+cat("Segmented object loaded:", ncol(seurat_seg), "cells\n")
+```
+
+### 2.1 111125ST vs Slide4 Segmented Mutant Selection
+
+```{r mutant_concordance, fig.width=7, fig.height=6}
+# Load Mutant barcodes
+mutant_barcodes <- read_csv(path_mutant_csv)$barcode
+
+# Subset segmented object
+common_mutant <- intersect(mutant_barcodes, Cells(seurat_seg))
+cat("Mutant barcodes matched:", length(common_mutant), "of", length(mutant_barcodes), "\n")
+
+sub_mutant <- subset(seurat_seg, cells = common_mutant)
+
+# Calculate average expression using rowMeans (no identity issues)
+avg_mutant <- data.frame(
+    Slide4_Mutant = rowMeans(as.matrix(GetAssayData(sub_mutant, layer = "data"))) * 2, # Multiply by 2 for visualization
+    Gene = rownames(sub_mutant)
+)
+
+# Join with 111125ST
+mutant_comp_df <- inner_join(avg_111125ST, avg_mutant, by = "Gene")
+
+# Identify top 10 most different genes
+mutant_comp_df <- mutant_comp_df %>%
+    mutate(diff = abs(log1p(WT_111125ST) - log1p(Slide4_Mutant))) %>%
+    arrange(desc(diff))
+
+top10_mutant <- head(mutant_comp_df, 10)
+
+# Axis limits
+max_val_mut <- max(log1p(mutant_comp_df$WT_111125ST), log1p(mutant_comp_df$Slide4_Mutant))
+
+# Plot
+p_mutant <- ggplot(mutant_comp_df, aes(x = log1p(WT_111125ST), y = 2*log1p(Slide4_Mutant))) +
+    geom_point(alpha = 0.5, size = 0.5, color = "indianred") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", linetype = "dashed") +
+    geom_smooth(method = "lm", color = "black", linetype = "solid", size = 0.5) +
+    geom_text_repel(data = top10_mutant, aes(label = Gene), size = 3, box.padding = 0.5) +
+    stat_cor(method = "pearson", label.y = max_val_mut * 0.95) +
+    labs(title = "Concordance: 111125ST vs Slide4 Mutant Selection",
+         x = "log1p(Avg Expression) - 111125ST",
+         y = "log1p(Avg Expression) - Mutant Selection") +
+    xlim(0, max_val_mut) + ylim(0, max_val_mut) +
+    coord_fixed(ratio = 1) +
+    theme_pubr()
+
+ggsave("../figures/concordance/Mutant_Selection_Concordance.png", p_mutant, width = 7, height = 7)
+print(p_mutant)
+```
+
+### 2.2 111125ST vs Slide4 Segmented WT Selection
+
+```{r wt_concordance, fig.width=7, fig.height=6}
+# Load WT barcodes
+wt_barcodes <- read_csv(path_wt_csv)$barcode
+
+# Subset segmented object
+common_wt <- intersect(wt_barcodes, Cells(seurat_seg))
+cat("WT barcodes matched:", length(common_wt), "of", length(wt_barcodes), "\n")
+
+sub_wt <- subset(seurat_seg, cells = common_wt)
+
+# Calculate average expression using rowMeans
+avg_wt_sel <- data.frame(
+    Slide4_WT = rowMeans(as.matrix(GetAssayData(sub_wt, layer = "data"))) * 2, # Multiply by 2 for visualization
+    Gene = rownames(sub_wt)
+)
+
+# Join with 111125ST
+wt_comp_df <- inner_join(avg_111125ST, avg_wt_sel, by = "Gene")
+
+# Identify top 10 most different genes
+wt_comp_df <- wt_comp_df %>%
+    mutate(diff = abs(log1p(WT_111125ST) - log1p(Slide4_WT))) %>%
+    arrange(desc(diff))
+
+top10_wt <- head(wt_comp_df, 10)
+
+# Axis limits
+max_val_wt <- max(log1p(wt_comp_df$WT_111125ST), log1p(wt_comp_df$Slide4_WT))
+
+# Plot
+p_wt <- ggplot(wt_comp_df, aes(x = log1p(WT_111125ST), y = 2*log1p(Slide4_WT))) +
+    geom_point(alpha = 0.5, size = 0.5, color = "darkgreen") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", linetype = "dashed") +
+    geom_smooth(method = "lm", color = "black", linetype = "solid", size = 0.5) +
+    geom_text_repel(data = top10_wt, aes(label = Gene), size = 3, box.padding = 0.5) +
+    stat_cor(method = "pearson", label.y = max_val_wt * 0.95) +
+    labs(title = "Concordance: 111125ST vs Slide4 WT Selection",
+         x = "log1p(Avg Expression) - 111125ST",
+         y = "log1p(Avg Expression) - WT Selection") +
+    xlim(0, max_val_wt) + ylim(0, max_val_wt) +
+    coord_fixed(ratio = 1) +
+    theme_pubr()
+
+ggsave("../figures/concordance/WT_Selection_Concordance.png", p_wt, width = 7, height = 7)
+print(p_wt)
+```
+
+## 3. GO Enrichment of Concordance Outliers
+
+We identify the top 200 differentially expressed genes (100 Up, 100 Down) for both Mutant and WT selections relative to the 111125ST baseline and perform GO enrichment analysis.
+
+```{r go_enrichment, fig.width=10, fig.height=12}
+# 1. Identify Top 400 Up/Down for Mutant Selection
+mutant_comp_df <- mutant_comp_df %>%
+    mutate(log2FC = log2(Slide4_Mutant / WT_111125ST))
+
+mutant_up_all <- mutant_comp_df %>% filter(is.finite(log2FC)) %>% arrange(desc(log2FC)) %>% head(400) %>% pull(Gene)
+mutant_down_all <- mutant_comp_df %>% filter(is.finite(log2FC)) %>% arrange(log2FC) %>% head(400) %>% pull(Gene)
+
+# 2. Identify Top 400 Up/Down for WT Selection
+wt_comp_df <- wt_comp_df %>%
+    mutate(log2FC = log2(Slide4_WT / WT_111125ST))
+
+wt_up_all <- wt_comp_df %>% filter(is.finite(log2FC)) %>% arrange(desc(log2FC)) %>% head(400) %>% pull(Gene)
+wt_down_all <- wt_comp_df %>% filter(is.finite(log2FC)) %>% arrange(log2FC) %>% head(400) %>% pull(Gene)
+
+# 3. Define Mutant-Specific Sets
+# Genes NOT upregulated in WT but ARE in mutant
+mutant_spec_up <- setdiff(mutant_up_all, wt_up_all)
+
+# Genes downregulated in mutant but NOT in WT
+mutant_spec_down <- setdiff(mutant_down_all, wt_down_all)
+
+# 4. Combine into list for compareCluster, including counts in names
+genes_list <- list(mutant_spec_up, mutant_spec_down)
+names(genes_list) <- c(
+    paste0("Mutant_Specific_Up (n=", length(mutant_spec_up), ")"),
+    paste0("Mutant_Specific_Down (n=", length(mutant_spec_down), ")")
+)
+
+# 5. Run compareCluster (BP - Biological Process)
+cat("Running GO Enrichment (BP) for mutant-specific outliers...\n")
+go_cluster <- compareCluster(geneCluster = genes_list, 
+                             fun = "enrichGO", 
+                             OrgDb = org.Dm.eg.db, 
+                             keyType = "SYMBOL", 
+                             ont = "BP", 
+                             pvalueCutoff = 0.05)
+
+# 6. Visualize
+if (!is.null(go_cluster) && nrow(go_cluster) > 0) {
+    p_go <- dotplot(go_cluster, showCategory = 10) +
+        labs(title = "GO Enrichment: Mutant-Specific Outliers (Top 10 Terms)",
+             subtitle = "Mutant-specific = Change observed in Mutant Selection but NOT in WT Selection") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    ggsave("../figures/concordance/Mutant_Specific_Outliers_GO_Dotplot.png", p_go, width = 8, height = 12)
+    print(p_go)
+} else {
+    cat("No significant GO terms found for the mutant-specific outliers.\n")
+}
+
+# 7. Print the number of differential genes
+cat("\nNumber of Mutant-Specific Up-regulated genes:", length(mutant_spec_up), "\n")
+cat("Number of Mutant-Specific Down-regulated genes:", length(mutant_spec_down), "\n")
+```

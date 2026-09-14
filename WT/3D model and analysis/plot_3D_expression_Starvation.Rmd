@@ -1,0 +1,380 @@
+---
+title: "3D Spatial Gene Expression Projection (Starvation - 111125ST)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(plotly)
+library(dplyr)
+library(htmlwidgets)
+```
+
+## Introduction
+This script maps Seurat spatial gene expression data onto a new 3D midgut mesh using a centerline-based approach. It calculates the pseudotime for each mesh vertex by finding the nearest point on the provided centerline.
+
+```{r define_parameters}
+# Parameters
+seurat_obj_path <- "/home/mattia/Thesis/111125ST_def/Random data/merged_guts.rds"
+obj_file_path <- "/home/mattia/Thesis/3D model/Starvation/20230504_Starvation48hOregonR_1_HY_f1_gut.obj"
+centerline_path <- "/home/mattia/Thesis/3D model/Starvation/20230504_Starvation48hOregonR_1_HY_f1.traces"
+output_dir <- "/home/mattia/Thesis/111125ST_def/figures/3D_mesh_plots_starvation"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# The gene to visualize
+gene_name <- "CG5767"
+
+# Trimming and Leakage Prevention
+trim_start <- 7
+trim_end <- 77
+# max_dist_threshold: vertices further than this from the centerline will be grey.
+# We will calculate a default based on the mesh size.
+max_dist_val <- NULL 
+```
+
+## Load Data
+```{r load_data}
+cat("Loading Seurat Object...\n")
+seurat_obj <- readRDS(seurat_obj_path)
+
+if (!gene_name %in% rownames(seurat_obj[["Segmented"]])) {
+  stop(paste("Gene", gene_name, "not found in the 'Segmented' assay of the Seurat object."))
+}
+
+cat("Extracting expression and pseudotime data...\n")
+data_df <- FetchData(seurat_obj, vars = c(gene_name, "Spatial_Pseudotime"))
+colnames(data_df) <- c("Expression", "Pseudotime")
+
+# Remove NA pseudotime cells
+data_df <- data_df[!is.na(data_df$Pseudotime), ]
+```
+
+## Parse 3D Mesh
+```{r parse_mesh}
+cat("Parsing OBJ file...\n")
+obj_lines <- readLines(obj_file_path)
+
+v_lines <- obj_lines[startsWith(obj_lines, "v ")]
+f_lines <- obj_lines[startsWith(obj_lines, "f ")]
+
+# Extract vertices
+v_matrix <- do.call(rbind, lapply(strsplit(v_lines, " "), function(x) {
+  as.numeric(x[x != "v" & x != ""])
+}))
+
+# Extract faces (OBJ is 1-indexed, plotly needs 0-indexed)
+f_matrix <- do.call(rbind, lapply(strsplit(f_lines, " "), function(x) {
+  v_indices <- sapply(x[x != "f" & x != ""], function(y) as.numeric(strsplit(y, "/")[[1]][1]))
+  v_indices - 1 # convert to 0-indexed
+}))
+
+num_vertices <- nrow(v_matrix)
+```
+
+## Parse Centerline
+The `.traces` file is gzipped and typically contains XML-like structure with points.
+```{r parse_centerline}
+cat("Parsing Centerline...\n")
+# Read gzipped file
+con <- gzfile(centerline_path, "rt")
+trace_lines <- readLines(con)
+close(con)
+
+# Extract points (assuming <point x="..." y="..." z="..." ... /> format)
+# We use grep to be robust if xml2 is not installed
+pt_lines <- trace_lines[grep("<point", trace_lines)]
+
+extract_coord <- function(line, coord) {
+  pattern <- paste0(coord, "=\"([^\"]+)\"")
+  regmatches(line, regexec(pattern, line))[[1]][2] %>% as.numeric()
+}
+
+centerline_pts <- data.frame(
+  x = sapply(pt_lines, extract_coord, "x"),
+  y = sapply(pt_lines, extract_coord, "y"),
+  z = sapply(pt_lines, extract_coord, "z")
+)
+
+# Remove any NA points
+centerline_pts <- na.omit(centerline_pts)
+
+# Calculate cumulative distance along centerline
+diffs <- diff(as.matrix(centerline_pts[, 1:3]))
+dists <- sqrt(rowSums(diffs^2))
+cum_dists <- c(0, cumsum(dists))
+centerline_pts$cum_dist <- cum_dists
+centerline_pts$pt_scale <- (cum_dists / max(cum_dists)) * 100
+
+# Debugging Coordinate Ranges
+cat("Coordinate Ranges:\n")
+cat("Mesh Vertices:\n")
+print(apply(v_matrix, 2, range))
+cat("Centerline Points:\n")
+print(apply(centerline_pts[, 1:3], 2, range))
+
+# If the scales are vastly different, we may need to normalize.
+# We'll calculate a simple scale factor based on the bounding box diagonal
+mesh_diag <- sqrt(sum((apply(v_matrix, 2, max) - apply(v_matrix, 2, min))^2))
+line_diag <- sqrt(sum((apply(centerline_pts[, 1:3], 2, max) - apply(centerline_pts[, 1:3], 2, min))^2))
+
+cat(paste("Mesh diagonal:", mesh_diag, "\n"))
+cat(paste("Line diagonal:", line_diag, "\n"))
+
+# If the difference is more than 10x, we normalize both to 0-1 for the NN search
+if (abs(log10(mesh_diag / line_diag)) > 0.5) {
+  cat("Vastly different scales detected. Normalizing coordinates for Nearest Neighbor search...\n")
+  
+  normalize_coords <- function(m) {
+    apply(m, 2, function(x) (x - min(x)) / (max(x) - min(x)))
+  }
+  
+  v_matrix_norm <- normalize_coords(v_matrix)
+  centerline_pts_norm <- normalize_coords(as.matrix(centerline_pts[, 1:3]))
+} else {
+  v_matrix_norm <- v_matrix
+  centerline_pts_norm <- as.matrix(centerline_pts[, 1:3])
+}
+```
+
+## Map Vertices to Centerline
+For each vertex, we find the nearest point on the centerline and assign its scaled distance.
+```{r map_vertices}
+cat("Mapping vertices to centerline...\n")
+
+mesh_cache_file <- file.path(output_dir, "tube_mesh_cache.rds")
+
+if (file.exists(mesh_cache_file)) {
+  cat("Loading cached Tube Mesh...\n")
+  mesh_data <- readRDS(mesh_cache_file)
+  v_matrix <- mesh_data$v_matrix
+  f_matrix <- mesh_data$f_matrix
+  tube_pt <- mesh_data$tube_pt
+  vertex_centerline_idx <- mesh_data$vertex_centerline_idx
+  vertex_pseudotime <- mesh_data$vertex_pseudotime
+  final_mask <- mesh_data$final_mask
+  centerline_pts <- mesh_data$centerline_pts
+  num_vertices <- nrow(v_matrix)
+} else {
+  # --- NEW: Synthetic Tube Mesh Generator ---
+  cat("Aligning centerline to mesh and generating Tube Mesh...\n")
+  
+  # 1. Strict Coordinate Alignment
+  # We shift and scale the centerline to fit exactly inside the mesh bounding box
+  mesh_min <- apply(v_matrix, 2, min)
+  mesh_max <- apply(v_matrix, 2, max)
+  line_min <- apply(centerline_pts[, 1:3], 2, min)
+  line_max <- apply(centerline_pts[, 1:3], 2, max)
+  
+  # Shift to 0 and scale to 1
+  normalize_v <- function(v, min_v, max_v) (v - min_v) / (max_v - min_v)
+  # Map 0-1 back to mesh space
+  denormalize_v <- function(v, min_v, max_v) v * (max_v - min_v) + min_v
+  
+  line_norm <- sweep(centerline_pts[, 1:3], 2, line_min, "-")
+  line_norm <- sweep(line_norm, 2, (line_max - line_min), "/")
+  
+  # Final aligned centerline points
+  line_aligned <- sweep(line_norm, 2, (mesh_max - mesh_min), "*")
+  line_aligned <- sweep(line_aligned, 2, mesh_min, "+")
+  centerline_pts[, 1:3] <- line_aligned
+  
+  # 2. Calculate local radii from aligned coordinates
+  cat("Extracting local radii (max of k=1000)...\n")
+  # Use the original mesh (v_matrix) to find radii
+  nn_radius <- RANN::nn2(data = v_matrix, query = centerline_pts[, 1:3], k = 1000)
+  # Use the maximum distance among 1000 neighbors to ensure the tube is thick enough
+  centerline_pts$radius <- apply(nn_radius$nn.dists, 1, max) * 2
+  
+  # Smooth radii using a simple moving average (no external packages)
+  smooth_vec <- function(x, n=5){ stats::filter(x, rep(1/n, n), sides=2) }
+  centerline_pts$radius <- as.numeric(smooth_vec(centerline_pts$radius))
+  centerline_pts$radius[is.na(centerline_pts$radius)] <- mean(centerline_pts$radius, na.rm = TRUE)
+  
+  # 3. Generate Tube Geometry
+  n_points_circle <- 20
+  num_sections <- nrow(centerline_pts)
+  
+  tube_v <- matrix(0, nrow = num_sections * n_points_circle, ncol = 3)
+  tube_pt <- rep(0, nrow(tube_v))
+  
+  # Helper to get perpendicular vectors (Parallel Transport Frame logic)
+  cross_prod <- function(a, b) {
+    c(a[2]*b[3] - a[3]*b[2], a[3]*b[1] - a[1]*b[3], a[1]*b[2] - a[2]*b[1])
+  }
+  get_frame <- function(tangent, prev_u = NULL) {
+    tangent <- tangent / sqrt(sum(tangent^2))
+    if (is.null(prev_u)) {
+      u <- if(abs(tangent[1]) < 0.9) c(1,0,0) else c(0,1,0)
+      u <- cross_prod(u, tangent)
+    } else {
+      u <- prev_u
+    }
+    u <- u / sqrt(sum(u^2))
+    v <- cross_prod(tangent, u)
+    v <- v / sqrt(sum(v^2))
+    u <- cross_prod(v, tangent)
+    u <- u / sqrt(sum(u^2))
+    return(list(u = u, v = v))
+  }
+  
+  prev_frame <- NULL
+  for (i in 1:num_sections) {
+    p <- as.numeric(centerline_pts[i, 1:3])
+    r <- centerline_pts$radius[i]
+    
+    if (i < num_sections) {
+      tangent <- as.numeric(centerline_pts[i+1, 1:3] - centerline_pts[i, 1:3])
+    } else {
+      tangent <- as.numeric(centerline_pts[i, 1:3] - centerline_pts[i-1, 1:3])
+    }
+    
+    frame <- get_frame(tangent, prev_frame$u)
+    prev_frame <- frame
+    
+    angles <- seq(0, 2*pi, length.out = n_points_circle + 1)[1:n_points_circle]
+    for (j in 1:n_points_circle) {
+      idx <- (i-1)*n_points_circle + j
+      tube_v[idx, ] <- p + r * (cos(angles[j]) * frame$u + sin(angles[j]) * frame$v)
+      tube_pt[idx] <- centerline_pts$pt_scale[i]
+    }
+  }
+  
+  # 3. Build Tube Faces
+  tube_f <- matrix(0, nrow = (num_sections - 1) * n_points_circle * 2, ncol = 3)
+  f_idx <- 1
+  for (i in 1:(num_sections - 1)) {
+    for (j in 1:n_points_circle) {
+      p1 <- (i-1)*n_points_circle + j
+      p2 <- (i-1)*n_points_circle + (j %% n_points_circle) + 1
+      p3 <- i*n_points_circle + j
+      p4 <- i*n_points_circle + (j %% n_points_circle) + 1
+      
+      # Two triangles per quad
+      tube_f[f_idx, ] <- c(p1, p2, p3) - 1
+      tube_f[f_idx+1, ] <- c(p2, p4, p3) - 1
+      f_idx <- f_idx + 2
+    }
+  }
+  
+  # Replace original mesh with tube mesh for visualization
+  v_matrix <- tube_v
+  f_matrix <- tube_f
+  num_vertices <- nrow(v_matrix)
+  # For compatibility with plotting function text
+  vertex_centerline_idx <- rep(1:num_sections, each = n_points_circle)
+  
+  # 4. Trimming and Masking (Simplified for the Tube)
+  # Map to 0-100 scale within the trimmed segment
+  vertex_pseudotime <- rep(NA, num_vertices)
+  midgut_mask <- tube_pt >= trim_start & tube_pt <= trim_end
+  vertex_pseudotime[midgut_mask] <- ((tube_pt[midgut_mask] - trim_start) / (trim_end - trim_start)) * 100
+  final_mask <- midgut_mask
+  
+  # Save to cache
+  mesh_data <- list(
+    v_matrix = v_matrix,
+    f_matrix = f_matrix,
+    tube_pt = tube_pt,
+    vertex_centerline_idx = vertex_centerline_idx,
+    vertex_pseudotime = vertex_pseudotime,
+    final_mask = final_mask,
+    centerline_pts = centerline_pts
+  )
+  saveRDS(mesh_data, mesh_cache_file)
+  cat(paste("Saved Tube Mesh cache to:", mesh_cache_file, "\n"))
+}
+```
+
+## Compute Expression
+```{r compute_expression}
+# Compute Raw (Binned) Expression
+data_df$bin <- cut(data_df$Pseudotime, breaks = seq(0, 100, length.out = 101), include.lowest = TRUE, labels = FALSE)
+bin_means <- data_df %>% group_by(bin) %>% summarize(mean_expr = mean(Expression), .groups = 'drop')
+
+vertex_raw_expr <- rep(NA, num_vertices)
+# Only map for the final smoothed mask
+valid_pt <- vertex_pseudotime[final_mask]
+vertex_bin <- cut(valid_pt, breaks = seq(0, 100, length.out = 101), include.lowest = TRUE, labels = FALSE)
+
+matched_expr <- bin_means$mean_expr[match(vertex_bin, bin_means$bin)]
+matched_expr[is.na(matched_expr)] <- 0
+vertex_raw_expr[final_mask] <- matched_expr
+
+# Compute LOESS Smoothed Expression
+loess_model <- loess(Expression ~ Pseudotime, data = data_df, span = 0.3)
+vertex_smooth_expr <- rep(NA, num_vertices)
+predicted_expr <- predict(loess_model, newdata = data.frame(Pseudotime = vertex_pseudotime[final_mask]))
+predicted_expr[predicted_expr < 0] <- 0
+vertex_smooth_expr[final_mask] <- predicted_expr
+```
+
+## Plotting Function
+```{r define_plot_function}
+generate_mesh_plot <- function(expr_values, title, filename) {
+  pal <- colorRamp(c("#440154", "#3b528b", "#21908c", "#5dc863", "#fde725"))
+  
+  min_expr <- min(expr_values, na.rm = TRUE)
+  max_expr <- max(expr_values, na.rm = TRUE)
+  
+  if (max_expr == min_expr) {
+    norm_expr <- rep(0, length(expr_values))
+  } else {
+    norm_expr <- (expr_values - min_expr) / (max_expr - min_expr)
+  }
+  
+  vertex_colors <- rep("rgb(220, 220, 220)", num_vertices) # Default grey for trimmed/distant sections
+  
+  valid_idx <- !is.na(expr_values)
+  colors_rgb <- pal(norm_expr[valid_idx])
+  colors_rgb[is.na(colors_rgb)] <- 0
+  
+  vertex_colors[valid_idx] <- apply(colors_rgb, 1, function(x) paste0("rgb(", x[1], ",", x[2], ",", x[3], ")"))
+  
+  fig <- plot_ly(
+    x = v_matrix[, 1],
+    y = v_matrix[, 2],
+    z = v_matrix[, 3],
+    i = f_matrix[, 1],
+    j = f_matrix[, 2],
+    k = f_matrix[, 3],
+    type = "mesh3d",
+    vertexcolor = vertex_colors,
+    name = title,
+    hoverinfo = "text",
+    text = ifelse(valid_idx, 
+                  paste("Expr:", round(expr_values, 2), "<br>Pseudotime:", round(vertex_pseudotime, 1)), 
+                  "Excluded Section")
+  )
+  
+  fig <- fig %>% layout(
+    title = title,
+    scene = list(
+      aspectmode = "data",
+      xaxis = list(title = "X"),
+      yaxis = list(title = "Y"),
+      zaxis = list(title = "Z")
+    )
+  )
+  
+  out_file <- file.path(output_dir, filename)
+  saveWidget(fig, file = out_file, selfcontained = FALSE)
+  cat(paste("Saved plot to:", out_file, "\n"))
+  
+  return(fig)
+}
+```
+
+## Generate Plots
+### Raw Expression
+```{r plot_raw}
+fig_raw <- generate_mesh_plot(vertex_raw_expr, paste(gene_name, "- Raw Expression (Starvation)"), paste0(gene_name, "_raw_3D_starvation.html"))
+fig_raw
+```
+
+### Smoothed Expression
+```{r plot_smoothed}
+fig_smoothed <- generate_mesh_plot(vertex_smooth_expr, paste(gene_name, "- Smoothed Expression (Starvation)"), paste0(gene_name, "_smoothed_3D_starvation.html"))
+fig_smoothed
+```

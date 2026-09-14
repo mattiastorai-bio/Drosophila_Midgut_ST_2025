@@ -1,0 +1,255 @@
+---
+title: "Topological Association Analysis (ST) - New 3D Model"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(Rvcg)
+library(rgl)
+library(dplyr)
+library(dbscan)
+library(ggplot2)
+```
+
+## 1. Introduction
+This script identifies topologically associated areas in the gut mesh—regions physically touching (low Euclidean distance) but topologically distant along the tube (high pseudotime distance). It utilizes the **new 3D modelling approach** directly painting the `gut.obj` mesh instead of the old Plotly scatter cache.
+
+## 2. Load 3D Model and Data
+
+```{r load_data}
+blender_dir <- "/home/mattia/Thesis/3D model"
+swc_dir <- "/mnt/d/BlackieGasparEtAl2024-sourceData/BlackieGasparEtAl2024-sourceData/OregonR/Centrelines"
+
+# 1. Load Meshes
+gut_mesh <- vcgImport(file.path(blender_dir, "gut.obj"))
+
+# 2. Load Centreline
+swc_file <- file.path(swc_dir, "M4T.swc")
+centreline <- read.table(swc_file, comment.char = "#")
+colnames(centreline) <- c("id", "type", "x", "y", "z", "radius", "parent")
+
+# Align Centreline to Gut Mesh
+c_pts <- centreline[, c("x", "y", "z")]
+gut_pts <- t(gut_mesh$vb[1:3, ])
+
+c_center <- colMeans(c_pts)
+gut_center <- colMeans(gut_pts)
+
+c_aligned <- sweep(c_pts, 2, c_center, "-")
+c_aligned <- c_aligned * 1.20 # Scale
+c_aligned <- sweep(c_aligned, 2, gut_center, "+")
+
+centreline$x <- c_aligned[, "x"]
+centreline$y <- c_aligned[, "y"]
+centreline$z <- c_aligned[, "z"]
+
+# Calculate cumulative percentage length
+pts <- as.matrix(centreline[, c("x", "y", "z")])
+dists <- sqrt(rowSums((pts[-1,] - pts[-nrow(pts),])^2))
+centreline$cum_dist <- c(0, cumsum(dists))
+centreline$pct_length <- centreline$cum_dist / max(centreline$cum_dist)
+
+# Map pct_length to ST Pseudotime (0-100 scale)
+pt_nodes <- (centreline$pct_length - 0.05) / 0.90 * 100
+
+# Pre-calculate nearest node for each mesh vertex to paint the mesh later!
+cat("Mapping", nrow(gut_pts), "mesh vertices to centreline...\n")
+nearest_node_idx <- integer(nrow(gut_pts))
+for(i in 1:nrow(gut_pts)) {
+  dsq <- (pts[,1] - gut_pts[i,1])^2 + 
+         (pts[,2] - gut_pts[i,2])^2 + 
+         (pts[,3] - gut_pts[i,3])^2
+  nearest_node_idx[i] <- which.min(dsq)
+}
+
+# 3. Load ST Object
+st_path <- "../Random data/merged_guts.rds"
+st_obj <- readRDS(st_path)
+st_obj <- subset(st_obj, cells = grep("^Gut3_", Cells(st_obj), value = TRUE))
+
+valid_spots <- !is.na(st_obj$Spatial_Pseudotime)
+st_obj <- subset(st_obj, cells = Cells(st_obj)[valid_spots])
+
+if ("SCT" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "SCT"
+} else if ("Segmented" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "Segmented"
+}
+```
+
+## 3. Find Topological Contacts
+
+```{r find_contacts}
+# 1. Euclidean vs Pseudotime Distances of the Centreline Nodes
+euc_dist <- as.matrix(dist(pts))
+pt_dist <- as.matrix(dist(pt_nodes))
+
+# We use a strict Euclidean threshold (0.12) to ensure we only capture the most intimately touching segments 
+# strictly confined to the highly coiled middle region, without bleeding along the tube.
+contact_matrix <- (euc_dist < 0.12) & (pt_dist > 15)
+
+contact_pairs <- which(contact_matrix, arr.ind = TRUE)
+contact_pairs <- contact_pairs[contact_pairs[,1] < contact_pairs[,2], , drop = FALSE]
+
+if(nrow(contact_pairs) == 0) {
+  stop("No topological contacts found.")
+}
+
+pt_coords <- data.frame(
+  pt1 = pt_nodes[contact_pairs[,1]],
+  pt2 = pt_nodes[contact_pairs[,2]]
+)
+
+eps_val <- 1.5 
+clusters <- dbscan::dbscan(pt_coords, eps = eps_val, minPts = 3)
+
+contact_pairs_df <- data.frame(
+  idx1 = contact_pairs[,1],
+  idx2 = contact_pairs[,2],
+  pt1 = pt_coords$pt1,
+  pt2 = pt_coords$pt2,
+  cluster = clusters$cluster
+) %>% filter(cluster > 0)
+
+num_clusters <- length(unique(contact_pairs_df$cluster))
+cat(paste("Found", num_clusters, "unique topological associations.\n"))
+
+# Extract regions
+contact_regions_list <- list()
+for (c in unique(contact_pairs_df$cluster)) {
+  c_pairs <- contact_pairs_df %>% filter(cluster == c)
+  contact_regions_list[[as.character(c)]] <- list(
+    seg1 = c(min(c_pairs$pt1), max(c_pairs$pt1)),
+    seg2 = c(min(c_pairs$pt2), max(c_pairs$pt2)),
+    nodes1 = unique(c_pairs$idx1),
+    nodes2 = unique(c_pairs$idx2)
+  )
+}
+```
+
+## 4. Visualize Global Topological Associations in 3D
+
+Before running the heavy differential gene expression, we can instantly visualize all detected topological loops globally on the 3D gut mesh.
+
+```{r plot_global_associations, rgl=TRUE}
+# Base mesh in light semi-transparent grey
+v_colors_global <- rep("grey90", nrow(gut_pts))
+
+# Define a palette of bright distinct colors for the loops
+loop_colors <- c("firebrick1", "dodgerblue1", "forestgreen", "darkorchid1", "darkorange1")
+
+for (i in seq_along(names(contact_regions_list))) {
+  c <- names(contact_regions_list)[i]
+  bounds <- contact_regions_list[[c]]
+  
+  col_to_use <- loop_colors[(i %% length(loop_colors)) + 1]
+  
+  # Paint both interacting segments of the loop with the same distinct color
+  v_colors_global[nearest_node_idx %in% bounds$nodes1] <- col_to_use
+  v_colors_global[nearest_node_idx %in% bounds$nodes2] <- col_to_use
+}
+
+gut_mesh_global <- gut_mesh
+gut_mesh_global$material$color <- v_colors_global
+
+open3d()
+shade3d(gut_mesh_global, alpha = 0.95)
+lines3d(centreline$x, centreline$y, centreline$z, color = "black", lwd = 2, alpha = 0.5)
+aspect3d("iso")
+view3d(theta = 45, phi = 30, zoom = 0.8)
+text3d(x = min(gut_pts[,1]), y = max(gut_pts[,2]), z = max(gut_pts[,3]), 
+       texts = paste("Global Topological Associations (N =", num_clusters, ")"), 
+       col = "black", cex = 2)
+```
+
+## 5. DGE and Local Visualization per Association
+
+```{r dge_and_plot, rgl=TRUE, fig.width=8, fig.height=4}
+cell_pt <- st_obj$Spatial_Pseudotime
+window <- 2 
+
+for (c in names(contact_regions_list)) {
+  assoc_name <- paste0("Association_", c)
+  cat(paste("\n\n###", assoc_name, "\n"))
+  
+  bounds <- contact_regions_list[[c]]
+  
+  # --- 1. RENDER 3D MESH ---
+  # Color the mesh mapping to Seg1 (red) and Seg2 (blue)
+  v_colors <- rep("grey80", nrow(gut_pts))
+  
+  v_colors[nearest_node_idx %in% bounds$nodes1] <- "firebrick1"
+  v_colors[nearest_node_idx %in% bounds$nodes2] <- "dodgerblue1"
+  
+  # Create localized mesh
+  gut_mesh_assoc <- gut_mesh
+  gut_mesh_assoc$material$color <- v_colors
+  
+  open3d()
+  shade3d(gut_mesh_assoc, alpha = 0.9)
+  lines3d(centreline$x, centreline$y, centreline$z, color = "black", lwd = 2, alpha = 0.5)
+  aspect3d("iso")
+  view3d(theta = 45, phi = 30, zoom = 0.8)
+  text3d(x = min(gut_pts[,1]), y = max(gut_pts[,2]), z = max(gut_pts[,3]), 
+         texts = paste("Topological Loop:", assoc_name), col = "black", cex = 2)
+  
+  # --- 2. DIFFERENTIAL GENE EXPRESSION ---
+  is_in_seg1 <- !is.na(cell_pt) & (cell_pt >= (bounds$seg1[1] - window) & cell_pt <= (bounds$seg1[2] + window))
+  is_in_seg2 <- !is.na(cell_pt) & (cell_pt >= (bounds$seg2[1] - window) & cell_pt <= (bounds$seg2[2] + window))
+  
+  cells_in_seg1 <- colnames(st_obj)[is_in_seg1]
+  cells_in_seg2 <- colnames(st_obj)[is_in_seg2]
+  cells_in_contact <- unique(c(cells_in_seg1, cells_in_seg2))
+  cells_out <- colnames(st_obj)[!colnames(st_obj) %in% cells_in_contact]
+  
+  if (length(cells_in_contact) > 10 && length(cells_out) > 10) {
+    ident_vec <- rep("Rest", ncol(st_obj))
+    names(ident_vec) <- colnames(st_obj)
+    ident_vec[cells_in_contact] <- "Contact"
+    Idents(st_obj) <- ident_vec
+    
+    markers <- FindMarkers(st_obj, ident.1 = "Contact", ident.2 = "Rest", 
+                           min.pct = 0.20, logfc.threshold = 0.40, return.thresh = 0.05, only.pos = TRUE)
+    markers <- markers %>% filter((pct.1 - pct.2) > 0.15)
+    
+    expr_data <- GetAssayData(st_obj, layer = "data")[rownames(markers), , drop=FALSE]
+    pct_seg1 <- rowMeans(expr_data[, cells_in_seg1, drop=FALSE] > 0)
+    pct_seg2 <- rowMeans(expr_data[, cells_in_seg2, drop=FALSE] > 0)
+    
+    valid_genes <- rownames(markers)[pct_seg1 >= 0.20 & pct_seg2 >= 0.20]
+    markers <- markers[valid_genes, ]
+    
+    top_markers <- markers %>% filter(p_val_adj < 0.05) %>% head(3) # Plot top 3
+    
+    if(nrow(top_markers) > 0) {
+      for (gene in rownames(top_markers)) {
+        data_df <- FetchData(st_obj, vars = c(gene, "Spatial_Pseudotime"))
+        colnames(data_df) <- c("Expression", "Pseudotime")
+        data_df <- data_df[!is.na(data_df$Pseudotime), ]
+        
+        y_min <- min(data_df$Expression, na.rm = TRUE) - 0.5
+        y_max <- max(data_df$Expression, na.rm = TRUE) + 0.5
+        
+        p <- ggplot(data_df, aes(x = Pseudotime, y = Expression)) +
+          geom_point(alpha = 0.3, size = 1, color = "grey50") +
+          geom_smooth(method = "loess", span = 0.3, color = "darkblue", se = FALSE) +
+          geom_rect(aes(xmin = bounds$seg1[1] - window, xmax = bounds$seg1[2] + window, 
+                        ymin = y_min, ymax = y_max), fill = "firebrick1", alpha = 0.02, inherit.aes = FALSE) +
+          geom_rect(aes(xmin = bounds$seg2[1] - window, xmax = bounds$seg2[2] + window, 
+                        ymin = y_min, ymax = y_max), fill = "dodgerblue1", alpha = 0.02, inherit.aes = FALSE) +
+          theme_minimal() +
+          labs(title = paste(gene, "Expression -", assoc_name),
+               subtitle = paste("Log2FC:", round(top_markers[gene, "avg_log2FC"], 2)))
+        
+        print(p)
+      }
+    } else {
+      cat("No significant co-expressed markers found.\n")
+    }
+  } else {
+    cat("Not enough cells for DGE.\n")
+  }
+}
+```

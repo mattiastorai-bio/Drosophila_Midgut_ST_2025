@@ -1,0 +1,210 @@
+---
+title: "EE Regional Correlation Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+library(Matrix.utils)
+library(pheatmap)
+library(patchwork)
+
+# Paths
+sc_data_path <- "/home/mattia/Thesis/111125ST_def/Random data/EE_with_spatial_scores.rds"
+sc_ref_path <- "/home/mattia/Thesis/Single-cell/EE-single-cell/GSE132274_RAW(1)"
+```
+
+## 1. Load and Harmonize Gene Names
+
+We must clean the gene names (remove version decimals, uppercase) and aggregate duplicates before proceeding to ensure markers are found.
+
+```{r load_and_clean}
+# 1. Load Spatial EE Data
+if (!file.exists(sc_data_path)) stop("Spatial EE data not found.")
+sc_data <- readRDS(sc_data_path)
+
+# 2. Load Reference EE Data
+counts <- Read10X(data.dir = sc_ref_path)
+
+# --- ROBUST GENE CLEANING ---
+clean_genes <- function(counts_matrix) {
+  raw_names <- rownames(counts_matrix)
+  # Remove version suffixes like .1, .2 and convert to uppercase
+  clean_names <- toupper(gsub("\\..*$", "", raw_names))
+  
+  # Aggregate duplicates by summing counts
+  if (any(duplicated(clean_names))) {
+    message("Aggregating duplicated gene names...")
+    counts_matrix <- Matrix.utils::aggregate.Matrix(
+      counts_matrix, 
+      group = clean_names, 
+      fun = "sum"
+    )
+  } else {
+    rownames(counts_matrix) <- clean_names
+  }
+  return(counts_matrix)
+}
+
+# Clean both
+sc_ref_counts_clean <- clean_genes(counts)
+sc_data_counts_clean <- clean_genes(GetAssayData(sc_data, assay = "SCT", layer = "counts"))
+
+# Re-initialize Seurat objects with clean names
+sc_ref <- CreateSeuratObject(counts = sc_ref_counts_clean)
+sc_data_clean <- CreateSeuratObject(counts = sc_data_counts_clean)
+
+# Transmit metadata back to sc_data_clean
+sc_data_clean@meta.data <- sc_data@meta.data
+sc_data <- sc_data_clean
+
+# Normalize sc_data since it is now a fresh object with "RNA" assay
+sc_data <- NormalizeData(sc_data)
+
+message("Gene name harmonization and normalization complete.")
+```
+
+## 2. Process Reference and Map Clusters to Regions
+
+```{r process_ref}
+# 2. Reference Processing (t-SNE at Res 0.4)
+sc_ref <- NormalizeData(sc_ref)
+sc_ref <- FindVariableFeatures(sc_ref, nfeatures = 2000)
+sc_ref <- ScaleData(sc_ref)
+sc_ref <- RunPCA(sc_ref, verbose = FALSE)
+sc_ref <- FindNeighbors(sc_ref, dims = 1:20)
+sc_ref <- FindClusters(sc_ref, resolution = 0.4) # Requested resolution
+sc_ref <- RunTSNE(sc_ref, dims = 1:20) # Use t-SNE
+
+# --- FOOLPROOF MANUAL MAPPING ---
+# Logic: Cluster IDs are strings. We map them directly to regions.
+cluster_ids <- as.character(Idents(sc_ref))
+regions_vec <- rep("Unknown", length(cluster_ids))
+
+# According to the image mapping:
+regions_vec[cluster_ids %in% c("2", "3", "8", "9", "10")] <- "Anterior"
+regions_vec[cluster_ids %in% c("0", "1", "4")] <- "Middle"
+regions_vec[cluster_ids %in% c("5", "6", "7")] <- "Posterior"
+
+# Assign back to the object metadata
+sc_ref[["Region"]] <- factor(regions_vec, levels = c("Anterior", "Middle", "Posterior", "Unknown"))
+
+# PLOT: Verify results
+p1 <- DimPlot(sc_ref, reduction = "tsne", label = TRUE) + NoLegend() + ggtitle("Reference t-SNE (Res 0.4)")
+p2 <- DimPlot(sc_ref, group.by = "Region", reduction = "tsne", 
+              cols = c("Anterior" = "blue", "Middle" = "green", "Posterior" = "red", "Unknown" = "grey80")) + 
+      ggtitle("Manual Regional Assignment")
+
+p1 + p2
+
+# --- DIAGNOSTIC PRINT ---
+message("Manual Cluster Assignments Summary:")
+print(table(sc_ref$Region, Idents(sc_ref)))
+```
+
+## 3. Verify Spatial Data
+
+Using the `region_prediction` (R1-R5) labels for the spatial datasets.
+
+```{r verify_spatial}
+if ("region_prediction" %in% colnames(sc_data@meta.data)) {
+  message("Collapsing spatial data regions:")
+  # Group R1+R2 and R4+R5
+  sc_data$Spatial_Region <- case_when(
+    sc_data$region_prediction %in% c("R1", "R2") ~ "R1-R2",
+    sc_data$region_prediction == "R3" ~ "R3",
+    sc_data$region_prediction %in% c("R4", "R5") ~ "R4-R5",
+    TRUE ~ "Other"
+  )
+  
+  sc_data$Spatial_Region <- factor(sc_data$Spatial_Region, levels = c("R1-R2", "R3", "R4-R5"))
+  print(table(sc_data$Spatial_Region))
+} else {
+  stop("Column 'region_prediction' not found in spatial data.")
+}
+```
+
+## 4. Region-wise Correlation Analysis
+
+```{r correlation}
+# 1. Calculate average expression per region for common genes
+common_genes <- intersect(rownames(sc_data), rownames(sc_ref))
+message("Number of common genes for correlation: ", length(common_genes))
+
+# We use the factor levels we established earlier
+avg_spatial <- AverageExpression(sc_data, features = common_genes, group.by = "Spatial_Region", assay = "RNA")$RNA
+avg_ref <- AverageExpression(sc_ref, features = common_genes, group.by = "Region", assay = "RNA")$RNA
+
+# Ensure we only use the three biological regions (Anterior, Middle, Posterior) for the comparison
+# even if some clusters were 'Unknown'
+biological_regions <- c("Anterior", "Middle", "Posterior")
+avg_ref_sub <- avg_ref[, intersect(colnames(avg_ref), biological_regions), drop=FALSE]
+
+# 2. Compute Spearman Correlation Matrix
+cor_matrix <- cor(as.matrix(avg_spatial), as.matrix(avg_ref_sub), method = "spearman")
+
+# 3. Visualization
+library(pheatmap)
+pheatmap(cor_matrix, 
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE,
+         display_numbers = TRUE,
+         main = "Region-wise Correlation (Collapsed Spatial vs Ref Regions)",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         labels_row = paste0("Spatial: ", rownames(cor_matrix)),
+         labels_col = paste0("Ref: ", colnames(cor_matrix)))
+```
+## 5. Marker Visualization on Reference t-SNE
+
+Visualizing the 56 EE spatial markers in batches of 6. We also include TK (Anterior marker) and AstC (Posterior/Middle marker) for regional context.
+
+```{r marker_visualization}
+# 1. Get the list of 56 EE markers from the research
+ee_markers_file <- "/home/mattia/Thesis/111125ST_def/Random data/celltype_specific_spatial_EE.csv"
+ee_markers_df <- read.csv(ee_markers_file)
+ee_markers <- ee_markers_df$gene
+
+# 2. Filter for genes present in reference
+ee_markers_present <- intersect(ee_markers, rownames(sc_ref))
+message("Found ", length(ee_markers_present), " out of ", length(ee_markers), " markers in reference data.")
+
+# 3. Add Key Regional Markers for Reference
+key_ref_markers <- c("TK", "ASTC")
+all_to_plot <- unique(c(key_ref_markers, ee_markers_present))
+
+# 4. Batch Plotting (6 per window)
+batch_size <- 6
+num_batches <- ceiling(length(all_to_plot) / batch_size)
+
+for (i in 1:num_batches) {
+  start_idx <- (i - 1) * batch_size + 1
+  end_idx <- min(i * batch_size, length(all_to_plot))
+  current_batch <- all_to_plot[start_idx:end_idx]
+  
+  p <- FeaturePlot(sc_ref, 
+                   features = current_batch, 
+                   reduction = "tsne", 
+                   cols = c("grey90", "red"),
+                   ncol = 3) + 
+       plot_annotation(title = paste0("EE Spatial Markers - Batch ", i))
+  
+  print(p)
+}
+
+# 5. Regional Enrichment Logic
+# We can determine if a gene is in an 'Anterior' or 'Posterior' cluster 
+# by looking at overlap with TK (Anterior) vs ASTC (Posterior/Middle).
+avg_expr_by_cluster <- AverageExpression(sc_ref, features = all_to_plot, group.by = "Region", assay = "RNA")$RNA
+
+message("\n--- Regional Enrichment Summary for Top Markers ---")
+# Print a simple logic check for the top 10 markers
+top_10_markers <- head(ee_markers_present, 10)
+for (m in top_10_markers) {
+  exprs <- avg_expr_by_cluster[m, ]
+  peak_region <- names(which.max(exprs))
+  message(m, " peaks in: ", peak_region)
+}
+```

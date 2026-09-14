@@ -1,0 +1,431 @@
+---
+title: "EB Subcluster Gene Modules & Markers"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+library(viridis)
+library(patchwork)
+```
+
+## 1. Load Data
+
+```{r load_data}
+# SC EB object with 5 subclusters and spatial module scores
+sc_eb <- readRDS("../Random data/sc_eb_spatial_modules.rds")
+DefaultAssay(sc_eb) <- "SCT"
+
+# Pre-computed markers with named subclusters (aEB, mEB1, mEB2, pEB, pLFC)
+markers_named <- read.csv("../Excels/EB_Subcluster_Components_Renamed.csv")
+
+cat("EB cells:", ncol(sc_eb), "\n")
+cat("Subclusters (Combined_Cluster):", paste(sort(unique(sc_eb$Combined_Cluster)), collapse = ", "), "\n")
+cat("Named marker clusters:", paste(sort(unique(markers_named$cluster)), collapse = ", "), "\n")
+cat("Total markers:", nrow(markers_named), "\n")
+```
+
+## 2. UMAP Overview
+
+```{r umap_overview, fig.width=12, fig.height=5}
+p1 <- DimPlot(sc_eb, group.by = "Combined_Cluster", label = TRUE, pt.size = 1) +
+  ggtitle("EB Subclusters (Unsupervised)") +
+  theme(legend.position = "bottom")
+
+p2 <- FeaturePlot(sc_eb, features = "Smoothed_Pseudotime", pt.size = 1) +
+  scale_color_viridis(option = "inferno") +
+  ggtitle("Spatial Pseudotime") +
+  theme(legend.position = "bottom")
+
+p1 + p2
+```
+
+## 3. Named Subcluster Markers — Top Genes
+
+```{r top_markers_table}
+# Show top 10 markers per named subcluster
+top_markers <- markers_named %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+cat("\n=== Top 10 Markers per Named EB Subcluster ===\n")
+print(top_markers %>% select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj))
+```
+
+## 4. Marker Heatmap
+
+```{r marker_heatmap, fig.width=10, fig.height=10}
+# Map Combined_Cluster (EB-Sub-0..4) to named subclusters
+cluster_map <- data.frame(
+  Combined_Cluster = paste0("EB-Sub-", 0:4),
+  Named = c("aEB", "mEB1", "mEB2", "pEB", "pLFC")
+)
+
+sc_eb$Named_Cluster <- cluster_map$Named[match(sc_eb$Combined_Cluster, cluster_map$Combined_Cluster)]
+
+# If no mapping is found, fall back to the unsupervised names
+if (all(is.na(sc_eb$Named_Cluster))) {
+  message("Named cluster mapping failed, falling back to Combined_Cluster")
+  sc_eb$Named_Cluster <- sc_eb$Combined_Cluster
+}
+
+Idents(sc_eb) <- "Named_Cluster"
+
+# Select top 5 genes per cluster for the heatmap
+heatmap_genes <- markers_named %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  pull(gene) %>%
+  unique()
+
+DoHeatmap(sc_eb, features = heatmap_genes, group.by = "Named_Cluster", 
+          size = 4, angle = 45) +
+  scale_fill_viridis(option = "magma") +
+  ggtitle("Top 5 Markers per EB Subcluster") +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+## 5. Dot Plot of Markers
+
+```{r dotplot, fig.width=12, fig.height=8}
+DotPlot(sc_eb, features = heatmap_genes, group.by = "Named_Cluster", 
+        cols = c("lightgrey", "firebrick3"), dot.scale = 6) +
+  coord_flip() +
+  ggtitle("EB Subcluster Marker Dot Plot") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(size = 9))
+```
+
+## 6. Spatial Module Scores per Subcluster
+
+```{r spatial_modules, fig.width=12, fig.height=5}
+module_cols <- grep("^(Anterior|Posterior|Mid).*Module$", colnames(sc_eb@meta.data), value = TRUE)
+
+if (length(module_cols) > 0) {
+  cat("Spatial module columns found:", paste(module_cols, collapse = ", "), "\n")
+  
+  module_df <- sc_eb@meta.data[, c("Named_Cluster", "Smoothed_Pseudotime", module_cols)]
+  module_long <- tidyr::pivot_longer(module_df, cols = all_of(module_cols), 
+                                      names_to = "Module", values_to = "Score")
+  
+  ggplot(module_long, aes(x = Named_Cluster, y = Score, fill = Named_Cluster)) +
+    geom_violin(scale = "width", alpha = 0.7) +
+    geom_boxplot(width = 0.15, outlier.shape = NA) +
+    facet_wrap(~Module, scales = "free_y") +
+    theme_minimal() +
+    labs(title = "Spatial Module Scores by EB Subcluster",
+         x = "EB Subcluster", y = "Module Score") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"))
+}
+```
+
+## 7. Feature Plots for Top Markers
+
+```{r feature_plots, fig.width=14, fig.height=12}
+# Top 3 markers per named cluster
+top3_per_cluster <- markers_named %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+# Only plot genes that exist in the object
+plot_genes <- top3_per_cluster$gene[top3_per_cluster$gene %in% rownames(sc_eb)]
+
+if (length(plot_genes) > 0) {
+  FeaturePlot(sc_eb, features = plot_genes, ncol = 5, pt.size = 0.8, 
+              order = TRUE, min.cutoff = "q5") &
+    scale_color_viridis(option = "magma") &
+    theme(legend.position = "right", plot.title = element_text(size = 10, face = "bold"))
+}
+```
+
+## 8. Expression Along Pseudotime per Subcluster
+
+```{r pseudotime_expression, fig.width=12, fig.height=10}
+# Pick top 2 markers per cluster for pseudotime curves
+pt_genes <- markers_named %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 2) %>%
+  ungroup()
+
+pt_genes_valid <- pt_genes$gene[pt_genes$gene %in% rownames(sc_eb)]
+
+if (length(pt_genes_valid) > 0) {
+  expr_data <- FetchData(sc_eb, vars = c(pt_genes_valid, "Smoothed_Pseudotime", "Named_Cluster"))
+  
+  expr_long <- tidyr::pivot_longer(expr_data, cols = all_of(pt_genes_valid), 
+                                    names_to = "Gene", values_to = "Expression")
+  
+  # Annotate which cluster each gene is a marker for
+  gene_cluster <- pt_genes %>% select(gene, cluster) %>% distinct()
+  expr_long <- expr_long %>% left_join(gene_cluster, by = c("Gene" = "gene"))
+  
+  ggplot(expr_long, aes(x = Smoothed_Pseudotime, y = Expression, color = Named_Cluster)) +
+    geom_point(alpha = 0.15, size = 0.5) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1.2) +
+    facet_wrap(~Gene, scales = "free_y", ncol = 5) +
+    scale_color_brewer(palette = "Set1") +
+    theme_minimal() +
+    labs(title = "Marker Expression Along Spatial Pseudotime",
+         x = "Smoothed Pseudotime", y = "Expression", color = "Subcluster") +
+    theme(strip.text = element_text(face = "bold"),
+          legend.position = "bottom")
+}
+```
+
+---
+
+## 9. Regress Out Damage/Stress Signature
+
+Rather than removing clusters (the stress signal is continuous and keeps leaking through), we compute a **stress module score** from all HSP, peroxiredoxin, and glutathione transferase genes, then regress it out during scaling. This forces the clustering to ignore damage and focus on genuine biological variation.
+
+```{r regress_stress, fig.width=14, fig.height=5}
+DefaultAssay(sc_eb) <- "RNA"
+
+# Define stress gene families
+all_genes <- rownames(sc_eb)
+stress_genes <- all_genes[grepl("^HSP|^PRX|^GSTD|^GSTE|^GSTS", all_genes)]
+cat("Stress genes found:", paste(stress_genes, collapse = ", "), "\n")
+
+# Compute stress module score manually (avoids S4 compatibility issues with AddModuleScore)
+# Use SCT assay which has the actual normalized expression
+expr_mat <- GetAssayData(sc_eb, assay = "SCT", layer = "data")
+stress_genes <- stress_genes[stress_genes %in% rownames(expr_mat)]
+cat("Stress genes in expression matrix:", length(stress_genes), "\n")
+cat(paste(stress_genes, collapse = ", "), "\n")
+sc_eb$Stress_Score1 <- colMeans(as.matrix(expr_mat[stress_genes, , drop = FALSE]))
+sc_eb$Stress_Score1[is.na(sc_eb$Stress_Score1)] <- 0
+
+# Visualize the stress score before regression
+p_stress <- FeaturePlot(sc_eb, features = "Stress_Score1", pt.size = 1) +
+  scale_color_viridis(option = "magma") +
+  ggtitle("Stress Score (Before Regression)")
+
+p_clusters_orig <- DimPlot(sc_eb, group.by = "Combined_Cluster", label = TRUE, pt.size = 1) +
+  ggtitle("Original Subclusters")
+
+p_clusters_orig + p_stress
+```
+
+## 10. Re-Process with Stress Regressed Out
+
+```{r reprocess, fig.width=12, fig.height=5}
+sc_clean <- sc_eb
+
+sc_clean <- NormalizeData(sc_clean) %>%
+  FindVariableFeatures(nfeatures = 2000) %>%
+  ScaleData(vars.to.regress = "Stress_Score1") %>%
+  RunPCA(npcs = 30, verbose = FALSE) %>%
+  FindNeighbors(dims = 1:20) %>%
+  FindClusters(resolution = 0.4) %>%
+  RunUMAP(dims = 1:20)
+
+p1 <- DimPlot(sc_clean, group.by = "seurat_clusters", label = TRUE, pt.size = 1.5) +
+  ggtitle("New Clusters (Stress Regressed)") +
+  theme(legend.position = "bottom")
+
+p2 <- FeaturePlot(sc_clean, features = "Smoothed_Pseudotime", pt.size = 1.5) +
+  scale_color_viridis(option = "inferno") +
+  ggtitle("Spatial Pseudotime") +
+  theme(legend.position = "bottom")
+
+p3 <- FeaturePlot(sc_clean, features = "Stress_Score1", pt.size = 1.5) +
+  scale_color_viridis(option = "magma") +
+  ggtitle("Stress Score (After Regression)") +
+  theme(legend.position = "bottom")
+
+p1 + p2 + p3
+```
+
+## 11. Find New Markers (Damage-Free)
+
+```{r new_markers}
+Idents(sc_clean) <- "seurat_clusters"
+new_markers <- FindAllMarkers(sc_clean, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.4)
+
+new_markers_sig <- new_markers %>% filter(p_val_adj < 0.05)
+
+cat("\n=== Top 10 Markers per New Cluster ===\n")
+top10_new <- new_markers_sig %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+print(top10_new %>% select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj))
+
+# Check: are any HSPs or stress genes still dominant?
+stress_genes <- grep("^HSP|^PRX|^GSTD", new_markers_sig$gene, value = TRUE)
+if (length(stress_genes) > 0) {
+  cat("\n⚠ Residual stress genes in new markers:", paste(stress_genes, collapse = ", "), "\n")
+} else {
+  cat("\n✓ No stress genes in new markers — clean clustering achieved.\n")
+}
+```
+
+## 12. Heatmap & Dot Plot (Clean)
+
+```{r clean_heatmap, fig.width=10, fig.height=8}
+heatmap_genes_clean <- new_markers_sig %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  pull(gene) %>%
+  unique()
+
+DoHeatmap(sc_clean, features = heatmap_genes_clean, size = 4, angle = 45) +
+  scale_fill_viridis(option = "magma") +
+  ggtitle("Top 5 Markers per Clean EB Cluster (Damage-Free)")
+```
+
+```{r clean_dotplot, fig.width=12, fig.height=8}
+DotPlot(sc_clean, features = heatmap_genes_clean, cols = c("lightgrey", "firebrick3"), dot.scale = 6) +
+  coord_flip() +
+  ggtitle("Clean EB Cluster Markers") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(size = 9))
+```
+
+## 13. Pseudotime Expression (Clean)
+
+```{r clean_pseudotime, fig.width=12, fig.height=8}
+pt_genes_clean <- new_markers_sig %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+pt_valid <- pt_genes_clean$gene[pt_genes_clean$gene %in% rownames(sc_clean)]
+
+if (length(pt_valid) > 0) {
+  expr_data <- FetchData(sc_clean, vars = c(pt_valid, "Smoothed_Pseudotime", "seurat_clusters"))
+  
+  expr_long <- tidyr::pivot_longer(expr_data, cols = all_of(pt_valid), 
+                                    names_to = "Gene", values_to = "Expression")
+  
+  ggplot(expr_long, aes(x = Smoothed_Pseudotime, y = Expression, color = seurat_clusters)) +
+    geom_point(alpha = 0.15, size = 0.5) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE, linewidth = 1.2) +
+    facet_wrap(~Gene, scales = "free_y", ncol = 5) +
+    scale_color_brewer(palette = "Set2") +
+    theme_minimal() +
+    labs(title = "Clean EB Marker Expression Along Spatial Pseudotime",
+         x = "Smoothed Pseudotime", y = "Expression", color = "Cluster") +
+    theme(strip.text = element_text(face = "bold"),
+          legend.position = "bottom")
+}
+```
+
+---
+
+
+## 14. 3D UMAP (UMAP + Spatial Pseudotime)
+
+Visualizing the single-cell expression manifold (UMAP 1 and 2) against physical space (Z-axis = Spatial Pseudotime) to see how transcriptional clusters distribute spatially.
+
+```{r 3d_umap, fig.width=10, fig.height=8}
+library(plotly)
+
+# Extract coordinates
+umap_coords <- Embeddings(sc_clean, "umap")
+plot_df <- data.frame(
+  UMAP_1 = umap_coords[, 1],
+  UMAP_2 = umap_coords[, 2],
+  Spatial_Pseudotime = sc_clean$Smoothed_Pseudotime,
+  Cluster = sc_clean$seurat_clusters
+)
+
+# Define color palette
+n_clusters <- length(levels(plot_df$Cluster))
+pal <- RColorBrewer::brewer.pal(max(3, n_clusters), "Set1")[1:n_clusters]
+
+# Create interactive 3D plot
+fig <- plot_ly(plot_df, x = ~UMAP_1, y = ~UMAP_2, z = ~Spatial_Pseudotime, 
+               color = ~Cluster, colors = pal,
+               type = "scatter3d", mode = "markers",
+               marker = list(size = 3, opacity = 0.8),
+               hoverinfo = "text",
+               text = ~paste("Cluster:", Cluster, "<br>Pseudotime:", round(Spatial_Pseudotime, 1)))
+
+fig <- fig %>% layout(
+  title = "3D UMAP (Transcriptome vs Space)",
+  scene = list(
+    xaxis = list(title = "UMAP 1"),
+    yaxis = list(title = "UMAP 2"),
+    zaxis = list(title = "Spatial Pseudotime (Anterior -> Posterior)")
+  )
+)
+
+fig
+```
+
+---
+
+## 15. Manual Spatial Bins (<50, 50-70, >70)
+
+Since unsupervised clustering is dominated by other biological signals in the 50-70 range, we can force a purely spatial grouping to see if distinct regional transcriptional programs emerge. We split the clean EBs into three physical domains based on spatial pseudotime:
+- **Anterior** (< 50)
+- **Midgut** (50-70)
+- **Posterior** (> 70)
+
+```{r manual_spatial_bins, fig.width=12, fig.height=8}
+# 1. Create Bins
+sc_clean$Spatial_Bin <- "Midgut (50-70)"
+sc_clean$Spatial_Bin[sc_clean$Smoothed_Pseudotime < 50] <- "Anterior (<50)"
+sc_clean$Spatial_Bin[sc_clean$Smoothed_Pseudotime > 70] <- "Posterior (>70)"
+
+# Factorize to ensure logical ordering in plots
+sc_clean$Spatial_Bin <- factor(sc_clean$Spatial_Bin, levels = c("Anterior (<50)", "Midgut (50-70)", "Posterior (>70)"))
+
+# Check cell counts per bin
+cat("Cell counts per spatial bin:\n")
+print(table(sc_clean$Spatial_Bin))
+
+# 2. Find Markers
+Idents(sc_clean) <- "Spatial_Bin"
+spatial_markers <- FindAllMarkers(sc_clean, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+spatial_markers_sig <- spatial_markers %>% filter(p_val_adj < 0.05)
+
+cat("\n=== Top 10 Markers per Spatial Bin ===\n")
+top10_spatial <- spatial_markers_sig %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+print(top10_spatial %>% select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj))
+
+# 3. Visualize Top Spatial Markers
+top5_spatial <- spatial_markers_sig %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  pull(gene) %>%
+  unique()
+
+p_heat <- DoHeatmap(sc_clean, features = top5_spatial, size = 4, angle = 45) +
+  scale_fill_viridis(option = "magma") +
+  ggtitle("Top 5 Markers per Spatial Bin")
+
+p_dot <- DotPlot(sc_clean, features = top5_spatial, cols = c("lightgrey", "firebrick3"), dot.scale = 6) +
+  coord_flip() +
+  ggtitle("Spatial Bin Markers") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"))
+
+p_heat
+p_dot
+```

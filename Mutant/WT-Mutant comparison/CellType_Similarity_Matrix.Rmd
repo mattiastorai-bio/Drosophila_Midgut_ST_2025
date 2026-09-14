@@ -1,0 +1,140 @@
+---
+title: "Cell Type Similarity Matrix (WT vs Mutant Single-Cell)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(viridis)
+```
+
+## 1. Load Single-Cell Data
+We load the single-cell references used for spatial deconvolution in both conditions.
+- WT: `seurat_ctrl_with_metadata.rds`
+- Mutant: `ApcKO_merged_SC.rds`
+
+```{r load_data}
+path_wt <- "/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds"
+path_mut <- "../Random data/ApcKO_merged_SC.rds"
+
+if (!file.exists(path_wt)) stop("WT SC data not found at: ", path_wt)
+if (!file.exists(path_mut)) stop("Mutant SC data not found at: ", path_mut)
+
+message("Loading WT SC object...")
+sc_wt <- readRDS(path_wt)
+
+message("Loading Mutant SC object...")
+sc_mut <- readRDS(path_mut)
+```
+
+## 2. Identify Common Cell Types & Variable Features
+We align the two datasets to compute similarity strictly between shared cell types, avoiding artificial correlations from missing clusters.
+
+```{r prep_data}
+# Get common cell types
+wt_celltypes <- unique(as.character(sc_wt$celltype))
+mut_celltypes <- unique(as.character(sc_mut$celltype))
+common_celltypes <- intersect(wt_celltypes, mut_celltypes)
+
+# Exclude NAs or empty strings just in case
+common_celltypes <- common_celltypes[!is.na(common_celltypes) & common_celltypes != ""]
+
+message("Common cell types found: ", paste(common_celltypes, collapse = ", "))
+
+# Filter objects to only common cell types
+sc_wt <- subset(sc_wt, celltype %in% common_celltypes)
+sc_mut <- subset(sc_mut, celltype %in% common_celltypes)
+
+# Ensure layers are joined and data is normalized
+sc_wt <- JoinLayers(sc_wt)
+sc_mut <- JoinLayers(sc_mut)
+
+sc_wt <- NormalizeData(sc_wt, verbose = FALSE)
+sc_mut <- NormalizeData(sc_mut, verbose = FALSE)
+
+# Get variable features for correlation
+# We use the intersection of highly variable features from both datasets to ensure 
+# we are correlating biologically informative genes rather than noise or housekeeping genes.
+sc_wt <- FindVariableFeatures(sc_wt, nfeatures = 2000, verbose = FALSE)
+sc_mut <- FindVariableFeatures(sc_mut, nfeatures = 2000, verbose = FALSE)
+
+var_genes <- intersect(VariableFeatures(sc_wt), VariableFeatures(sc_mut))
+message(paste("Using", length(var_genes), "shared highly variable genes for correlation."))
+```
+
+## 3. Calculate Average Expression Profiles
+
+```{r calc_avg_exp}
+# We use the 'data' slot (log-normalized) for average expression
+avg_wt <- AverageExpression(sc_wt, group.by = "celltype", assays = "RNA", slot = "data")$RNA
+avg_mut <- AverageExpression(sc_mut, group.by = "celltype", assays = "RNA", slot = "data")$RNA
+
+# Ensure we only try to subset genes that actually exist in the matrices
+valid_genes <- intersect(var_genes, intersect(rownames(avg_wt), rownames(avg_mut)))
+if (length(valid_genes) < length(var_genes)) {
+  message(paste("Dropped", length(var_genes) - length(valid_genes), "variable genes not present in RNA assays."))
+}
+
+# Seurat's AverageExpression sometimes sanitizes column names. 
+# We intersect the columns to be completely safe.
+valid_cols <- intersect(colnames(avg_wt), colnames(avg_mut))
+
+# Filter to highly variable genes and matching columns
+avg_wt <- avg_wt[valid_genes, valid_cols, drop = FALSE]
+avg_mut <- avg_mut[valid_genes, valid_cols, drop = FALSE]
+```
+
+## 4. Compute Similarity Matrix
+We compute the Spearman correlation between the expression profiles of WT cell types and Mutant cell types. Spearman is robust against expression outliers.
+
+```{r similarity_matrix, fig.width=9, fig.height=8}
+# Compute correlation matrix
+cor_mat <- cor(as.matrix(avg_wt), as.matrix(avg_mut), method = "spearman")
+
+# Order the matrix based on alphabetical cell type names
+cor_mat <- cor_mat[sort(valid_cols), sort(valid_cols), drop = FALSE]
+
+# Define row and column labels
+rownames(cor_mat) <- paste0("WT_", rownames(cor_mat))
+colnames(cor_mat) <- paste0("Mut_", colnames(cor_mat))
+
+# Visualize with pheatmap
+p_heatmap <- pheatmap(cor_mat,
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE,
+         display_numbers = round(cor_mat, 2),
+         color = viridis(100),
+         main = "Spearman Correlation: WT vs Mutant Cell Types",
+         angle_col = 45,
+         fontsize_number = 10,
+         treeheight_row = 30,
+         treeheight_col = 30)
+
+# Save the plot automatically
+out_dir <- "../figures/sc_comparisons"
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+png(file.path(out_dir, "CellType_Similarity_Matrix.png"), width = 900, height = 800, res = 120)
+# pheatmap directly plots to device
+pheatmap(cor_mat,
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE,
+         display_numbers = round(cor_mat, 2),
+         color = viridis(100),
+         main = "Spearman Correlation: WT vs Mutant Cell Types",
+         angle_col = 45,
+         fontsize_number = 10,
+         treeheight_row = 30,
+         treeheight_col = 30)
+dev.off()
+
+message("Matrix saved to figures/sc_comparisons/CellType_Similarity_Matrix.png")
+```

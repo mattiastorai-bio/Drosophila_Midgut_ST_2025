@@ -1,0 +1,197 @@
+---
+title: "St111125"
+output: html_document
+date: "2025-11-22"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(SPOTlight)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+```
+
+```{r}
+# Replace 'path/to/your/spaceranger/output/directory' with the actual path
+data_dir <- "/home/mattia/Thesis/03Slide4/binned_data"
+
+# Clean up Windows :Zone.Identifier metadata files that break Seurat's Load10X_Spatial
+message("Cleaning up Windows :Zone.Identifier metadata files...")
+zone_files <- list.files(path = data_dir, pattern = "Zone.Identifier$", recursive = TRUE, full.names = TRUE)
+if (length(zone_files) > 0) {
+  unlink(zone_files)
+}
+
+# Fix Visium HD directory structure if necessary
+# Seurat's Load10X_Spatial expects the bin folders to be inside a 'binned_outputs' directory
+if (!dir.exists(file.path(data_dir, "binned_outputs"))) {
+  message("Restoring SpaceRanger Visium HD 'binned_outputs' directory structure for Seurat...")
+  dir.create(file.path(data_dir, "binned_outputs"), showWarnings = FALSE)
+  for (res in c("square_002um", "square_008um", "square_016um")) {
+    old_path <- file.path(data_dir, res)
+    new_path <- file.path(data_dir, "binned_outputs", res)
+    if (dir.exists(old_path)) {
+      file.rename(old_path, new_path)
+    }
+  }
+}
+
+# Load the data
+# The 'slice' argument is important for naming the spatial data in the Seurat object
+spe_object <- Load10X_Spatial(data_dir, slice = "HE_Stain_Slice")
+```
+
+```{r}
+# 1. Set the default assay to "Spatial" 
+DefaultAssay(spe_object) <- "Spatial.016um"
+
+# 2. Filter out all spots/cells where the total count (nCount_Spatial) is zero.
+spe_object <- subset(spe_object, subset = nCount_Spatial.016um > 0)
+
+spe_object <- SCTransform(spe_object, assay = "Spatial.016um", verbose = FALSE)
+```
+
+```{r}
+# Visualize the spot counts over the H&E image
+SpatialFeaturePlot(spe_object, features = "nCount_Spatial.016um")
+
+# Visualize a specific gene (e.g., B2M)
+SpatialFeaturePlot(spe_object, features = "OstDelta")
+```
+
+```{r}
+# Sum UMIs for each gene across all cells
+gene_umis <- Matrix::rowSums(spe_object@assays$Spatial.016um$counts)
+# Sort genes by UMI count in descending order
+sorted_gene_umis <- sort(gene_umis, decreasing = TRUE)
+# Print the top 10 genes with the highest UMI counts
+head(sorted_gene_umis, 10)
+
+genes = rownames(spe_object@assays$Spatial.016um$counts)
+gene_umis <- data.frame(UMIs = gene_umis, genes = genes)
+
+# Reorder 'genes' based on UMI_count in descending order
+gene_umis$genes <- factor(gene_umis$genes, 
+                                     levels = gene_umis$genes[order(gene_umis$UMIs, decreasing = TRUE)])
+
+# Create the bar plot, ordered by UMI_count, and remove x-axis labels
+ggplot(gene_umis, aes(x = genes, y = UMIs)) +
+  geom_col(fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Number of UMIs per gene", x = "Genes", y = "Number of UMIs") + scale_y_log10() +  # Apply log10 transformation to Y-axis
+  theme(axis.text.x = element_blank(),  # Remove gene names from the x-axis
+        axis.ticks.x = element_blank(),  # Optional: Remove ticks on the x-axis
+        plot.title = element_text(hjust = 0.5))  # Center the title
+
+# Create the bar plot, ordered by UMI_count, and remove x-axis labels
+ggplot(gene_umis, aes(x = genes, y = UMIs)) +
+  geom_col(fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Number of UMIs per gene", x = "Genes", y = "Number of UMIs") 
+  theme(axis.text.x = element_blank(),  # Remove gene names from the x-axis
+        axis.ticks.x = element_blank(),  # Optional: Remove ticks on the x-axis
+        plot.title = element_text(hjust = 0.5))  # Center the title
+```
+
+```{r}
+# Run PCA on the SCT assay
+seurat_obj <- RunPCA(spe_object, assay = "SCT", features = VariableFeatures(spe_object))
+
+# Run UMAP using the first 20 principal components (you can adjust the number of PCs as needed)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:30, reduction = "pca")
+
+# Find the nearest neighbors using the first 20 principal components
+seurat_obj <- FindNeighbors(seurat_obj , dims = 1:30)
+
+# Run the Louvain algorithm to find clusters (you can adjust resolution for more/less granular clustering)
+seurat_obj <- FindClusters(seurat_obj , resolution = 0.4)  # Adjust resolution as needed
+
+# Plot the UMAP
+DimPlot(seurat_obj, reduction = "umap")
+```
+
+```{r}
+# The pattern to match for Drosophila mitochondrial genes is '^mt:'
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt:")
+
+SpatialFeaturePlot(seurat_obj, features = "percent.mt")
+```
+
+```{r}
+# 1. Extract the normalized expression matrix (SCT-normalized data)
+normalized_data <- GetAssayData(seurat_obj, assay = "SCT", layer = "data")
+
+# 2. Calculate the Mean Expression per pixel (column)
+# R's row/column functions are optimized for this.
+# Since the matrix is (Genes x Pixels), we apply the function to the columns (margin = 2).
+mean_expression_per_pixel <- colMeans(normalized_data)
+
+# 3. Add the new statistics back into the Seurat object's metadata
+seurat_obj$mean_expression <- mean_expression_per_pixel
+```
+
+```{r}
+# Plot 1: Mean Expression
+SpatialFeaturePlot(seurat_obj, features = "mean_expression", pt.size.factor = 1.2)
+
+```
+
+```{r}
+# 1. Access the raw count matrix (the 'counts' slot of the RNA assay).
+# This matrix has Genes (Features) as rows and Pixels (Cells/Spots) as columns.
+raw_counts <- GetAssayData(seurat_obj, assay = "SCT", layer = "counts")
+
+# 2. Identify the mitochondrial genes (using the Drosophila prefix "mt:")
+mt_genes <- rownames(raw_counts)[grep(pattern = "^mt:", x = rownames(raw_counts))]
+
+# 3. Calculate the total mitochondrial counts across the ENTIRE SAMPLE
+total_mt_counts <- sum(raw_counts[mt_genes, ])
+
+# 4. Calculate the total counts (UMIs) for ALL genes across the ENTIRE SAMPLE
+total_all_counts <- sum(raw_counts)
+
+# 5. Calculate the global mitochondrial percentage
+global_mt_percent <- (total_mt_counts / total_all_counts) * 100
+
+global_mt_percent
+```
+
+```{r}
+# 1. Access the raw count matrix
+raw_counts <- GetAssayData(seurat_obj, assay = "SCT", layer = "counts")
+
+# 2. Identify the ribosomal genes (using the Drosophila prefix pattern '^Rp[LS]')
+# This pattern matches genes starting with RpL or RpS.
+ribo_genes <- rownames(raw_counts)[grep(pattern = "^Rp[LS]", x = rownames(raw_counts))]
+
+# 3. Calculate the total ribosomal counts across the ENTIRE SAMPLE
+total_ribo_counts <- sum(raw_counts[ribo_genes, ])
+
+# 4. Calculate the total counts (UMIs) for ALL genes across the ENTIRE SAMPLE
+total_all_counts <- sum(raw_counts)
+
+# 5. Calculate the global ribosomal percentage
+global_ribo_percent <- (total_ribo_counts / total_all_counts) * 100
+
+# Print the result
+cat(sprintf("The percentage of reads assigned to ribosomal genes is: %.2f%%", global_ribo_percent))
+```
+
+```{r}
+# 1. Calculate the percentage for each individual pixel/spot
+# Store the result in the object's metadata under 'percent.ribo'
+seurat_obj[["percent.ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = "^Rp[LS]")
+
+# 2. Plotting the per-pixel percentage on the spatial image
+SpatialFeaturePlot(seurat_obj, features = "percent.ribo", pt.size.factor = 1.2)
+```
+

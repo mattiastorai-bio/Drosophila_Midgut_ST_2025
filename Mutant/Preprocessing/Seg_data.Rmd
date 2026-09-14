@@ -1,0 +1,478 @@
+---
+title: "Seg_data"
+output: html_document
+date: "2025-12-30"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(SPOTlight)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(sf)
+library(patchwork)
+```
+
+```{r}
+# Replace 'path/to/your/spaceranger/output/directory' with the actual path
+bin_dir <- "/home/mattia/Thesis/03Slide4/binned_data/binned_outputs/square_008um"
+
+# Load as a standard Spatial Seurat object
+# NOTE: For Visium HD, if you specify bin.size, Load10X_Spatial expects data.dir 
+# to be the folder ABOVE "square_XXXum" (the binned_outputs folder).
+parent_dir <- dirname(bin_dir) 
+print(paste("Checking directory levels..."))
+print(paste("Parent directory (binned_outputs):", parent_dir))
+
+all_files <- list.files(bin_dir)
+h5_files <- all_files[grepl("\\.h5$", all_files)]
+print(paste("H5 files found in Resolution folder:", paste(h5_files, collapse=", ")))
+
+visium_8um <- tryCatch({
+  # Explicitly pick the first h5 if multiple exist, ensuring it's length 1
+  selected_h5 <- h5_files[1]
+  if ("filtered_feature_bc_matrix.h5" %in% h5_files) {
+      selected_h5 <- "filtered_feature_bc_matrix.h5"
+  }
+  
+  if (is.na(selected_h5)) stop("No .h5 files found in resolution folder")
+  
+  # APPROACH 1: Attempt standard Visium HD loading from the PARENT folder
+  Load10X_Spatial(
+    data.dir = parent_dir,
+    bin.size = 8,
+    assay = "Spatial.008um"
+  )
+}, error = function(e) {
+  print(paste("Approach 1 failed:", e$message))
+  print("Attempting Approach 2: Direct loading from Resolution folder...")
+  
+  # APPROACH 2: If Approach 1 fails, try loading directly from the specific square folder
+  tryCatch({
+      Load10X_Spatial(
+        data.dir = bin_dir,
+        filename = as.character(h5_files[1]), 
+        assay = "Spatial.008um"
+      )
+  }, error = function(e2) {
+      print(paste("Approach 2 failed:", e2$message))
+      print("Final Fallback: Manual Object Construction...")
+      h5_path <- file.path(bin_dir, "filtered_feature_bc_matrix.h5")
+      if(!file.exists(h5_path)) h5_path <- file.path(bin_dir, h5_files[1])
+      counts <- Read10X_h5(h5_path)
+      CreateSeuratObject(counts = counts, assay = "Spatial.008um")
+  })
+})
+```
+
+```{r}
+# Clean up Windows :Zone.Identifier metadata files in segmented_data
+seg_data_dir <- "/home/mattia/Thesis/03Slide4/segmented_data"
+zone_files_seg <- list.files(path = seg_data_dir, pattern = "Zone.Identifier$", recursive = TRUE, full.names = TRUE)
+if (length(zone_files_seg) > 0) {
+  unlink(zone_files_seg)
+}
+
+# 1. Load the count matrix first to get the correct barcode format
+counts <- Read10X_h5(file.path(seg_data_dir, "filtered_feature_cell_matrix.h5"))
+visium_seg <- CreateSeuratObject(counts = counts, assay = "Segmented")
+
+# 2. Prepare the GeoJSON data
+geo_data <- st_read(file.path(seg_data_dir, "cell_segmentations.geojson"))
+
+# 3. Format the IDs to match "cellid_000000001-1"
+# Ensure we pad correctly to match the 10x expression matrix barcodes
+formatted_ids <- sprintf("cellid_%09d-1", as.numeric(geo_data$cell_id))
+# We use make.unique because split polygons in GeoJSON can have duplicate IDs
+rownames(geo_data) <- make.unique(formatted_ids)
+geo_data$cell_id    <- formatted_ids
+
+# 4. Geometry Cleaning (CRITICAL for CreateFOV)
+# A. Repair and ensure validity
+geo_data <- st_make_valid(geo_data)
+
+# B. Extract Polygons and cast to POLYGON
+# This ensures we have a clean sfc_POLYGON class
+geo_data <- st_collection_extract(geo_data, "POLYGON")
+geo_data <- st_cast(geo_data, "POLYGON", warn = FALSE)
+
+# C. Reset Barcodes (CRITICAL)
+# After st_cast, some features might have been split (e.g., cell_1 becomes cell_1.1)
+# We must ensure the 'cell_id' column still contains the original barcode for matching.
+# We also add a column named 'barcodes' which Seurat specifically looks for.
+geo_data$barcodes <- gsub("\\.[0-9]+$", "", rownames(geo_data))
+geo_data$cells    <- geo_data$barcodes
+
+# D. Filter to keep only cells present in the Expression Matrix
+valid_cells <- Cells(visium_seg)
+geo_data <- geo_data[geo_data$barcodes %in% valid_cells, ]
+
+# E. Remove any empty geometries 
+geo_data <- geo_data[!st_is_empty(geo_data), ]
+
+# --- VALIDATION CHECK 1: Overlay Integrity ---
+cat("\n=== FOV Integrity Check ===\n")
+cat("Geometry Class:", class(st_geometry(geo_data))[1], "\n")
+cat("Cells in Matrix:", length(valid_cells), "\n")
+cat("Features in sf object:", nrow(geo_data), "\n")
+cat("Unique Barcodes in sf:", length(unique(geo_data$barcodes)), "\n")
+
+overlap <- intersect(valid_cells, geo_data$barcodes)
+cat("Overlap with Matrix:", length(overlap), "\n")
+
+if (length(overlap) == 0) {
+  stop("FATAL: Zero overlap between barcodes! Check rowname formatting.")
+}
+
+# 5. Create the FOV
+# Subset the Seurat object to match the spatial data
+visium_seg <- subset(visium_seg, cells = overlap)
+
+# Create the FOV
+# Adding the 'barcodes' column directly to the sf object ensures 
+# Seurat's vertex extractor can map points back to cell IDs.
+fov <- CreateFOV(
+  coords = geo_data, 
+  type = "segmentation",
+  assay = "Segmented",
+  key = "seg_"
+)
+
+# 6. Add to object
+visium_seg[["fov"]] <- fov
+```
+
+```{r}
+# This should show your cell outlines
+ImageDimPlot(visium_seg, fov = "fov")
+```
+
+```{r}
+# 1. Normalize the Segmented assay
+visium_seg <- NormalizeData(visium_seg, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# 2. Set the default assay
+DefaultAssay(visium_seg) <- "Segmented"
+```
+
+```{r}
+# Plot the expression
+p <- ImageFeaturePlot(
+  object = visium_seg,
+  features = "fz3",
+  fov = "fov",
+  cols = c("gray90", "red"),
+  size = 1,
+  border.color = NA,
+  border.size = 0,
+  max.cutoff = "q95"
+)
+
+p
+
+# 3. Save as PNG (High-resolution raster)
+ggsave("../figures/alphaTry_segmented_plot.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+# Create a named list to hold both resolutions
+vhd_list <- list(
+  bin8 = visium_8um,
+  seg  = visium_seg
+)
+
+# vhd_list$bin8 -> Your 8um data
+# vhd_list$bin8 -> Your 8um data
+# vhd_list$seg  -> Your segmented data
+```
+
+```{r segmentation_qc_mapping}
+# --- Quality Control Mapping ---
+# 1. Calculate % Mitochondrial and % Ribosomal reads
+# Note: Drosophila mitochondrial genes start with 'mt:' and ribosomal with 'Rp'
+visium_seg[["percent.mt"]] <- PercentageFeatureSet(visium_seg, pattern = "^mt:")
+visium_seg[["percent.ribo"]] <- PercentageFeatureSet(visium_seg, pattern = "^Rp[LS]")
+
+# 2. Identify low UMI cells (< 200 counts)
+# We use a factor for discrete mapping in ImageDimPlot
+visium_seg$QC_Status <- ifelse(visium_seg$nCount_Segmented < 200, "Low_UMI (<200)", "Pass")
+visium_seg$QC_Status <- factor(visium_seg$QC_Status, levels = c("Pass", "Low_UMI (<200)"))
+
+# 3. Generate Spatial Plots
+p_qc_mito <- ImageFeaturePlot(
+  object = visium_seg,
+  features = "percent.mt",
+  fov = "fov",
+  cols = c("gray90", "darkred"),
+  border.color = NA,
+  border.size = 0,
+  max.cutoff = "q95"
+) + ggtitle("% Mitochondrial Reads")
+
+p_qc_ribo <- ImageFeaturePlot(
+  object = visium_seg,
+  features = "percent.ribo",
+  fov = "fov",
+  cols = c("gray90", "darkblue"),
+  border.color = NA,
+  border.size = 0,
+  max.cutoff = "q95"
+) + ggtitle("% Ribosomal Reads")
+
+# Highlight cells with low counts using group.by
+p_qc_umi <- ImageDimPlot(
+  object = visium_seg,
+  fov = "fov",
+  group.by = "QC_Status",
+  cols = c("Pass" = "gray90", "Low_UMI (<200)" = "red"),
+  size = 1,
+  border.color = NA,
+  border.size = 0
+) + ggtitle("QC: Low UMI Detection")
+
+# View side-by-side
+(p_qc_mito | p_qc_ribo | p_qc_umi)
+
+# Save QC maps
+ggsave("../figures/segmentation_qc_mapping.png", plot = (p_qc_mito | p_qc_ribo | p_qc_umi), width = 18, height = 6)
+```
+
+```{r}
+# --- 8. Robust Coordinate Assignment ---
+# We calculate centroids to ensure every cell has a valid X/Y for downstream analysis.
+
+# 1. Disable S2 Geometry (CRITICAL FIX)
+sf_use_s2(FALSE)
+
+# --- VALIDATION CHECK 2: Geometry Validity Logging ---
+invalid_before <- !st_is_valid(geo_data)
+num_invalid <- sum(invalid_before)
+
+if (num_invalid > 0) {
+  cat("\n=== Geometry Validation Warning ===\n")
+  cat("Found", num_invalid, "cells with invalid geometries (self-intersections, holes, etc.)\n")
+  cat("These will be auto-corrected using st_make_valid()\n")
+  
+  # Log which cells were invalid
+  invalid_cells_log <- data.frame(
+    cell_id = geo_data$cell_id[invalid_before],
+    issue = "Invalid geometry corrected"
+  )
+  write.csv(invalid_cells_log, "../Excels/invalid_geometries_log.csv", row.names = FALSE)
+  cat("Logged invalid cells to: invalid_geometries_log.csv\n")
+} else {
+  cat("\n=== Geometry Validation: All cells have valid geometries ===\n")
+}
+
+geo_fixed <- st_make_valid(geo_data)
+centroids_sf <- st_centroid(geo_fixed)
+coords_temp <- st_coordinates(centroids_sf)
+
+# 3. Create Metadata Dataframe (Aggregated by Barcode)
+# This handles cases where a cell was split into multiple polygons
+coords_raw <- data.frame(
+  barcode = geo_data$barcodes,
+  x = coords_temp[, 1],
+  y = coords_temp[, 2]
+)
+
+# Aggregate to get one coordinate pair per unique barcode
+coords_aggregated <- coords_raw %>%
+  group_by(barcode) %>%
+  summarize(x_centroid = mean(x), y_centroid = mean(y)) %>%
+  as.data.frame()
+
+# Final coordinate dataframe for Seurat metadata
+coords_df <- data.frame(
+  x_centroid = coords_aggregated$x_centroid,
+  y_centroid = coords_aggregated$y_centroid,
+  row.names  = coords_aggregated$barcode
+)
+
+# Ensure the rows are in the same order as the Seurat object
+coords_df <- coords_df[Cells(visium_seg), ]
+
+# 4. Add to Seurat Object
+visium_seg <- AddMetaData(visium_seg, metadata = coords_df)
+
+print("Centroids calculated and added to metadata (x_centroid, y_centroid).")
+head(visium_seg@meta.data[, c("x_centroid", "y_centroid")])
+
+# Verify count
+print(paste("Total Cells with Coordinates:", nrow(coords_df)))
+```
+
+```{r}
+# --- 9. Alignment Verification ---
+# We verify if the segmentation mask aligns with the tissue structure.
+message("--- Alignment Verification ---")
+
+fov_bbox <- st_bbox(geo_fixed)
+print("Bounding Box of Segmentation Mask:")
+print(fov_bbox)
+
+# 2. Visual Check: Density of Segments
+p_verify <- ggplot() +
+  geom_sf(data = geo_fixed, fill = "gray", color = NA) +
+  theme_void() +
+  ggtitle("Verification: Segmentation Mask Geometry")
+
+# Save this plot to visually inspect alignment
+ggsave("../figures/verification_mask_geometry.png", plot = p_verify, width = 8, height = 8, dpi = 300)
+
+message("Saved 'verification_mask_geometry.png'. Please inspect this image.")
+
+# --- 10. Side-Object: Cell Type Label Transfer ---
+# We create a side object to verify identity without altering visium_seg for 3D_UMAP.
+message("--- Side-Analysis: Label Transfer ---")
+
+ref_path <- "/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds"
+
+if (file.exists(ref_path)) {
+  # 1. Create temporary side object
+  visium_seg_transfer <- visium_seg 
+  
+  # 2. Load Single-Cell Reference
+  sc_ref <- readRDS(ref_path)
+  if (!"SCT" %in% names(sc_ref@assays)) sc_ref <- SCTransform(sc_ref, verbose = FALSE)
+  
+  # 3. Prepare Transfer Object (isolated)
+  visium_seg_transfer <- SCTransform(visium_seg_transfer, assay = "Segmented", verbose = FALSE)
+  visium_seg_transfer <- RunPCA(visium_seg_transfer, verbose = FALSE)
+
+  # 4. Transfer Labels
+  anchors <- FindTransferAnchors(reference = sc_ref, query = visium_seg_transfer, 
+                                normalization.method = "SCT", reference.assay = "SCT", 
+                                query.assay = "SCT", dims = 1:20)
+
+  predictions <- TransferData(anchorset = anchors, refdata = sc_ref@meta.data[["celltype"]],
+                             prediction.assay = TRUE, weight.reduction = visium_seg_transfer[["pca"]], 
+                             dims = 1:20)
+  
+  # Extract and filter (threshold 0.5)
+  pred_scores <- predictions@data
+  if("max" %in% rownames(pred_scores)) pred_scores <- pred_scores[rownames(pred_scores) != "max", ]
+  max_scores <- apply(pred_scores, 2, max)
+  predicted_ids <- rownames(pred_scores)[apply(pred_scores, 2, which.max)]
+  predicted_ids[max_scores < 0.1] <- "Ambiguous"
+  
+  visium_seg_transfer$Predicted_CellType <- predicted_ids
+  
+  # 5. Spatial Plot (No Boundaries)
+  p_transfer <- ImageDimPlot(visium_seg_transfer, fov = "fov", group.by = "Predicted_CellType",
+                            cols = "polychrome", border.color = NA, border.size = 0) + 
+                ggtitle("Side Analysis: Label Transfer")
+  
+  ggsave("../figures/verification_transfer_noborder.png", plot = p_transfer, width = 10, height = 8)
+  message("Saved side-analysis transfer plot to ../figures/verification_transfer_noborder.png")
+}
+```
+
+```{r side_literature_labeling}
+# --- 11. Side-Object: Literature Identity ---
+# Independent verification using canonical markers.
+message("--- Side-Analysis: Literature Labeling (Enhanced) ---")
+
+# 1. Create temporary side object
+visium_seg_lit <- visium_seg 
+
+# 2. Define Markers (Refined for Specificity - avoiding shared progenitors)
+# Note: 'esg' is removed as it marks both ISC and EB. We rely on Dl/Su(H) distinction.
+lit_markers <- list(
+  # Progenitors (Split)
+  ISC     = c("Dl", "spdo", "h", "kgo", "sna", "Delta"), # Notch Ligand High
+  EB      = c("Su(H)", "klu", "N", "E(spl)m3-HLH", "E(spl)malpha-BFM", "da"), # Notch Target High
+  
+  # Enteroendocrine (Pan & Specific)
+  EE      = c("pros", "AstA", "Tk", "NPF", "CCHa1", "Dh31", "Orcokinin", "allatostatin", "burs"),
+
+  # Differentiating
+  dEC     = c("zfh2", "Ote", "Sox100B", "boul", "Piezo", "Myo31DF"),
+
+  # Specialized Regions
+  Copper  = c("lab", "vha100-2", "vha55", "Cut", "Emp", "CAH1", "MtnA"),
+  LFC     = c("PGRP-SC1a", "PGRP-SC1b", "Mvl", "Fer1HCH", "Fer2LCH", "Zip99C"),
+
+  # Regional Enterocytes
+  aEC     = c("Amy-p", "Amy-d", "bgs", "Pura", "Mylk", "jbug", "GATAe"),
+  mEC     = c("dve", "Ptx1", "CREG", "apt", "alphaTry", "betaTry", "gammaTry"),
+  pEC     = c("Cad99C", "LManVI", "LManV", "Gs2", "Gdh", "p38b", "bab1")
+)
+
+# 3. Enhanced Scoring & Noise Filtering
+message("Calculating Module Scores...")
+score_matrix <- data.frame(row.names = colnames(visium_seg_lit))
+
+for (type in names(lit_markers)) {
+  # Add score
+  # We use tryCatch to handle cases where genes might be missing
+  tryCatch({
+    present <- lit_markers[[type]][lit_markers[[type]] %in% rownames(visium_seg_lit)]
+    if(length(present) > 0) {
+      visium_seg_lit <- AddModuleScore(visium_seg_lit, features = list(present), 
+                                      name = paste0("Raw_", type), assay = "Segmented")
+      
+      # Extract the newly added column (Seurat appends '1' to name)
+      col_name <- paste0("Raw_", type, "1")
+      score_matrix[[type]] <- visium_seg_lit[[col_name]][,1]
+    } else {
+      score_matrix[[type]] <- 0 # If no markers found, score is 0
+    }
+  }, error = function(e) { message(paste("Error in", type, ":", e$message)) })
+}
+
+# 4. Strategy: "Exhalt" Differences (Z-Score + Thresholding)
+message("Applying Signal Enhancement (Z-Score + Noise Floor)...")
+
+# A. Z-Score Standardization per cell type (Column-wise)
+# This highlights which cells are *significantly* high for that type compared to the population
+score_scaled <- scale(score_matrix) 
+
+# B. Hard Noise Floor
+# If a cell's score is below the population mean (Z < 0), treat it as noise (0)
+score_scaled[score_scaled < 0] <- 0
+
+# C. Assign Identity
+# Find max score per cell
+max_scores <- apply(score_scaled, 1, max, na.rm=TRUE)
+max_idx    <- apply(score_scaled, 1, which.max)
+assigned_types <- colnames(score_scaled)[max_idx]
+
+# D. Confidence Filter
+# If the max Z-score is still very low (weak signal), mark as Unresolved.
+# Threshold 0.5 means "at least 0.5 std devs above mean"
+assigned_types[max_scores < 0.5] <- "Unresolved"
+
+visium_seg_lit$Literature_Identity <- assigned_types
+
+# 5. Spatial Plot (No Boundaries, Cleaner Colors)
+p_lit <- ImageDimPlot(visium_seg_lit, fov = "fov", group.by = "Literature_Identity",
+                     cols = "polychrome", border.color = NA, border.size = 0) + 
+         ggtitle("Side Analysis: Enhanced Literature Labels")
+
+ggsave("../figures/verification_literature_noborder.png", plot = p_lit, width = 10, height = 8)
+message("Saved enhanced literature plot to ../figures/verification_literature_noborder.png")
+
+# --- FINAL CONSOLIDATION FOR SHINY APP ---
+# Merge metadata from side objects back into the main visium_seg object
+visium_seg$Predicted_CellType <- visium_seg_transfer$Predicted_CellType
+
+# Update the list and save complete data
+vhd_list$seg <- visium_seg
+saveRDS(vhd_list, file = "../Random data/VisiumHD_Drosophila_Resolution_List.rds")
+message("✓ Final labeled object saved to ../Random data/VisiumHD_Drosophila_Resolution_List.rds")
+
+```
+
+Finished Segmentation Analysis.

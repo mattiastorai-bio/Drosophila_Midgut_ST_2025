@@ -1,0 +1,180 @@
+---
+title: "3D Spatial Gene Expression Projection"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(plotly)
+library(dplyr)
+library(htmlwidgets)
+```
+
+## Introduction
+This script maps Seurat spatial pseudotime data onto the 3D midgut mesh. It extracts the `Spatial_Pseudotime` from the provided Seurat object and maps the values along the anterior-posterior axis of the 3D `.obj` mesh.
+
+```{r define_parameters}
+# Parameters
+seurat_obj_path <- "/home/mattia/Thesis/111125ST_def/Random data/merged_guts.rds"
+obj_file_path <- "/home/mattia/Thesis/3D model/flygut_midgut_3D.obj"
+output_dir <- "/home/mattia/Thesis/111125ST_def/figures/3D_mesh_plots"
+
+# The gene to visualize
+gene_name <- "Vha100-4"
+```
+
+## Load Data
+```{r load_data}
+cat("Loading Seurat Object...\n")
+seurat_obj <- readRDS(seurat_obj_path)
+
+if (!gene_name %in% rownames(seurat_obj[["Segmented"]])) {
+  stop(paste("Gene", gene_name, "not found in the 'Segmented' assay of the Seurat object."))
+}
+
+cat("Extracting expression and pseudotime data...\n")
+data_df <- FetchData(seurat_obj, vars = c(gene_name, "Spatial_Pseudotime"))
+colnames(data_df) <- c("Expression", "Pseudotime")
+
+# Remove NA pseudotime cells
+data_df <- data_df[!is.na(data_df$Pseudotime), ]
+```
+
+## Parse 3D Mesh
+We read the `.obj` file directly into R to extract the vertices and faces.
+```{r parse_mesh}
+cat("Parsing OBJ file...\n")
+obj_lines <- readLines(obj_file_path)
+
+v_lines <- obj_lines[startsWith(obj_lines, "v ")]
+f_lines <- obj_lines[startsWith(obj_lines, "f ")]
+
+# Extract vertices
+v_matrix <- do.call(rbind, lapply(strsplit(v_lines, " "), function(x) {
+  as.numeric(x[x != "v" & x != ""])
+}))
+
+# Extract faces (OBJ is 1-indexed, plotly needs 0-indexed)
+f_matrix <- do.call(rbind, lapply(strsplit(f_lines, " "), function(x) {
+  v_indices <- sapply(x[x != "f" & x != ""], function(y) as.numeric(strsplit(y, "/")[[1]][1]))
+  v_indices - 1 # convert to 0-indexed
+}))
+
+num_vertices <- nrow(v_matrix)
+```
+
+## Map Pseudotime to Mesh Vertices
+We map the 0-100 pseudotime scale onto the midgut portion of the mesh. The first 245 rings correspond to the Malpighian section and are excluded.
+```{r map_pseudotime}
+cat("Mapping vertices to pseudotime...\n")
+
+# Constants for clarity
+NUM_VERTICES <- num_vertices
+RING_SIZE <- 60
+MID_START <- 280
+MID_END <- 850
+
+# 1. Map vertices to rings
+vertex_ring_idx <- floor((0:(NUM_VERTICES - 1)) / RING_SIZE)
+vertex_ring_idx[vertex_ring_idx > 999] <- c(0, 999)
+
+# 2. Define mask and initialize
+vertex_pseudotime <- rep(NA, NUM_VERTICES)
+midgut_mask <- vertex_ring_idx >= MID_START & vertex_ring_idx <= MID_END
+
+# 3. Apply Inverted Mapping (Posterior to Anterior)
+vertex_pseudotime[midgut_mask] <- ((vertex_ring_idx[midgut_mask] - MID_START) / (MID_END - MID_START)) * 100
+```
+
+## Compute Expression
+We compute both a local binned average (raw) and a LOESS smoothed expression profile along the pseudotime axis.
+```{r compute_expression}
+# Compute Raw (Binned) Expression
+data_df$bin <- cut(data_df$Pseudotime, breaks = seq(0, 100, length.out = 101), include.lowest = TRUE, labels = FALSE)
+bin_means <- data_df %>% group_by(bin) %>% summarize(mean_expr = mean(Expression), .groups = 'drop')
+
+vertex_raw_expr <- rep(NA, num_vertices)
+vertex_bin <- cut(vertex_pseudotime[midgut_mask], breaks = seq(0, 100, length.out = 101), include.lowest = TRUE, labels = FALSE)
+
+matched_expr <- bin_means$mean_expr[match(vertex_bin, bin_means$bin)]
+matched_expr[is.na(matched_expr)] <- 0
+vertex_raw_expr[midgut_mask] <- matched_expr
+
+# Compute LOESS Smoothed Expression
+loess_model <- loess(Expression ~ Pseudotime, data = data_df, span = 0.3)
+
+vertex_smooth_expr <- rep(NA, num_vertices)
+predicted_expr <- predict(loess_model, newdata = data.frame(Pseudotime = vertex_pseudotime[midgut_mask]))
+
+# LOESS can sometimes predict negative values for 0-bounded data, clip at 0
+predicted_expr[predicted_expr < 0] <- 0
+vertex_smooth_expr[midgut_mask] <- predicted_expr
+```
+
+## Plotting Function
+```{r define_plot_function}
+generate_mesh_plot <- function(expr_values, title, filename) {
+  pal <- colorRamp(c("#440154", "#3b528b", "#21908c", "#5dc863", "#fde725"))
+  
+  min_expr <- min(expr_values, na.rm = TRUE)
+  max_expr <- max(expr_values, na.rm = TRUE)
+  
+  if (max_expr == min_expr) {
+    norm_expr <- rep(0, length(expr_values))
+  } else {
+    norm_expr <- (expr_values - min_expr) / (max_expr - min_expr)
+  }
+  
+  vertex_colors <- rep("rgb(200, 200, 200)", num_vertices) # Default grey for Malpighian
+  
+  valid_idx <- !is.na(norm_expr)
+  colors_rgb <- pal(norm_expr[valid_idx])
+  colors_rgb[is.na(colors_rgb)] <- 0
+  
+  vertex_colors[valid_idx] <- apply(colors_rgb, 1, function(x) paste0("rgb(", x[1], ",", x[2], ",", x[3], ")"))
+  
+  fig <- plot_ly(
+    x = v_matrix[, 1],
+    y = v_matrix[, 2],
+    z = v_matrix[, 3],
+    i = f_matrix[, 1],
+    j = f_matrix[, 2],
+    k = f_matrix[, 3],
+    type = "mesh3d",
+    vertexcolor = vertex_colors,
+    name = title,
+    hoverinfo = "text",
+    text = ifelse(valid_idx, paste("Expr:", round(expr_values, 2), "<br>Pseudotime:", round(vertex_pseudotime, 1)), "Malpighian Section")
+  )
+  
+  fig <- fig %>% layout(
+    title = title,
+    scene = list(
+      aspectmode = "data",
+      xaxis = list(title = "X"),
+      yaxis = list(title = "Y"),
+      zaxis = list(title = "Z")
+    )
+  )
+  
+  out_file <- file.path(output_dir, filename)
+  saveWidget(fig, file = out_file, selfcontained = FALSE)
+  cat(paste("Saved plot to:", out_file, "\n"))
+  
+  return(fig)
+}
+```
+
+## Generate Plots
+### Raw Expression
+```{r plot_raw}
+fig_raw <- generate_mesh_plot(vertex_raw_expr, paste(gene_name, "- Raw Expression"), paste0(gene_name, "_raw_3D.html"))
+fig_raw
+```
+
+### Smoothed Expression
+```{r plot_smoothed}
+fig_smoothed <- generate_mesh_plot(vertex_smooth_expr, paste(gene_name, "- Smoothed Expression"), paste0(gene_name, "_smoothed_3D.html"))
+fig_smoothed
+```

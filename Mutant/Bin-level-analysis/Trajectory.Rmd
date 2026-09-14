@@ -1,0 +1,819 @@
+---
+title: "Trajectories"
+output: html_document
+date: "2025-12-02"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(Matrix)
+library(spacexr)
+library(Matrix.utils)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(ggspavis)
+library(presto)
+library(clusterProfiler)
+library(shiny)
+library(sf)
+library(viridis)
+library(monocle3)
+library(monocle)
+library(tidyr)
+library(plotly)
+library(tidyverse)
+library(reticulate)
+library(SeuratWrappers)
+library(RColorBrewer)
+```
+
+```{r}
+# 1. Access the final proportion matrix (weights_full)
+myRCTD <- readRDS("/home/mattia/Thesis/03Slide4/Random data/myRCTD_spatial_bins_results.rds")
+proportion_matrix <- myRCTD@assays@data@listData[["weights_full"]]
+
+# 2. Transpose the matrix to have Pixels (Barcodes) as ROWS, which is required for easy filtering
+proportion_df <- as.data.frame(t(proportion_matrix))
+
+# Sanity Check: Print the first few columns to confirm cell type names are correct
+colnames(proportion_df)
+```
+
+```{r}
+cell_type_to_remove <- "unk" 
+
+# Define the minimum proportion threshold for removal (e.g., 1%)
+# Spots with this cell type >= this proportion will be REMOVED.
+threshold <- 0.05 
+
+# 3. Create a logical vector to identify spots to keep:
+# We keep spots where the proportion of the unwanted cell type is strictly BELOW the threshold.
+spots_to_keep <- proportion_df[[cell_type_to_remove]] < threshold
+
+# 4. Get the list of barcodes (pixel IDs) to keep
+barcodes_to_keep <- rownames(proportion_df)[spots_to_keep]
+
+# Optional: Report the impact of the filter
+num_removed <- sum(!spots_to_keep)
+num_total <- length(spots_to_keep)
+print(paste0("Total spots to remove: ", num_removed, " (", round(num_removed/num_total*100, 2), "%)"))
+```
+
+```{r}
+# 5. Subset the SpatialExperiment object
+spatial_experiment <- readRDS("/home/mattia/Thesis/03Slide4/Random data/spatial_experiment.rds")
+spe_filtered <- spatial_experiment[, barcodes_to_keep]
+
+# Final Check: Print the new number of spots
+print(paste0("New number of spatial spots (columns): ", ncol(spe_filtered)))
+```
+
+```{r}
+# 1. Get the spatial coordinates (colData or from spatialCoords)
+coords_original <- as.data.frame(spatialCoords(spatial_experiment))
+coords_filtered <- as.data.frame(spatialCoords(spe_filtered))
+
+# 2. Add a status column to each data frame
+coords_original$Status <- "Original (All Spots)"
+coords_filtered$Status <- "Filtered (Kept Spots Only)"
+
+# 3. Rename columns for generic use (x-y coordinates)
+colnames(coords_original)[1:2] <- c("x_coord", "y_coord")
+colnames(coords_filtered)[1:2] <- c("x_coord", "y_coord")
+
+# 4. Combine the data frames for a single ggplot call
+plot_data <- rbind(coords_original, coords_filtered)
+```
+
+```{r}
+plot_filtered_effect <- ggplot(plot_data, aes(x = x_coord, y = y_coord, color = Status)) +
+  geom_point(size = 0.5) + # Adjust size based on your data density
+  facet_wrap(~Status) +
+  scale_y_reverse() + # Standard spatial plots often reverse the Y-axis
+  labs(
+    title = paste("Spatial Spot Removal (Threshold:", threshold * 100, "% of", cell_type_to_remove, "removed)"),
+    x = "Spatial X Coordinate",
+    y = "Spatial Y Coordinate"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.text = element_text(size = 12)
+  )
+
+print(plot_filtered_effect)
+```
+
+```{r}
+# Define the list of all 14 cell type proportion columns
+#CELL_TYPE_COLS <- c("AstC-EE", "aEC", "classIII-EE", "Copper", "daEC", "dEC", #"EB", "EEP", "ISC", "LFC", "mEC", "MT", "pEC", "Tk-EE")
+
+CELL_TYPE_COLS <- c("EE", "aEC", "Copper", "daEC", "dEC", "EB", "ISC", "LFC", "mEC", "MT", "pEC")
+
+# 1. Filter the original proportion data for only the kept spots (barcodes_to_keep)
+# Assuming proportion_df is a data.frame or matrix
+proportion_df_filtered <- proportion_df[barcodes_to_keep, ] 
+
+# 2. Loop through each cell type and add the column to spe_filtered
+for (ct_name in CELL_TYPE_COLS) {
+    
+    # Check if the column exists in the proportion data
+    if (ct_name %in% colnames(proportion_df_filtered)) {
+        
+        # Extract the single column (as a vector) from the filtered proportions
+        cell_type_proportions <- proportion_df_filtered[[ct_name]]
+        
+        # Add this vector as a new column to the colData of the SpatialExperiment object
+        colData(spe_filtered)[[ct_name]] <- cell_type_proportions
+        
+        # Optional check:
+        print(paste("Successfully added:", ct_name))
+        
+    } else {
+        warning(paste("Column not found in proportion_df_filtered:", ct_name))
+    }
+}
+
+# Optional: Ensure the barcode names match (though not strictly necessary if order is preserved)
+rownames(colData(spe_filtered)) <- colnames(spe_filtered)
+```
+
+```{r}
+# 1. Prepare data frame: Combine colData (metadata) and spatialCoords from the FILTERED object
+plot_data_filtered <- data.frame(
+    colData(spe_filtered),
+    spatialCoords(spe_filtered)
+)
+
+# 2. Rename coordinates for ggplot
+colnames(plot_data_filtered)[grep("coord", colnames(plot_data_filtered))] <- c("x", "y")
+
+# 3. Generate the ggplot visualization
+final_proportion_plot <- ggplot(
+  plot_data_filtered, 
+  aes(x = x, y = y, color = !!rlang::sym("LFC"))  # "classIII.EE" "Tk.EE" 
+) +  # "ADD CELLTYPE AGAIN" "AstC.EE"
+  geom_point(size = 1.5) +
+  scale_color_viridis_c(name = "Proportion") + # Use a continuous color scale
+  scale_y_reverse() + # Reverse Y-axis to match image orientation
+  coord_fixed() + # Ensures the spatial aspect ratio is correct
+  theme_void() + # Removes axes and background for a clean spatial look
+  ggtitle(paste0("Proportion of ", "LFC", " (Filtered Data)")) + # "ADD CELLTYPE AGAIN"
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(final_proportion_plot)
+```
+
+```{r}
+# --- 1. Identify the Cell Type with the Highest Proportion for each Pixel ---
+CELL_TYPE_COLS <- c("EE", "aEC", "Copper", "daEC", "dEC", "EB", "ISC", "LFC", "mEC", "MT", "pEC")
+
+# Define the list of all 14 cell type proportion columns
+#CELL_TYPE_COLS <- c("AstC.EE", "aEC", "classIII.EE", "Copper", "daEC", "dEC", #"EB", "EEP", "ISC", "LFC", "mEC", "MT", "pEC", "Tk.EE")
+
+# Extract the colData (metadata) from your SpatialExperiment object
+colData_df <- as.data.frame(colData(spe_filtered))
+
+# Create a new column 'Most_Likely_CellType'
+# The apply function finds the column name (cell type) that corresponds to the maximum value in each row (pixel)
+colData_df$Most_Likely_CellType <- apply(
+    colData_df[, CELL_TYPE_COLS], # Look only at the cell type proportion columns
+    1,                            # Apply function across rows (pixels)
+    function(x) CELL_TYPE_COLS[which.max(x)] # Find the index of the max value and return the cell type name
+)
+
+# Add the new column back to the colData of your SpatialExperiment object
+colData(spe_filtered)$Most_Likely_CellType <- colData_df$Most_Likely_CellType
+
+
+# --- 2. Prepare Data and Plot the Most Likely Cell Type ---
+
+# Prepare data frame: Combine colData and spatialCoords from the FILTERED object
+plot_data_ML <- data.frame(
+    colData(spe_filtered),
+    spatialCoords(spe_filtered)
+)
+colnames(plot_data_ML)[grep("coord", colnames(plot_data_ML))] <- c("x", "y")
+
+# Get a color palette with enough distinct colors for all 14 cell types
+# The 'Set3' palette from RColorBrewer is a good option for categorical data up to 12 colors.
+# Since you have 14, you might need a custom or mixed palette.
+celltype_colors <- colorRampPalette(brewer.pal(n = 12, name = "Set3"))(length(CELL_TYPE_COLS))
+
+
+# Generate the ggplot visualization
+most_likely_plot <- ggplot(
+    plot_data_ML,
+    aes(x = x, y = y, color = Most_Likely_CellType)
+) +
+    geom_point(size = 1.5) +
+    scale_color_manual(
+        values = celltype_colors, # Use the custom color palette
+        name = "Most Likely Cell Type"
+    ) +
+    scale_y_reverse() + # Reverse Y-axis to match image orientation
+    coord_fixed() + # Ensures the spatial aspect ratio is correct
+    theme_void() + # Removes axes and background
+    ggtitle("Spatial Mapping of Most Likely Cell Type (RTCD)") +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "right"
+    )
+
+print(most_likely_plot)
+```
+
+```{r}
+# --- 1. Prepare Data for Faceting ---
+
+# Use the same base plot_data_ML dataframe from the previous step
+
+# Transform the data from "wide" format (14 columns) to "long" format (3 columns: x, y, CellType, Proportion)
+# This is necessary for ggplot's facet_wrap
+plot_data_long <- plot_data_ML %>%
+    pivot_longer(
+        cols = all_of(CELL_TYPE_COLS), # Columns to gather
+        names_to = "CellType",         # New column for the cell type names
+        values_to = "Proportion"       # New column for the proportion values
+    )
+
+# --- 2. Generate the Faceted ggplot Visualization ---
+
+faceted_proportion_plot <- ggplot(
+    plot_data_long,
+    aes(x = x, y = y, color = Proportion)
+) +
+    geom_point(size = 1.5) +
+    scale_color_viridis_c(name = "Proportion", option = "magma") + # Continuous color scale
+    scale_y_reverse() +
+    coord_fixed() +
+    theme_void() +
+    # This creates a separate plot for each cell type
+    facet_wrap(~ CellType, ncol = 4) + # Adjust ncol for desired layout
+    ggtitle("Spatial Proportion Map of All Cell Types (RTCD)") +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        strip.text = element_text(size = 8, face = "bold") # Format the cell type titles
+    )
+
+print(faceted_proportion_plot)
+```
+
+```{r}
+# 1. Prepare Data outside of Shiny
+coords_data <- as.data.frame(spatialCoords(spe_filtered))
+colnames(coords_data) <- c("x", "y")
+coords_data$barcode <- colnames(spe_filtered)
+coords_data$id <- 1:nrow(coords_data)
+
+# 2. Define the Shiny App (UI and Server logic)
+ui <- fluidPage(
+  titlePanel("Manual Gut Selection (Plotly Lasso Draw)"),
+  sidebarLayout(
+    sidebarPanel(
+      actionButton("save_gut_1", "Save Gut 1 Selection"),
+      actionButton("save_gut_2", "Save Gut 2 Selection"),
+      actionButton("save_gut_3", "Save Gut 3 Selection"),
+      hr(),
+      actionButton("done_button", "DONE: Close App & Save Data"),
+      hr(),
+      p("Instructions: **Look for the toolbar in the plot's top-right corner.** Click the Lasso tool icon (a free-form loop) to select points. Draw a shape around a gut section, then click the corresponding 'Save Gut X' button."),
+      p("Click the 'DONE' button when all three guts are saved.")
+    ),
+    mainPanel(
+      plotlyOutput("spatial_plot")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  selected_barcodes <- reactiveValues(gut_1 = character(0), gut_2 = character(0), gut_3 = character(0))
+  
+  # Render the main plot using Plotly
+  output$spatial_plot <- renderPlotly({
+    plot_ly(
+      coords_data, 
+      x = ~x, 
+      y = ~y, 
+      type = 'scatter', 
+      mode = 'markers',
+      marker = list(size = 5, color = 'blue', opacity = 0.5),
+      source = "A" # Source ID for event capture
+    ) %>%
+      layout(
+        title = "Use Lasso Tool to Select Points",
+        yaxis = list(autorange = "reversed")
+      ) 
+  })
+  
+  get_selected_points <- reactive({
+    event_data("plotly_selected", source = "A")
+  })
+  
+  observeEvent(input$save_gut_1, {
+    selected <- get_selected_points()
+    req(selected)
+    selected_indices <- selected$pointNumber + 1
+    selected_barcodes$gut_1 <- coords_data$barcode[selected_indices]
+    cat(paste("Gut 1 saved with", length(selected_barcodes$gut_1), "spots.\n"))
+  })
+  
+  observeEvent(input$save_gut_2, {
+    selected <- get_selected_points()
+    req(selected)
+    selected_indices <- selected$pointNumber + 1
+    selected_barcodes$gut_2 <- coords_data$barcode[selected_indices]
+    cat(paste("Gut 2 saved with", length(selected_barcodes$gut_2), "spots.\n"))
+  })
+  
+  observeEvent(input$save_gut_3, {
+    selected <- get_selected_points()
+    req(selected)
+    selected_indices <- selected$pointNumber + 1
+    selected_barcodes$gut_3 <- coords_data$barcode[selected_indices]
+    cat(paste("Gut 3 saved with", length(selected_barcodes$gut_3), "spots.\n"))
+  })
+  
+  observeEvent(input$done_button, {
+    stopApp(list(
+      barcodes_gut_1 = selected_barcodes$gut_1,
+      barcodes_gut_2 = selected_barcodes$gut_2,
+      barcodes_gut_3 = selected_barcodes$gut_3
+    ))
+  })
+} 
+
+# Run the app and save the results
+selection_results <- runApp(list(ui = ui, server = server), launch.browser = TRUE)
+```
+
+```{r}
+# Extract the barcode vectors from the results
+gut_1_barcodes <- selection_results$barcodes_gut_1
+gut_2_barcodes <- selection_results$barcodes_gut_2
+gut_3_barcodes <- selection_results$barcodes_gut_3
+
+# Subset the main object
+spe_gut_1 <- spe_filtered[, gut_1_barcodes]
+spe_gut_2 <- spe_filtered[, gut_2_barcodes]
+spe_gut_3 <- spe_filtered[, gut_3_barcodes]
+
+print("Successfully created separate, lasso-defined subset objects: spe_gut_1, spe_gut_2, spe_gut_3.")
+```
+
+```{r}
+cell_type_to_plot <- "ISC" 
+
+# Check if the column exists (Optional, but good practice)
+if (!(cell_type_to_plot %in% colnames(colData(spe_gut_1)))) {
+    stop(paste("Cell type fraction column '", cell_type_to_plot, "' not found in colData.", sep=""))
+}
+
+# 1. Create the base ggplot object from the subsetted data
+plot_data <- as.data.frame(spatialCoords(spe_gut_1))
+plot_data$CellFraction <- colData(spe_gut_1)[[cell_type_to_plot]]
+
+# 2. Plot the spatial data, coloring by the cell type fraction
+ggplot(plot_data, aes(x = x, y = y, color = CellFraction)) +
+  geom_point(size = 3) +
+  scale_y_reverse() + # Standard for spatial data
+  coord_fixed() +
+  scale_color_viridis_c(name = paste0(cell_type_to_plot, "\nFraction")) + # Use viridis for better perception
+  theme_classic() +
+  ggtitle(paste("Spatial Distribution of", cell_type_to_plot, "in Gut 1"))
+```
+
+```{r}
+# --- Custom Conversion Function (Final Version) ---
+create_monocle_cds_spatial <- function(spe_obj) {
+    library(monocle3)
+    library(SingleCellExperiment) 
+    
+    expr_matrix <- counts(spe_obj)
+    cell_data <- as.data.frame(colData(spe_obj))
+    feature_data <- as.data.frame(rowData(spe_obj))
+    
+    # Ensure gene_short_name exists to prevent warnings/errors
+    if (!"gene_short_name" %in% colnames(feature_data)) {
+        feature_data$gene_short_name <- rownames(feature_data) 
+    }
+    
+    cds <- new_cell_data_set(
+        expression_data = expr_matrix,
+        cell_metadata = cell_data,
+        gene_metadata = feature_data
+    )
+    
+    # CRITICAL FIX: Set the spatial coordinates as the UMAP dimension.
+    spatial_coords <- spatialCoords(spe_obj)
+    colnames(spatial_coords) <- c("x", "y")
+    reducedDims(cds)$UMAP <- spatial_coords 
+    
+    return(cds)
+}
+```
+
+```{r}
+print("--- Starting Spatial Trajectory Learning for spe_gut_1 ---")
+
+# --- A. Conversion and Trajectory Setup for Gut 1 ---
+cds_gut_1 <- create_monocle_cds_spatial(spe_gut_1) 
+    
+# --- B. Spatial Trajectory Learning ---
+
+# 1. Learn Graph from Spatial Data (UMAP)
+# This step still fails because of the internal cluster check.
+# cds_gut_1 <- learn_graph(cds_gut_1) 
+
+# Run cluster_cells, forcing it to use the spatial UMAP
+# This satisfies the internal check and uses the spatial data as the basis.
+cds_gut_1 <- cluster_cells(cds_gut_1)
+cds_gut_1@clusters$UMAP$partitions[] <- factor("1")   # Merge partitions to bridge gap
+
+# Now, learn_graph will see the necessary cluster slots and use the spatial UMAP.
+cds_gut_1 <- learn_graph(cds_gut_1, use_partition = FALSE) 
+
+print("Spatial trajectory graph learned. Now ordering cells...")
+
+# --- C. Order Cells and Calculate Pseudotime ---
+spatial_coords <- spatialCoords(spe_gut_1)
+
+# Identify the root node (leftmost spot for horizontal trajectory)
+root_node_barcodes <- head(
+    colnames(cds_gut_1)[order(spatial_coords[, 1])], 
+    n = 1
+)
+
+# Order the cells based on the chosen root
+cds_gut_1 <- order_cells(cds_gut_1, root_cells = root_node_barcodes)
+
+# --- D. Extract and Scale Scores ---
+current_scores <- pseudotime(cds_gut_1)
+min_pt <- min(current_scores, na.rm = TRUE)
+max_pt <- max(current_scores, na.rm = TRUE)
+scaled_scores <- (current_scores - min_pt) / (max_pt - min_pt) * 100
+
+# --- E. Store Result Back in SpatialExperiment object ---
+colData(spe_gut_1)$spe_gut_1_Pseudotime_Score <- scaled_scores
+
+print("✅ Spatial-based Pseudotime scores calculated and saved to spe_gut_1.")
+```
+
+```{r}
+# 1. Prepare data for Gut 1
+plot_data_1 <- as.data.frame(spatialCoords(spe_gut_1))
+# Retrieve the calculated pseudotime score
+plot_data_1$Pseudotime <- colData(spe_gut_1)$spe_gut_1_Pseudotime_Score
+
+# 2. Plot the spatial pseudotime
+ggplot(plot_data_1, aes(x = x, y = y, color = Pseudotime)) +
+  geom_point(size = 3) +
+  scale_y_reverse() + # Standard for spatial data
+  coord_fixed() +
+  # Use the magma palette which is great for continuous data
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Pseudotime\n(0-100)") + 
+  theme_classic() +
+  ggtitle("Spatial Pseudotime Trajectory in Gut 1")
+```
+
+```{r}
+# --- Trajectory Setup for Gut 2 ---
+print("--- Starting Spatial Trajectory Learning for spe_gut_2 ---")
+
+cds_gut_2 <- create_monocle_cds_spatial(spe_gut_2) 
+    
+# Bypass checks and learn the graph based on spatial coordinates
+cds_gut_2 <- cluster_cells(cds_gut_2)
+cds_gut_2@clusters$UMAP$partitions[] <- factor("1")   # Merge partitions to bridge gap
+cds_gut_2 <- learn_graph(cds_gut_2, use_partition = FALSE) 
+
+# Order Cells (Root is still the leftmost spot)
+spatial_coords_2 <- spatialCoords(spe_gut_2)
+root_node_barcodes_2 <- head(
+    colnames(cds_gut_2)[order(spatial_coords_2[, 1])], 
+    n = 1
+)
+
+cds_gut_2 <- order_cells(cds_gut_2, root_cells = root_node_barcodes_2)
+
+# Extract and Scale Scores
+current_scores_2 <- pseudotime(cds_gut_2)
+min_pt_2 <- min(current_scores_2, na.rm = TRUE)
+max_pt_2 <- max(current_scores_2, na.rm = TRUE)
+scaled_scores_2 <- (current_scores_2 - min_pt_2) / (max_pt_2 - min_pt_2) * 100
+
+# Store Result Back in SpatialExperiment object
+colData(spe_gut_2)$spe_gut_2_Pseudotime_Score <- scaled_scores_2
+
+print("✅ Spatial-based Pseudotime scores calculated and saved to spe_gut_2.")
+```
+
+```{r}
+# Visualize the trajectory for Gut 2
+plot_data_2 <- as.data.frame(spatialCoords(spe_gut_2))
+plot_data_2$Pseudotime <- colData(spe_gut_2)$spe_gut_2_Pseudotime_Score
+
+ggplot(plot_data_2, aes(x = x, y = y, color = Pseudotime)) +
+  geom_point(size = 3) +
+  scale_y_reverse() + 
+  coord_fixed() +
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Pseudotime\n(0-100)") + 
+  theme_classic() +
+  ggtitle("Spatial Pseudotime Trajectory in Gut 2 (Forced Spatial)")
+```
+
+```{r}
+# --- Trajectory Setup for Gut 3 ---
+print("--- Starting Spatial Trajectory Learning for spe_gut_3 ---")
+
+cds_gut_3 <- create_monocle_cds_spatial(spe_gut_3) 
+    
+# Bypass checks and learn the graph based on spatial coordinates
+cds_gut_3 <- cluster_cells(cds_gut_3)
+cds_gut_3@clusters$UMAP$partitions[] <- factor("1")   # Merge partitions to bridge gap
+cds_gut_3 <- learn_graph(cds_gut_3, use_partition = FALSE) 
+
+# Order Cells (Root is still the leftmost spot)
+spatial_coords_3 <- spatialCoords(spe_gut_3)
+root_node_barcodes_3 <- head(
+    colnames(cds_gut_3)[order(spatial_coords_3[, 1])], 
+    n = 1
+)
+
+cds_gut_3 <- order_cells(cds_gut_3, root_cells = root_node_barcodes_3)
+
+# Extract and Scale Scores
+current_scores_3 <- pseudotime(cds_gut_3)
+min_pt_3 <- min(current_scores_3, na.rm = TRUE)
+max_pt_3 <- max(current_scores_3, na.rm = TRUE)
+scaled_scores_3 <- (current_scores_3 - min_pt_3) / (max_pt_3 - min_pt_3) * 100
+
+# Store Result Back in SpatialExperiment object
+colData(spe_gut_3)$spe_gut_3_Pseudotime_Score <- scaled_scores_3
+
+print("✅ Spatial-based Pseudotime scores calculated and saved to spe_gut_3.")
+```
+
+```{r}
+# Visualize the trajectory for Gut 3
+plot_data_3 <- as.data.frame(spatialCoords(spe_gut_3))
+plot_data_3$Pseudotime <- colData(spe_gut_3)$spe_gut_3_Pseudotime_Score
+
+ggplot(plot_data_3, aes(x = x, y = y, color = Pseudotime)) +
+  geom_point(size = 3) +
+  scale_y_reverse() + 
+  coord_fixed() +
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Pseudotime\n(0-100)") + 
+  theme_classic() +
+  ggtitle("Spatial Pseudotime Trajectory in Gut 3 (Forced Spatial)")
+```
+
+```{r}
+# Define the complete list of 11 cell type fraction columns (matching previous definition)
+CELL_TYPE_COLS_FINAL <- c("EE", "aEC", "Copper", "daEC", "dEC", "EB", "ISC", "LFC", "mEC", "MT", "pEC")
+
+# --- Function to Prepare Data for One Gut ---
+prepare_gut_data <- function(spe_obj, gut_id) {
+    # Determine the correct pseudotime column name for this object
+    pt_col_name <- paste0("spe_gut_", substring(gut_id, 5), "_Pseudotime_Score")
+    
+    # Identify which columns actually exist in the object's colData
+    existing_cols <- colnames(colData(spe_obj))
+    available_ct_cols <- intersect(CELL_TYPE_COLS_FINAL, existing_cols)
+    
+    # Verify pt_col_name exists
+    if (!pt_col_name %in% existing_cols) {
+        stop(paste("Pseudotime column", pt_col_name, "not found in object."))
+    }
+    
+    # Extract Pseudotime and available cell type columns
+    data_cols <- as.data.frame(colData(spe_obj))[, c(pt_col_name, available_ct_cols)]
+    
+    # Rename Pseudotime column consistently
+    data_cols$Pseudotime <- data_cols[[pt_col_name]]
+    data_cols$GutID <- gut_id
+    
+    # Keep only Pseudotime, GutID, and the cell type columns
+    data_cols <- data_cols[, c("Pseudotime", "GutID", available_ct_cols)]
+    
+    return(data_cols)
+}
+
+# Combine data from all three guts
+df_1_wide <- prepare_gut_data(spe_gut_1, "Gut 1")
+df_2_wide <- prepare_gut_data(spe_gut_2, "Gut 2")
+df_3_wide <- prepare_gut_data(spe_gut_3, "Gut 3")
+
+combined_wide_df <- rbind(df_1_wide, df_2_wide, df_3_wide)
+
+# 2. Pivot Data to Long Format (Melt)
+# Identify which cell type columns are actually present in the combined data
+available_ct_cols_for_pivot <- intersect(CELL_TYPE_COLS_FINAL, colnames(combined_wide_df))
+
+combined_long_df <- combined_wide_df %>%
+  pivot_longer(
+    cols = all_of(available_ct_cols_for_pivot),
+    names_to = "CellType",
+    values_to = "Fraction"
+  )
+
+# Clean up cell type names for plotting (replace dots/hyphens with spaces)
+combined_long_df$CellType_Clean <- gsub("[\\.-]", " ", combined_long_df$CellType)
+```
+
+```{r}
+# 3. Generate Faceted Visualization
+final_plot_responsive <- ggplot(combined_long_df, aes(x = Pseudotime, y = Fraction)) +
+ geom_point(aes(color = GutID), alpha = 0.6, size = 1.5) +
+# Use a trend line that is more responsive to local variation
+ geom_smooth(method = "loess", span = 0.2, color = "black", linetype = "solid", se = FALSE, linewidth = 0.5) + 
+ scale_color_manual(
+ values = c("Gut 1" = "#E69F00", "Gut 2" = "#56B4E9", "Gut 3" = "#009E73"),
+ name = "Gut Section"
+ ) +
+ # Create a separate panel for each cell type
+ facet_wrap(~ CellType_Clean, scales = "free_y", ncol = 4) + 
+ theme_bw(base_size = 12) +
+ labs(
+ title = "Cell Type Fraction Distribution Along Spatial Axis",
+ x = "Pseudotime (Spatial Position)",
+ y = "Cell Type Fraction (% of Total Cells)"
+ ) +
+ theme(plot.title = element_text(hjust = 0.5))
+
+print(final_plot_responsive)
+```
+
+```{r}
+# Define the single cell type column to plot
+CELL_TYPE_TO_PLOT <- "pEC" 
+
+# 1. Filter the combined long dataframe for only the 'aEC' cell type
+aEC_data_long <- combined_long_df[combined_long_df$CellType == CELL_TYPE_TO_PLOT, ]
+
+# 2. Generate Faceted Visualization for aEC
+final_aEC_plot <- ggplot(aEC_data_long, aes(x = Pseudotime, y = Fraction)) +
+  geom_point(aes(color = GutID), alpha = 0.7, size = 2) +
+  # Use a trend line to visually guide the eye on the spatial relationship
+  geom_smooth(method = "loess",span = 0.2, color = "black", linetype = "solid", se = FALSE, linewidth = 0.5) + 
+  scale_color_manual(
+      values = c("Gut 1" = "#E69F00", "Gut 2" = "#56B4E9", "Gut 3" = "#009E73"),
+      name = "Gut Section"
+  ) +
+  # Use facet_wrap to separate the data by GutID
+  facet_wrap(~ GutID, scales = "free_y", ncol = 3) + 
+  theme_bw(base_size = 14) +
+  labs(
+    title = "pEC Fraction vs. Spatial Position",
+    x = "Spatial Position",
+    y = "pEC Fraction (% of Total Cells)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(final_aEC_plot)
+```
+
+```{r}
+# --- 1. Prepare Colors (RColorBrewer) ---
+# Since we have 14 cell types, we need a palette large enough.
+# We will use a colorRampPalette based on a diverse palette like 'Set3' or 'Paired' 
+# and interpolate to get exactly 14 colors.
+
+num_celltypes <- length(unique(combined_long_df$CellType_Clean))
+# Use 'Set3' as a base, which is good for categorical data, and expand it to 14 colors
+custom_colors <- colorRampPalette(brewer.pal(n = 12, name = "Set3"))(num_celltypes)
+
+
+# --- 2. Generate the Combined LOESS Plot with Facets ---
+
+combined_celltype_faceted_plot <- ggplot(
+    combined_long_df,
+    aes(
+        x = Pseudotime,
+        y = Fraction,
+        # Map color to the cell type
+        color = CellType_Clean,
+        # Group by CellType_Clean ensures separate LOESS curves are calculated
+        group = CellType_Clean
+    )
+) +
+    # Use geom_smooth with method="loess" for the smooth curve
+    geom_smooth(
+        method = "loess",
+        span = 0.2,
+        se = FALSE, # Hide confidence intervals
+        linewidth = 1.5
+    ) +
+
+    # Set the colors using the RColorBrewer-derived custom palette
+    scale_color_manual(
+        values = custom_colors,
+        name = "Cell Type"
+    ) +
+
+    # --- Implement Facet Wrap by GutID (as requested) ---
+    facet_wrap(
+        ~ GutID,
+        scales = "free_y", # Allows y-axis to adjust for each gut's data range
+        ncol = 3           # Arrange in a single row
+    ) +
+
+    labs(
+        title = "Cell Type Trajectories Across Individual Gut Sections",
+        subtitle = "LOESS Proportion vs. Pseudotime for all Cell Types",
+        x = "Pseudotime (Spatial Position along Gut Axis)",
+        y = "Deconvolved Cell Type Fraction"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        # Ensure the background strips of the facets are visible
+        strip.background = element_rect(fill = "gray90", color = NA),
+        strip.text = element_text(face = "bold")
+    )
+
+print(combined_celltype_faceted_plot)
+```
+
+```{r}
+# --- 1. Filter the Data for Gut 1 Only ---
+# Create a new data frame containing only the data for "Gut 1"
+gut1_data_long <- combined_long_df %>%
+    filter(GutID == "Gut 1")
+
+# --- 2. Prepare Colors (RColorBrewer) ---
+# Use the same color preparation as before to maintain consistency
+num_celltypes <- length(unique(gut1_data_long$CellType_Clean))
+custom_colors <- colorRampPalette(brewer.pal(n = 12, name = "Set3"))(num_celltypes)
+
+
+# --- 3. Generate the Single Panel LOESS Plot ---
+
+single_gut_trajectory_plot <- ggplot(
+    gut1_data_long, # Use the FILTERED data here
+    aes(
+        x = Pseudotime,
+        y = Fraction,
+        # Map color to the cell type
+        color = CellType_Clean,
+        # Group by CellType_Clean ensures separate LOESS curves are calculated
+        group = CellType_Clean
+    )
+) +
+    # Use geom_smooth with method="loess" for the smooth curve
+    geom_smooth(
+        method = "loess",
+        span = 0.2,
+        se = FALSE, # Hide confidence intervals
+        linewidth = 1.5
+    ) +
+
+    # Set the colors using the RColorBrewer-derived custom palette
+    scale_color_manual(
+        values = custom_colors,
+        name = "Cell Type"
+    ) +
+
+    # We do NOT use facet_wrap here, as we only want one plot
+
+    labs(
+        title = "Cell Type Composition Along Spatial Axis",
+        subtitle = "LOESS Proportion vs. Position for all Cell Types",
+        x = "Pseudotime (Spatial Position along Gut1 Axis)",
+        y = "Deconvolved Cell Type Fraction"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "right"
+    )
+
+print(single_gut_trajectory_plot)
+```
+
+
+
+
+
+
+
+
+
+

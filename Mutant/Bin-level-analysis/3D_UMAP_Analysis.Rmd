@@ -1,0 +1,1109 @@
+---
+title: "3D UMAP Analysis (PCA + Spatial Pseudotime)"
+output: html_document
+date: "2026-01-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(monocle3)
+library(plotly)
+library(dplyr)
+library(ggplot2)
+library(shiny)
+library(sf)
+library(viridis)
+```
+
+## 1. Setup & Load Data
+Load the segmented Seurat object from the saved RDS file.
+
+```{r setup_env}
+if (!exists("visium_seg")) {
+  message("Loading visium_seg from saved RDS...")
+  vhd_list <- readRDS("/home/mattia/Thesis/03Slide4/Random data/VisiumHD_Drosophila_Resolution_List.rds")
+  visium_seg <- vhd_list$seg
+  rm(vhd_list)
+  message(paste("Loaded visium_seg with", ncol(visium_seg), "cells."))
+} else {
+  message(paste("Found visium_seg in environment with", ncol(visium_seg), "cells."))
+}
+```
+
+## 2. Prepare Data for Shiny App
+Extract coordinates from the segmented object to use in the interactive selector.
+
+```{r prepare_shiny_data}
+# 1. Get Coordinates from Metadata (Robustly calculated in Seg_data.Rmd)
+coords_seg <- visium_seg@meta.data[, c("x_centroid", "y_centroid")]
+colnames(coords_seg) <- c("x", "y")
+coords_seg$barcode <- rownames(coords_seg)
+
+print(paste("Ready for Shiny: ", nrow(coords_seg), "cells."))
+head(coords_seg)
+```
+
+## 2. Interactive Gut Subsetting
+
+Run this chunk to launch the Shiny app and select the 3 guts.
+
+```{r shiny_app}
+# Define UI
+ui <- fluidPage(
+  titlePanel("Gut Subsetting Tool"),
+  sidebarLayout(
+    sidebarPanel(
+      h4("Instructions"),
+      p("1. Use the Lasso tool (top visual toolbar) to select points."),
+      p("2. Click 'Save Gut X' to store the selection."),
+      actionButton("save_gut_1", "Save Gut 1"),
+      verbatimTextOutput("status_1"),
+      hr(),
+      actionButton("save_gut_2", "Save Gut 2"),
+      verbatimTextOutput("status_2"),
+      hr(),
+      actionButton("done_btn", "DONE (Close & Save)"),
+      class = "well"
+    ),
+    mainPanel(
+      plotlyOutput("scatter_plot", height = "800px")
+    )
+  )
+)
+
+# Define Server
+server <- function(input, output, session) {
+  
+  # Store selections
+  vals <- reactiveValues(
+    gut_1 = NULL,
+    gut_2 = NULL
+  )
+  
+  output$scatter_plot <- renderPlotly({
+    plot_ly(coords_seg, x = ~x, y = ~y, key = ~barcode, type = "scatter", mode = "markers",
+            marker = list(size = 3, color = 'gray', opacity = 0.5), source = "subset_source") %>%
+      layout(dragmode = "lasso", title = "Select Gut Regions", yaxis = list(autorange = "reversed"))
+  })
+  
+  # Save Gut 1
+  observeEvent(input$save_gut_1, {
+    event_data <- event_data("plotly_selected", source = "subset_source")
+    if (!is.null(event_data)) {
+      vals$gut_1 <- event_data$key
+    }
+  })
+  output$status_1 <- renderText({ 
+    if(is.null(vals$gut_1)) "Not saved" else paste(length(vals$gut_1), "cells saved")
+  })
+  
+  # Save Gut 2
+  observeEvent(input$save_gut_2, {
+    event_data <- event_data("plotly_selected", source = "subset_source")
+    if (!is.null(event_data)) {
+      vals$gut_2 <- event_data$key
+    }
+  })
+  output$status_2 <- renderText({ 
+    if(is.null(vals$gut_2)) "Not saved" else paste(length(vals$gut_2), "cells saved")
+  })
+  
+  # Done
+  observeEvent(input$done_btn, {
+    stopApp(list(gut_1 = vals$gut_1, gut_2 = vals$gut_2))
+  })
+}
+
+# Run App
+subset_res <- runApp(shinyApp(ui, server))
+
+# Subset Objects
+# DEBUG: Check if barcodes match
+cat("--- Barcode Debugging ---\n")
+cat("First 5 barcodes in object:\n")
+print(head(Cells(visium_seg)))
+cat("First 5 barcodes in Gut 1 selection (Raw):\n")
+print(head(subset_res$gut_1))
+
+# Helper to fix common selection issues
+clean_barcodes <- function(selection, all_cells) {
+  if (is.null(selection)) return(NULL)
+  
+  # 1. Clean whitespace
+  selection <- trimws(selection)
+  
+  # 2. Try to Format (if they look like simple numbers)
+  # The debug showed "1307", but object has "cellid_000001307-1".
+  # We attempt to convert raw ID to formatted ID.
+  normalized_selection <- tryCatch({
+    sprintf("cellid_%09d-1", as.numeric(selection))
+  }, warning = function(w) {
+    return(selection) # If not numeric, keep original
+  }, error = function(e) {
+    return(selection)
+  })
+  
+  # 3. Check intersection with BOTH raw and formatted
+  # This allows it to work whether the selection is already correct or needs formatting
+  valid_cells_raw <- intersect(selection, all_cells)
+  valid_cells_fmt <- intersect(normalized_selection, all_cells)
+  
+  if (length(valid_cells_fmt) > length(valid_cells_raw)) {
+    cat(paste("Formatting applied. Selected:", length(selection), "-> Valid:", length(valid_cells_fmt), "\n"))
+    return(valid_cells_fmt)
+  } else {
+    cat(paste("Raw used. Selected:", length(selection), "-> Valid:", length(valid_cells_raw), "\n"))
+    return(valid_cells_raw)
+  }
+}
+
+cells_1 <- clean_barcodes(subset_res$gut_1, Cells(visium_seg))
+cells_2 <- clean_barcodes(subset_res$gut_2, Cells(visium_seg))
+
+if (length(cells_1) > 0) spe_gut_1 <- subset(visium_seg, cells = cells_1)
+if (length(cells_2) > 0) spe_gut_2 <- subset(visium_seg, cells = cells_2)
+
+print("Subsets created successfully (if valid cells were found).")
+```
+
+## 3. Analysis Function (PCA + Spatial Pseudotime)
+
+We define a function to process each gut individually.
+
+```{r analysis_function}
+process_gut_3d <- function(seurat_obj, gut_label) {
+  message(paste("Processing", gut_label, "..."))
+  
+  # --- A. Preprocessing & PCA (Seurat) ---
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+  
+  # Prevent SVD error by dynamically setting npcs
+  max_dims <- min(30, ncol(seurat_obj) - 1)
+  seurat_obj <- RunPCA(seurat_obj, npcs = max_dims, verbose = FALSE)
+  
+  # --- B. Spatial Trajectory (Monocle3) ---
+  # 1. Convert to CDS
+  # (Simplified conversion wrapper)
+  expr_matrix <- GetAssayData(seurat_obj, layer = "counts")
+  cell_meta <- seurat_obj@meta.data
+  gene_meta <- data.frame(gene_short_name = rownames(expr_matrix), row.names = rownames(expr_matrix))
+  
+  cds <- new_cell_data_set(expr_matrix, cell_metadata = cell_meta, gene_metadata = gene_meta)
+  
+  # 2. Inject Spatial Coordinates into 'UMAP' slot to force spatial trajectory
+  # Use the robust centroids if available
+  if (all(c("x_centroid", "y_centroid") %in% colnames(seurat_obj@meta.data))) {
+    coords <- seurat_obj@meta.data[, c("x_centroid", "y_centroid")]
+  } else {
+    coords <- GetTissueCoordinates(seurat_obj)[, c(1,2)]
+  }
+  colnames(coords) <- c("x", "y")
+  reducedDims(cds)$UMAP <- as.matrix(coords)
+  
+  # 3. Learn Graph
+  cds <- cluster_cells(cds, reduction_method = "UMAP") 
+  cds@clusters$UMAP$partitions[] <- factor("1")   # Merge partitions to bridge gap
+  cds <- learn_graph(cds, use_partition = FALSE)
+  
+  # 4. Order Cells (Root = Leftmost / Min X)
+  root_cells <- rownames(coords)[which.min(coords[, 1])]
+  cds <- order_cells(cds, root_cells = root_cells)
+  
+  # 5. Extract Pseudotime & COLLAPSE FRACTURES
+  # Using rank() instead of distance ensures that 'jumps' across empty gaps 
+  # are ignored, focusing only on the sequence of existing cells.
+  pt <- pseudotime(cds)
+  pt_ranked <- rank(pt, ties.method = "min", na.last = "keep")
+  pt_scaled <- (pt_ranked - min(pt_ranked, na.rm=T)) / (max(pt_ranked, na.rm=T) - min(pt_ranked, na.rm=T)) * 100
+  
+  # --- C. Assemble Data for 3D Plot ---
+  embeddings <- Embeddings(seurat_obj, "pca")[, 1:2]
+  
+  bg_data <- data.frame(
+    Barcode = rownames(embeddings),
+    PC1 = embeddings[, 1],
+    PC2 = embeddings[, 2],
+    Pseudotime = pt_scaled,
+    Gut = gut_label
+  )
+  
+  return(bg_data)
+}
+```
+
+
+
+## 5. Run Analysis Loop
+
+```{r run_loop}
+df_gut_1 <- process_gut_3d(spe_gut_1, "Gut 1")
+df_gut_2 <- process_gut_3d(spe_gut_2, "Gut 2")
+
+# Combine (Optional, but we plot separate 3D plots usually)
+# all_guts3d <- rbind(df_gut_1, df_gut_2)
+```
+
+## 6. Technical QC Filtering
+We apply standardized thresholds (Mito < 20%, Ribo < 30%, UMI > 200) to remove low-quality cells AFTER trajectory calculation to prevent graph fracturing.
+
+```{r post_trajectory_filtering}
+# Function to filter both the object and the plotting dataframe
+filter_qc_post_trajectory <- function(seurat_obj, plotting_df, name) {
+  if (is.null(seurat_obj) || is.null(plotting_df)) return(NULL)
+  
+  message(paste("\n--- Final QC Filtering:", name, "---"))
+  
+  # 1. Ensure QC metrics exist in object
+  if (!"percent.mt" %in% colnames(seurat_obj@meta.data)) {
+    seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt:")
+  }
+  if (!"percent.ribo" %in% colnames(seurat_obj@meta.data)) {
+    seurat_obj[["percent.ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = "^Rp[LS]")
+  }
+  
+  # 2. Identify passing cells
+  count_var <- if("nCount_Segmented" %in% colnames(seurat_obj@meta.data)) "nCount_Segmented" else "nCount_Spatial"
+  
+  passing_cells <- rownames(seurat_obj@meta.data)[
+    seurat_obj@meta.data$percent.mt < 20 & 
+    seurat_obj@meta.data$percent.ribo < 30 & 
+    seurat_obj@meta.data[[count_var]] > 1
+  ]
+  
+  n_removed <- ncol(seurat_obj) - length(passing_cells)
+  message(paste("Removed", n_removed, "low-quality cells."))
+  
+  # 3. Filter Object
+  seurat_obj_filtered <- subset(seurat_obj, cells = passing_cells)
+  
+  # 4. Filter Plotting DF
+  # (plotting_df uses 'Barcode' column for mapping)
+  plotting_df_filtered <- plotting_df[plotting_df$Barcode %in% passing_cells, ]
+  
+  return(list(obj = seurat_obj_filtered, df = plotting_df_filtered))
+}
+
+# Run for all selected guts
+if (exists("spe_gut_1") && exists("df_gut_1")) {
+  res1 <- filter_qc_post_trajectory(spe_gut_1, df_gut_1, "Gut 1")
+  spe_gut_1 <- res1$obj; df_gut_1 <- res1$df
+}
+if (exists("spe_gut_2") && exists("df_gut_2")) {
+  res2 <- filter_qc_post_trajectory(spe_gut_2, df_gut_2, "Gut 2")
+  spe_gut_2 <- res2$obj; df_gut_2 <- res2$df
+}
+```
+
+## 7. Generate 3D Plots
+
+### Gut 1 3D Map
+X: PC1, Y: PC2, Z: Pseudotime (Spatial)
+Color: Pseudotime
+
+```{r plot_gut1}
+plot_ly(df_gut_1, x = ~PC1, y = ~PC2, z = ~Pseudotime, 
+        type = 'scatter3d', mode = 'markers',
+        marker = list(
+          size = 3, 
+          color = ~Pseudotime, 
+          colorscale = 'Magma', 
+          reversescale = TRUE,
+          colorbar = list(title = "Pseudotime")
+        )) %>%
+  layout(title = "Gut 1: 3D UMAP (PC1/PC2/Spatial)", 
+         scene = list(
+           xaxis = list(title = 'PC 1'),
+           yaxis = list(title = 'PC 2'),
+           zaxis = list(title = 'Spatial Pseudotime')
+         ))
+```
+
+### Gut 2 3D Map
+
+```{r plot_gut2}
+plot_ly(df_gut_2, x = ~PC1, y = ~PC2, z = ~Pseudotime, 
+        type = 'scatter3d', mode = 'markers',
+        marker = list(
+          size = 3, 
+          color = ~Pseudotime, 
+          colorscale = 'Magma', 
+          reversescale = TRUE,
+          colorbar = list(title = "Pseudotime")
+        )) %>%
+  layout(title = "Gut 2: 3D UMAP (PC1/PC2/Spatial)", 
+         scene = list(
+           xaxis = list(title = 'PC 1'),
+           yaxis = list(title = 'PC 2'),
+           zaxis = list(title = 'Spatial Pseudotime')
+         ))
+```
+
+## 8. Label Transfer (All Guts)
+We predict cell types using the single-cell reference. We define a helper function to avoid code duplication.
+
+```{r label_transfer_all}
+# 1. Load Reference Once
+ref_path <- "/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds"
+
+if (file.exists(ref_path)) {
+  message("Loading Reference Dataset...")
+  sc_ref <- readRDS(ref_path)
+  
+  # Ensure Reference uses SCT
+  # Use names() check to be safe
+  existing_assays <- tryCatch(names(sc_ref@assays), error = function(e) Seurat::Assays(sc_ref))
+  if (!"SCT" %in% existing_assays) {
+    message("SCTransforming Reference...")
+    sc_ref <- SCTransform(sc_ref, verbose = FALSE)
+  }
+} else {
+  stop(paste("Reference file not found at:", ref_path))
+}
+
+# 2. Define Transfer Function
+transfer_labels <- function(query_obj, plotting_df, reference_obj) {
+  
+  # A. Prepare Query
+  # Explicitly use Segmented assay and run PCA
+  message("SCTransforming & PCA on Query...")
+  query_obj <- SCTransform(query_obj, assay = "Segmented", verbose = FALSE)
+  
+  # Prevent SVD error by dynamically setting npcs
+  max_dims_query <- min(50, ncol(query_obj) - 1)
+  query_obj <- RunPCA(query_obj, npcs = max_dims_query, verbose = FALSE)
+  
+  # B. Find Anchors
+  message("Finding Anchors...")
+  anchors <- FindTransferAnchors(
+    reference = reference_obj,
+    query = query_obj,
+    normalization.method = "SCT",
+    reference.assay = "SCT",
+    query.assay = "SCT",
+    dims = 1:20
+  )
+  
+  # C. Transfer Labels
+  message("Transferring Labels...")
+  predictions <- TransferData(
+    anchorset = anchors,
+    refdata = reference_obj@meta.data[["celltype"]],
+    prediction.assay = TRUE,
+    weight.reduction = query_obj[["pca"]],
+    dims = 1:20
+  )
+  
+  # D. Extract Winner with Confidence Filtering
+  predicted_labels <- predictions@data
+  if("max" %in% rownames(predicted_labels)) {
+      predicted_labels <- predicted_labels[rownames(predicted_labels) != "max", ]
+  }
+  
+  # Calculate confidence scores (max prediction score per cell)
+  max_scores <- apply(predicted_labels, 2, max)
+  max_idx <- apply(predicted_labels, 2, which.max)
+  predicted_types <- rownames(predicted_labels)[max_idx]
+  
+  # Filter low-confidence predictions
+  confidence_threshold <- 0.05
+  low_confidence <- max_scores < confidence_threshold
+  predicted_types[low_confidence] <- "Ambiguous"
+  
+  message(paste("  Filtered", sum(low_confidence), "low-confidence predictions (<", confidence_threshold, ")"))
+  
+  # E. Match to Plotting DataFrame
+  target_barcodes <- as.character(plotting_df$Barcode)
+  source_barcodes <- colnames(predicted_labels)
+  
+  # Handle potential NULL colnames
+  if (is.null(source_barcodes)) source_barcodes <- names(predicted_labels)
+  
+  # Assign
+  plotting_df$Predicted_Type <- predicted_types[match(target_barcodes, source_barcodes)]
+  
+  return(plotting_df)
+}
+
+# 3. Apply to All Guts
+message("--- Processing Gut 1 ---")
+df_gut_1 <- transfer_labels(spe_gut_1, df_gut_1, sc_ref)
+
+message("--- Processing Gut 2 ---")
+df_gut_2 <- transfer_labels(spe_gut_2, df_gut_2, sc_ref)
+
+message("All Label Transfers Complete.")
+```
+
+### Gut 1 3D Map (Cell Type)
+
+```{r plot_gut1_celltype}
+plot_ly(df_gut_1, x = ~PC1, y = ~PC2, z = ~Pseudotime, 
+      type = 'scatter3d', mode = 'markers',
+      color = ~Predicted_Type, colors = "Set3", marker = list(size = 3)
+    ) %>%
+layout(title = "Gut 1: 3D UMAP (Cell Type)", 
+       scene = list(xaxis = list(title = 'PC 1'), yaxis = list(title = 'PC 2'), zaxis = list(title = 'Pseudotime')))
+```
+
+### Gut 2 3D Map (Cell Type)
+
+```{r plot_gut2_celltype}
+plot_ly(df_gut_2, x = ~PC1, y = ~PC2, z = ~Pseudotime, 
+      type = 'scatter3d', mode = 'markers',
+      color = ~Predicted_Type, colors = "Set3", marker = list(size = 3)
+    ) %>%
+layout(title = "Gut 2: 3D UMAP (Cell Type)", 
+       scene = list(xaxis = list(title = 'PC 1'), yaxis = list(title = 'PC 2'), zaxis = list(title = 'Pseudotime')))
+```
+
+## 9. Spatial Differential Expression Analysis
+We merge the three gut sections and compare "Anterior" vs "Posterior" expression profiles within each cell type.
+
+```{r spatial_de_analysis}
+message("Starting Spatial DE Analysis...")
+
+# --- Helper Function for DE ---
+run_spatial_de <- function(seurat_obj, analysis_df, name) {
+  
+  message(paste0("\n=== Processing ", name, " ==="))
+  
+  # 1. Clean Object (Remove Images to prevent subset errors)
+  # Iterate over image names to safely remove them
+  for (img in Images(seurat_obj)) {
+    seurat_obj[[img]] <- NULL
+  }
+  
+  # 2. Join Layers if needed (Seurat v5)
+  if (inherits(seurat_obj, "Seurat")) {
+    seurat_obj <- JoinLayers(seurat_obj)
+  }
+  
+  # 3. Map Metadata from Analysis DataFrame
+  # Ensure we can match them (Barcodes should match)
+  # Check alignment
+  common_cells <- intersect(Cells(seurat_obj), analysis_df$Barcode)
+  
+  if (length(common_cells) < 10) {
+    warning(paste("Very few matching cells for", name, "- Check Barcodes!"))
+    return(NULL)
+  }
+  
+  # Subset both to common cells to be safe
+  seurat_obj <- subset(seurat_obj, cells = common_cells)
+  analysis_df <- analysis_df[analysis_df$Barcode %in% common_cells, ]
+  
+  # Re-order df to match object
+  analysis_df <- analysis_df[match(Cells(seurat_obj), analysis_df$Barcode), ]
+  
+  # Assign Metadata
+  seurat_obj$Spatial_Pseudotime <- analysis_df$Pseudotime
+  seurat_obj$Predicted_CellType <- analysis_df$Predicted_Type
+  
+  # 4. Define Spatial Regions (Threshold: 55)
+  seurat_obj$Spatial_Region <- ifelse(seurat_obj$Spatial_Pseudotime < 55, "Anterior", "Posterior")
+  
+  # 5. DE Loop
+  Idents(seurat_obj) <- seurat_obj$Predicted_CellType
+  unique_types <- unique(na.omit(seurat_obj$Predicted_CellType))
+  
+  results_list <- list()
+  
+  for (ctype in unique_types) {
+    # Subset to Cell Type
+    sub_obj <- subset(seurat_obj, idents = ctype)
+    
+    # Count cells in Anterior/Posterior
+    counts <- table(sub_obj$Spatial_Region)
+    
+    if (!is.na(counts["Anterior"]) && !is.na(counts["Posterior"]) && 
+        counts["Anterior"] > 3 && counts["Posterior"] > 3) {
+      
+      message(paste("  Running DE for:", ctype, "(Ant:", counts["Anterior"], "Post:", counts["Posterior"], ")"))
+      
+      tryCatch({
+        markers <- FindMarkers(
+          sub_obj,
+          ident.1 = "Anterior",
+          ident.2 = "Posterior",
+          group.by = "Spatial_Region",
+          min.pct = 0.1,
+          logfc.threshold = 0.25,
+          verbose = FALSE
+        )
+        
+        if (nrow(markers) > 0) {
+          markers$CellType <- ctype
+          markers$Gene <- rownames(markers)
+          markers$Gut_Origin <- name
+          results_list[[ctype]] <- markers
+        }
+        
+      }, error = function(e) {
+        message(paste("    Error:", e$message))
+      })
+    }
+  }
+  
+  # 6. Save & Return
+  if (length(results_list) > 0) {
+    all_res <- do.call(rbind, results_list)
+    
+    # Calculate Specificity
+    sig_res <- all_res[all_res$p_val_adj < 0.05, ]
+    if (nrow(sig_res) > 0) {
+      gene_counts <- table(sig_res$Gene)
+      all_res$CellType_Count <- as.numeric(gene_counts[all_res$Gene])
+      all_res$CellType_Count[is.na(all_res$CellType_Count)] <- 0
+      all_res$Specificity <- ifelse(all_res$CellType_Count == 1, "Unique (1 CellType)", 
+                                    paste0("Shared (", all_res$CellType_Count, " CellTypes)"))
+    } else {
+        all_res$Specificity <- "Not Significant"
+    }
+
+    write.csv(all_res, paste0("../Excels/Spatial_DE_", name, ".csv"))
+    message(paste("  Saved results (with specificity) to ../Excels/Spatial_DE_", name, ".csv", sep=""))
+    
+    # NEW: Save merged guts for sc_spatial_dec analysis
+    if (name == "Merged_Guts") {
+      saveRDS(seurat_obj, "../Random data/merged_guts_spatial.rds")
+      message("Saved merged guts to ../Random data/merged_guts_spatial.rds")
+    }
+    
+    return(list(results = all_res, object = seurat_obj))
+  } else {
+    message("  No significant DE genes found.")
+    return(NULL)
+  }
+}
+
+# --- A. Run for Individual Guts ---
+# Ensure metadata columns exist in individual dataframes as expected
+res_gut1 <- run_spatial_de(spe_gut_1, df_gut_1, "Gut1")
+res_gut2 <- run_spatial_de(spe_gut_2, df_gut_2, "Gut2")
+
+# --- SAVE GUT 1 OBJECT FOR DEDICATED ANALYSIS ---
+if (!is.null(res_gut1)) {
+  saveRDS(res_gut1$object, file = "../Random data/gut1_processed_for_analysis.rds")
+  message("Saved processed Gut 1 object to ../Random data/gut1_processed_for_analysis.rds")
+}
+
+# --- B. Run for Merged Dataset ---
+message("\n=== Preparing Merged Dataset ===")
+# Merge Objects
+merged_guts <- merge(spe_gut_1, y = spe_gut_2, add.cell.ids = c("Gut1", "Gut2"))
+
+# Prepare Merged Metadata DataFrame
+# (Need to adjust barcodes in DF to match the merged object's "Origin_Barcode" format)
+df_1_mod <- df_gut_1
+df_1_mod$Unique_Barcode <- paste0("Gut1_", df_1_mod$Barcode)
+
+df_2_mod <- df_gut_2
+df_2_mod$Unique_Barcode <- paste0("Gut2_", df_2_mod$Barcode)
+
+all_metadata <- rbind(df_1_mod, df_2_mod)
+# IMPORTANT: For the merged run, we must use the Unique_Barcode as the 'Barcode' column
+# because that's what matches Cells(merged_guts)
+all_metadata_merged <- all_metadata
+all_metadata_merged$Barcode <- all_metadata_merged$Unique_Barcode
+
+# Run DE on Merged
+# Capturing the returned list which contains both results and the processed object
+out_merged <- run_spatial_de(merged_guts, all_metadata_merged, "Merged_Guts")
+
+if (!is.null(out_merged)) {
+    res_merged <- out_merged$results
+    # UPDATE merged_guts with the version that has metadata added inside the function!
+    merged_guts <- out_merged$object 
+} else {
+    res_merged <- NULL
+}
+```
+
+## 10. Targeted Analysis: Unique Spatial Genes
+We identify genes that exhibit spatial gradients (Anterior vs Posterior) in **exactly one cell type**. We focus specifically on **EB (Enteroblasts)**.
+
+```{r analyze_unique_genes}
+message("--- Analyzing Specificity ---")
+
+if (exists("res_merged") && !is.null(res_merged)) {
+  
+  # 1. Filter for Unique Genes
+  unique_genes <- res_merged[res_merged$Specificity == "Unique (1 CellType)", ]
+  
+  message(paste("Total Spatially Resovled Genes:", nrow(res_merged)))
+  message(paste("Unique to a single CellType:", nrow(unique_genes)))
+  
+  # 2. Extract EB Specific Genes
+  eb_unique <- unique_genes[unique_genes$CellType == "EB", ]
+  
+  message(paste("\n--- EB Specific Spatial Genes (", nrow(eb_unique), ") ---", sep=""))
+  
+  if (nrow(eb_unique) > 0) {
+    # Sort by significance
+    eb_unique <- eb_unique[order(eb_unique$p_val_adj), ]
+    
+    # Display clearly
+    print(head(eb_unique[, c("Gene", "avg_log2FC", "p_val_adj")])) 
+    # Actually, FindMarkers output direction (positive/negative) depends on ident.1 vs ident.2. 
+    # Positive logFC = Higher in Anterior (ident.1), Negative = Higher in Posterior (ident.2)
+    
+    eb_unique$Direction <- ifelse(eb_unique$avg_log2FC > 0, "Upregulated in Anterior", "Upregulated in Posterior")
+    
+    print(head(eb_unique[, c("Gene", "Direction", "p_val_adj")], 20))
+    
+    # Save specifically for Research Agent
+    write.csv(eb_unique, "../Excels/EB_Unique_Spatial_Genes.csv")
+    message("Saved EB unique list to ../Excels/EB_Unique_Spatial_Genes.csv")
+    
+  } else {
+    message("No unique spatial genes found for EB.")
+  }
+  
+} else {
+  warning("res_merged not found. Please run the Spatial DE Analysis chunk first.")
+}
+```
+
+## 9. Visualizing Gene Expression (Delta)
+We plot the expression of **Delta (dl)** on the 3D UMAP to visualize its spatial distribution.
+
+```{r plot_delta_3d}
+target_gene <- "alphaTry" # Delta
+
+# Helper to plot gene expression
+plot_gene_3d <- function(seurat_obj, plotting_df, gene, gut_name) {
+  
+  # Check if gene exists
+  if (!gene %in% rownames(seurat_obj)) {
+    message(paste("Gene", gene, "not found in", gut_name))
+    return(NULL)
+  }
+  
+  # Fetch data (robust method)
+  expr_df <- FetchData(seurat_obj, vars = gene)
+  colnames(expr_df) <- "Value"
+  
+  # Match cells
+  common_cells <- intersect(rownames(expr_df), plotting_df$Barcode)
+  
+  if (length(common_cells) == 0) {
+    warning(paste("No matching cells for", gut_name))
+    return(NULL)
+  }
+  
+  # Subset and align
+  sub_df <- plotting_df[plotting_df$Barcode %in% common_cells, ]
+  sub_expr <- expr_df[sub_df$Barcode, , drop = FALSE]
+  
+  sub_df$Expression <- sub_expr$Value
+  
+  # Plot
+  p <- plot_ly(sub_df, x = ~PC1, y = ~PC2, z = ~Pseudotime, 
+        type = 'scatter3d', mode = 'markers',
+        marker = list(
+          size = 3, 
+          color = ~Expression, 
+          colorscale = 'Viridis', 
+          showscale = TRUE,
+          colorbar = list(title = paste(gene, "Expr"))
+        )
+      ) %>%
+  layout(title = paste(gut_name, ": 3D Expression of", gene), 
+         scene = list(
+           xaxis = list(title = 'PC 1'),
+           yaxis = list(title = 'PC 2'),
+           zaxis = list(title = 'Spatial Position')
+         ))
+         
+  return(p)
+}
+
+# Plot for each gut
+message("Plotting Delta (dl) for Gut 1...")
+if(!is.null(p1 <- plot_gene_3d(spe_gut_1, df_gut_1, target_gene, "Gut 1"))) print(p1)
+
+message("Plotting Delta (dl) for Gut 2...")
+if(!is.null(p2 <- plot_gene_3d(spe_gut_2, df_gut_2, target_gene, "Gut 2"))) print(p2)
+```
+
+## 10. Collapsed Enterocyte Analysis
+We group all Enterocyte subtypes (aEC, mEC, pEC, dEC) into a single "**Enterocyte**" label and re-run the Spatial DE Analysis. This increases statistical power for the general Enterocyte population and refines the specificity of gene markers for other cell types like EB.
+
+```{r spatial_de_collapsed}
+message("--- Starting Collapsed Enterocyte Analysis ---")
+
+# 1. Prepare Collapsed Metadata
+# We work with the consolidated 'all_metadata' from the merged analysis
+all_metadata_collapsed <- all_metadata
+
+# Define patterns to collapse
+# We target standard Enterocyte abbreviations found in this dataset
+# Define patterns to collapse
+# We target standard Enterocyte abbreviations found in this dataset
+ec_types <- c("aEC", "mEC", "pEC", "dEC", "daEC", "LFC", "Copper", "Iron")
+# Alternatively, we can use pattern matching for any type ending in "EC"
+# But we'll be explicit to avoid accidents (like 'dEC' vs 'dIEC' etc if distinct)
+
+current_types <- as.character(all_metadata_collapsed$Predicted_Type)
+
+# Collapse logic: replace if in list
+current_types[current_types %in% ec_types] <- "Enterocyte"
+
+# Also catch generic cases if label contains "Enterocyte"
+current_types[grepl("Enterocyte", current_types, ignore.case = TRUE)] <- "Enterocyte"
+
+# COLLAPSE 2: ISC and EB -> Progenitor
+progenitors <- c("ISC", "EB")
+current_types[current_types %in% progenitors] <- "Progenitor"
+
+all_metadata_collapsed$Predicted_Type <- current_types
+
+message("Cell Types after collapsing:")
+print(table(all_metadata_collapsed$Predicted_Type))
+
+# 2. Run Spatial DE (Collapsed)
+# We reuse our robust helper function
+res_merged_collapsed <- run_spatial_de(merged_guts, all_metadata_collapsed, "Merged_Guts_Collapsed_EC_Progenitor")
+
+# 3. Analyze Specificity for Progenitor (Collapsed Context)
+message("\n--- Analyzing Specificity (Collapsed Context) ---")
+
+if (!is.null(res_merged_collapsed)) {
+  
+  # Filter for Unique Genes (Specificity column is auto-calculated by run_spatial_de)
+  unique_genes_col <- res_merged_collapsed[res_merged_collapsed$Specificity == "Unique (1 CellType)", ]
+  
+  message(paste("Total Spatially Resolved Genes:", nrow(res_merged_collapsed)))
+  message(paste("Unique to a single CellType:", nrow(unique_genes_col)))
+  
+  # Extract Progenitor Specific
+  prog_unique_col <- unique_genes_col[unique_genes_col$CellType == "Progenitor", ]
+  
+  message(paste("Progenitor Specific Genes (Collapsed Context):", nrow(prog_unique_col)))
+  
+  if (nrow(prog_unique_col) > 0) {
+    prog_unique_col <- prog_unique_col[order(prog_unique_col$p_val_adj), ]
+    prog_unique_col$Direction <- ifelse(prog_unique_col$avg_log2FC > 0, "Upregulated in Anterior", "Upregulated in Posterior")
+    
+    print(head(prog_unique_col[, c("Gene", "Direction", "p_val_adj")], 20))
+    
+    write.csv(prog_unique_col, "../Excels/Progenitor_Unique_Spatial_Genes_Collapsed.csv")
+    message("Saved Progenitor unique list to ../Excels/Progenitor_Unique_Spatial_Genes_Collapsed.csv")
+    
+  } else {
+    message("No unique Progenitor genes found in this context.")
+  }
+}
+```
+
+## 11. Pseudotime Heatmap Analysis
+We visualize gene expression changes along the spatial pseudotime trajectory of the gut.
+1. **Global Heatmap**: Shows gene expression trends across the entire gut length, ignoring cell types.
+2. **Progenitor Heatmap**: Specific to the pooled ISC/EB population.
+3. **Enterocyte Heatmap**: Specific to the pooled Enterocyte population.
+
+```{r pseudotime_heatmap}
+message("--- Starting Pseudotime Heatmap Analysis (Binned) ---")
+
+# Helper function to generate BINNED heatmap
+# This aggregates cells into pseudotime bins (size 1) and plots the AVERAGE expression
+plot_binned_heatmap <- function(seurat_object, subset_name, n_features = 50, bin_size = 1) {
+  
+  message(paste("Generating binned heatmap for:", subset_name))
+  
+  # 1. Create Bins
+  # Floor the pseudotime to get integer bins (0-1 becomes 0, 1-2 becomes 1, etc.)
+  seurat_object$Pseudotime_Bin <- floor(seurat_object$Spatial_Pseudotime / bin_size)
+  
+  # Ensure bins are factors and ordered
+  bins <- sort(unique(seurat_object$Pseudotime_Bin))
+  seurat_object$Pseudotime_Bin <- factor(seurat_object$Pseudotime_Bin, levels = bins)
+  
+  # 2. Find Variable Features (on single cells) to pick what to plot
+  seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = n_features, verbose = FALSE)
+  top_genes <- VariableFeatures(seurat_object)
+  
+  # 3. Aggregate Data (Average Expression per Bin)
+  # AverageExpression returns a list (for each assay). We take the default/SCT.
+  # We group by the bins.
+  Idents(seurat_object) <- seurat_object$Pseudotime_Bin
+  
+  # avg_exp is a matrix: Genes x Bins
+  avg_exp <- AverageExpression(seurat_object, features = top_genes, return.seurat = FALSE, verbose = FALSE)
+  # Extract matrix (usually first slot 'RNA' or 'SCT')
+  mat <- avg_exp[[1]] 
+  
+  # 4. Scale the Averaged Data (Row-scaling/Z-score)
+  # We do this manually since we are plotting a raw matrix now, not a Seurat object
+  mat_scaled <- t(scale(t(mat)))
+  
+  # 5. Plot using pheatmap or heatmap()
+  # We order genes by peak expression bin for visual flow
+  peak_bin <- apply(mat_scaled, 1, which.max)
+  mat_sorted <- mat_scaled[order(peak_bin), , drop = FALSE]
+  
+  pheatmap::pheatmap(mat_sorted, 
+                     cluster_rows = FALSE, 
+                     cluster_cols = FALSE,
+                     show_rownames = TRUE, 
+                     show_colnames = TRUE,
+                     main = paste(subset_name, "- Binned Expression"),
+                     fontsize_row = 8)
+}
+
+# --- 1. Global Heatmap (All Cells Aggregated by Bin) ---
+# This merges all cell types together into the bins
+plot_binned_heatmap(merged_guts, "Global Gut Trajectory (All Types Merged)")
+
+# --- 2. Progenitor Heatmap ---
+# Subset to Progenitors first
+# Re-map the collapsed types if needed (safety check from previous chunk)
+match_idx <- match(Cells(merged_guts), all_metadata_collapsed$Unique_Barcode)
+if(!any(is.na(match_idx))) { 
+    merged_guts$Collapsed_Type <- all_metadata_collapsed$Predicted_Type[match_idx]
+}
+
+prog_obj <- subset(merged_guts, subset = Collapsed_Type == "Progenitor")
+plot_binned_heatmap(prog_obj, "Progenitors (ISC+EB)")
+
+# --- 3. Enterocyte Heatmap ---
+ec_obj <- subset(merged_guts, subset = Collapsed_Type == "Enterocyte")
+plot_binned_heatmap(ec_obj, "Enterocytes (Collapsed)")
+
+message("Binned Heatmaps Complete.")
+```
+
+## 12. Cell Type Specificity & Heatmap Gene Analysis
+We identify highly specific markers for each cell type and then check if the spatially variable genes (from the heatmap) are cell-type specific.
+
+```{r specificity_analysis}
+message("--- Starting Cell Type Specificity Analysis ---")
+
+# 1. Identify Markers for Each Cell Type (Original Labels)
+Idents(merged_guts) <- merged_guts$Predicted_CellType
+markers_original <- FindAllMarkers(merged_guts, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5, verbose = FALSE)
+write.csv(markers_original, "../Excels/Markers_All_Original_Types.csv")
+
+# 2. Identify Markers for Collapsed Labels (Progenitor vs Enterocyte vs Others)
+Idents(merged_guts) <- merged_guts$Collapsed_Type
+markers_collapsed <- FindAllMarkers(merged_guts, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5, verbose = FALSE)
+write.csv(markers_collapsed, "../Excels/Markers_Collapsed_Types.csv")
+
+message("Saved marker lists to ../Excels/")
+
+# 3. Analyze Function: Cross-reference Heatmap Genes with Specificity
+analyze_heatmap_genes <- function(seurat_object, subset_name, markers_df, bin_size=1) {
+  
+  message(paste("Analyzing heatmap genes for:", subset_name))
+  
+  # A. Re-identify the Top 50 Variable features used in the heatmap (same logic)
+  seurat_object$Pseudotime_Bin <- floor(seurat_object$Spatial_Pseudotime / bin_size)
+  bins <- sort(unique(seurat_object$Pseudotime_Bin))
+  seurat_object$Pseudotime_Bin <- factor(seurat_object$Pseudotime_Bin, levels = bins)
+  
+  seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 50, verbose = FALSE)
+  heatmap_genes <- VariableFeatures(seurat_object)
+  
+  # B. Calculate Peak Expression Bin
+  Idents(seurat_object) <- seurat_object$Pseudotime_Bin
+  avg_exp <- AverageExpression(seurat_object, features = heatmap_genes, return.seurat = FALSE, verbose = FALSE)[[1]]
+  peak_bins <- bins[apply(avg_exp, 1, which.max)]
+  
+  # C. Check Specificity
+  # A gene is "Specific" if it appears in the marker list for ANY cell type
+  # We find which cell type it is a marker for (lowest p_val if multiple)
+  
+  results_df <- data.frame(Gene = heatmap_genes, Peak_Bin = peak_bins, Specificity = "Non-Specific", stringsAsFactors = FALSE)
+  
+  for (i in 1:nrow(results_df)) {
+    g <- results_df$Gene[i]
+    if (g %in% markers_df$gene) {
+      # Find which cluster it marks
+      g_markers <- markers_df[markers_df$gene == g, ]
+      best_match <- g_markers[which.max(g_markers$avg_log2FC), "cluster"] # Pick strongest logFC
+      results_df$Specificity[i] <- as.character(best_match)
+    }
+  }
+  
+  # Sort by Peak Bin
+  results_df$Peak_Bin <- as.numeric(as.character(results_df$Peak_Bin))
+  results_df <- results_df[order(results_df$Peak_Bin), ]
+  
+  return(results_df)
+}
+
+# --- Run Analysis ---
+
+# A. Global Heatmap Genes -> Check against Original Cell Types
+global_analysis <- analyze_heatmap_genes(merged_guts, "Global", markers_original)
+print("Global Heatmap Genes (Top 10):")
+print(head(global_analysis, 10))
+write.csv(global_analysis, "../Excels/Global_Heatmap_Gene_Specificity.csv")
+
+# B. Progenitor Heatmap Genes -> Check against Collapsed Types (Is it specific to Progenitors?)
+# Re-subset
+prog_obj <- subset(merged_guts, subset = Collapsed_Type == "Progenitor")
+prog_analysis <- analyze_heatmap_genes(prog_obj, "Progenitors", markers_collapsed)
+print("Progenitor Heatmap Genes (Top 10):")
+print(head(prog_analysis, 10))
+write.csv(prog_analysis, "../Excels/Progenitor_Heatmap_Gene_Specificity.csv")
+
+# C. Enterocyte Heatmap Genes -> Check against Collapsed Types
+ec_obj <- subset(merged_guts, subset = Collapsed_Type == "Enterocyte")
+ec_analysis <- analyze_heatmap_genes(ec_obj, "Enterocytes", markers_collapsed)
+print("Enterocyte Heatmap Genes (Top 10):")
+print(head(ec_analysis, 10))
+write.csv(ec_analysis, "../Excels/Enterocyte_Heatmap_Gene_Specificity.csv")
+
+message("Specificity Analysis Complete.")
+
+# --- Save Final Object for Comparison Scripts ---
+out_dir <- "../Random data"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+saveRDS(merged_guts, file.path(out_dir, "merged_guts.rds"))
+message(paste("✓ Processed Seurat object saved to:", file.path(out_dir, "merged_guts.rds")))
+```
+
+## 13. WT Gut Selection & Processing (Same-Slide Comparison)
+We select the WT guts from the same tissue slide and process them through the identical pipeline, producing a `merged_guts_wt.rds` object for direct WT vs Mutant comparison.
+
+### WT Gut Selection (Shiny Lasso)
+
+```{r wt_shiny_app}
+message("--- Launching WT Gut Selection ---")
+
+# Reuse the same coordinate data from the segmented object
+ui_wt <- fluidPage(
+  titlePanel("WT Gut Subsetting Tool"),
+  sidebarLayout(
+    sidebarPanel(
+      h4("Instructions"),
+      p("1. Use the Lasso tool to select WT gut regions."),
+      p("2. Click 'Save WT Gut X' to store each selection."),
+      actionButton("save_wt_gut_1", "Save WT Gut 1"),
+      verbatimTextOutput("wt_status_1"),
+      hr(),
+      actionButton("save_wt_gut_2", "Save WT Gut 2"),
+      verbatimTextOutput("wt_status_2"),
+      hr(),
+      actionButton("wt_done_btn", "DONE (Close & Save)"),
+      class = "well"
+    ),
+    mainPanel(
+      plotlyOutput("wt_scatter_plot", height = "800px")
+    )
+  )
+)
+
+server_wt <- function(input, output, session) {
+  vals <- reactiveValues(gut_1 = NULL, gut_2 = NULL)
+  
+  output$wt_scatter_plot <- renderPlotly({
+    plot_ly(coords_seg, x = ~x, y = ~y, key = ~barcode, type = "scatter", mode = "markers",
+            marker = list(size = 3, color = 'gray', opacity = 0.5), source = "wt_source") %>%
+      layout(dragmode = "lasso", title = "Select WT Gut Regions", yaxis = list(autorange = "reversed"))
+  })
+  
+  observeEvent(input$save_wt_gut_1, {
+    event_data <- event_data("plotly_selected", source = "wt_source")
+    if (!is.null(event_data)) vals$gut_1 <- event_data$key
+  })
+  output$wt_status_1 <- renderText({
+    if(is.null(vals$gut_1)) "Not saved" else paste(length(vals$gut_1), "cells saved")
+  })
+  
+  observeEvent(input$save_wt_gut_2, {
+    event_data <- event_data("plotly_selected", source = "wt_source")
+    if (!is.null(event_data)) vals$gut_2 <- event_data$key
+  })
+  output$wt_status_2 <- renderText({
+    if(is.null(vals$gut_2)) "Not saved" else paste(length(vals$gut_2), "cells saved")
+  })
+  
+  observeEvent(input$wt_done_btn, {
+    stopApp(list(gut_1 = vals$gut_1, gut_2 = vals$gut_2))
+  })
+}
+
+wt_subset_res <- runApp(shinyApp(ui_wt, server_wt))
+
+# Subset Objects (reuse barcode cleaning from earlier)
+wt_cells_1 <- clean_barcodes(wt_subset_res$gut_1, Cells(visium_seg))
+wt_cells_2 <- clean_barcodes(wt_subset_res$gut_2, Cells(visium_seg))
+
+if (length(wt_cells_1) > 0) spe_wt_gut_1 <- subset(visium_seg, cells = wt_cells_1)
+if (length(wt_cells_2) > 0) spe_wt_gut_2 <- subset(visium_seg, cells = wt_cells_2)
+
+message(paste("WT Gut 1:", ncol(spe_wt_gut_1), "cells"))
+message(paste("WT Gut 2:", ncol(spe_wt_gut_2), "cells"))
+```
+
+### WT Trajectory Analysis
+
+```{r wt_trajectory}
+# Run the same PCA + Spatial Pseudotime pipeline
+df_wt_gut_1 <- process_gut_3d(spe_wt_gut_1, "WT Gut 1")
+df_wt_gut_2 <- process_gut_3d(spe_wt_gut_2, "WT Gut 2")
+
+message("WT trajectory analysis complete.")
+```
+
+### WT QC Filtering
+
+```{r wt_qc_filtering}
+if (exists("spe_wt_gut_1") && exists("df_wt_gut_1")) {
+  res_wt1 <- filter_qc_post_trajectory(spe_wt_gut_1, df_wt_gut_1, "WT Gut 1")
+  spe_wt_gut_1 <- res_wt1$obj; df_wt_gut_1 <- res_wt1$df
+}
+if (exists("spe_wt_gut_2") && exists("df_wt_gut_2")) {
+  res_wt2 <- filter_qc_post_trajectory(spe_wt_gut_2, df_wt_gut_2, "WT Gut 2")
+  spe_wt_gut_2 <- res_wt2$obj; df_wt_gut_2 <- res_wt2$df
+}
+```
+
+### WT Label Transfer
+
+```{r wt_label_transfer}
+message("--- WT Label Transfer ---")
+df_wt_gut_1 <- transfer_labels(spe_wt_gut_1, df_wt_gut_1, sc_ref)
+df_wt_gut_2 <- transfer_labels(spe_wt_gut_2, df_wt_gut_2, sc_ref)
+message("WT Label Transfer Complete.")
+```
+
+### WT Spatial DE & Merge
+
+```{r wt_spatial_de}
+message("--- WT Spatial DE Analysis ---")
+
+# Individual gut DE
+res_wt_gut1 <- run_spatial_de(spe_wt_gut_1, df_wt_gut_1, "WT_Gut1")
+res_wt_gut2 <- run_spatial_de(spe_wt_gut_2, df_wt_gut_2, "WT_Gut2")
+
+# Merge WT guts
+merged_guts_wt <- merge(spe_wt_gut_1, y = spe_wt_gut_2, add.cell.ids = c("WTGut1", "WTGut2"))
+
+# Prepare merged metadata
+df_wt_1_mod <- df_wt_gut_1
+df_wt_1_mod$Unique_Barcode <- paste0("WTGut1_", df_wt_1_mod$Barcode)
+
+df_wt_2_mod <- df_wt_gut_2
+df_wt_2_mod$Unique_Barcode <- paste0("WTGut2_", df_wt_2_mod$Barcode)
+
+all_metadata_wt <- rbind(df_wt_1_mod, df_wt_2_mod)
+all_metadata_wt_merged <- all_metadata_wt
+all_metadata_wt_merged$Barcode <- all_metadata_wt_merged$Unique_Barcode
+
+# Run DE on merged WT
+out_merged_wt <- run_spatial_de(merged_guts_wt, all_metadata_wt_merged, "Merged_WT_Guts")
+
+if (!is.null(out_merged_wt)) {
+    merged_guts_wt <- out_merged_wt$object
+}
+
+# --- Save WT Object ---
+saveRDS(merged_guts_wt, file.path(out_dir, "merged_guts_wt.rds"))
+message(paste("✓ WT Seurat object saved to:", file.path(out_dir, "merged_guts_wt.rds")))
+```

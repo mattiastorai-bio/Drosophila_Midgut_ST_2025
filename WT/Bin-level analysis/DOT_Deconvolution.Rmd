@@ -1,0 +1,823 @@
+---
+title: "DOT Deconvolution (Exact Match)"
+output: html_document
+date: "2026-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(SeuratDisk)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+library(spacexr)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+# SaezLab DOT package is loaded as DOTr
+library(DOTr) 
+library(org.Dm.eg.db) # from St111125
+library(AnnotationDbi) # from St111125
+library(Matrix.utils) # from Processing.Rmd logic
+```
+
+# 1. Prepare Spatial Data (Replicating `St111125.Rmd`)
+
+We replicate the exact steps from `St111125.Rmd` to generate the `seurat_obj` in its final state.
+
+```{r load_spatial}
+# Path to spatial data
+data_dir <- "/home/mattia/Thesis/111125ST_def/binned_data"
+
+print("Loading 10X Spatial data...")
+spe_object <- Load10X_Spatial(data_dir, slice = "HE_Stain_Slice")
+
+# 1. Set default assay
+DefaultAssay(spe_object) <- "Spatial.016um"
+
+# 2. Filter out zero count spots
+spe_object <- subset(spe_object, subset = nCount_Spatial.016um > 0)
+
+# 3. SCTransform
+print("Running SCTransform...")
+spe_object <- SCTransform(spe_object, assay = "Spatial.016um", verbose = FALSE)
+
+# 4. Run PCA
+print("Running PCA...")
+seurat_obj <- RunPCA(spe_object, assay = "SCT", features = VariableFeatures(spe_object))
+
+# 5. Run UMAP
+print("Running UMAP...")
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:30, reduction = "pca")
+
+# 6. Find Neighbors & Clusters
+print("Clustering...")
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:30)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.4)
+
+# 7. Add Mitochondrial Percentage
+print("Calculating Percentages...")
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt:")
+
+# 8. Add Mean Expression
+normalized_data <- GetAssayData(seurat_obj, assay = "SCT", layer = "data")
+mean_expression_per_pixel <- colMeans(normalized_data)
+seurat_obj$mean_expression <- mean_expression_per_pixel
+
+# 9. Add Ribosomal Percentage (Final step of St111125.Rmd)
+seurat_obj[["percent.ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = "^Rp[LS]")
+
+print("Spatial Object Prepared.")
+```
+
+# 2. Load Single Cell Reference
+
+```{r load_sc}
+sc_path <- "/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds"
+print("Loading Single-Cell Reference...")
+if (!file.exists(sc_path)) stop("SC file not found.")
+seurat_ref <- readRDS(sc_path)
+
+# Ensure celltype column
+if (!"celltype" %in% colnames(seurat_ref@meta.data)) {
+    print("Warning: 'celltype' column not found. Please check metadata.")
+    print(head(seurat_ref@meta.data))
+} else {
+    Idents(seurat_ref) <- "celltype"
+}
+```
+
+# 3. Exact Gene Matching (Replicating `Processing.Rmd`)
+
+We use the *exact* logic provided in `Processing.Rmd` to clean, intersect, aggregate, and match genes between Spatial and Single-Cell data.
+
+```{r gene_matching}
+print("Starting Exact Gene Matching...")
+
+# 1. Extract Raw Counts
+# Note: St111125 uses "Spatial.016um" (raw) or "SCT" (normalized). Processing.Rmd used "Spatial.016um" count slot equivalent.
+# We will use the 'counts' slot from the default assay of seurat_obj (which started as Spatial.016um)
+# BUT seurat_obj is now the SCT transformed object. The original counts are in "Spatial.016um".
+spatial_counts <- GetAssayData(seurat_obj, assay = "Spatial.016um", layer = "counts")
+sc_counts <- GetAssayData(seurat_ref, assay = "RNA", layer = "counts")
+
+## 1. Extract Gene Names
+spatial_genes_raw <- rownames(spatial_counts)
+sc_genes_raw <- rownames(sc_counts)
+
+## 2. Aggressive Cleaning and Harmonization
+# a. Remove anything after a period
+# b. Convert to uppercase
+spatial_genes_clean <- toupper(gsub("\\..*$", "", spatial_genes_raw))
+sc_genes_clean <- toupper(gsub("\\..*$", "", sc_genes_raw))
+
+# c. Assign back
+rownames(spatial_counts) <- spatial_genes_clean
+rownames(sc_counts) <- sc_genes_clean
+
+## 3. Determine Valid Intersection
+common_genes <- intersect(rownames(spatial_counts), rownames(sc_counts))
+
+## 4. Check for Duplicates (Crucial Safety Check)
+cat("Duplicates in Spatial:", sum(duplicated(rownames(spatial_counts))), "\n")
+cat("Duplicates in SC:", sum(duplicated(rownames(sc_counts))), "\n")
+
+## 5. Filter the Matrices
+spatial_counts_filtered <- spatial_counts[common_genes, ]
+sc_counts_filtered <- sc_counts[common_genes, ]
+
+## 6. Aggregate (dMeltAndSum logic)
+# Use Matrix.utils for robust aggregation
+print("Aggregating duplicates...")
+spatial_counts_agg <- Matrix.utils::aggregate.Matrix(
+    spatial_counts, 
+    group = rownames(spatial_counts), 
+    fun = "sum"
+)
+
+sc_counts_agg <- Matrix.utils::aggregate.Matrix(
+    sc_counts, 
+    group = rownames(sc_counts), 
+    fun = "sum"
+)
+
+## 7. Final Intersection & Filtering
+common_genes_final <- intersect(rownames(spatial_counts_agg), rownames(sc_counts_agg))
+
+spatial_counts_final <- spatial_counts_agg[common_genes_final, ]
+sc_counts_final <- sc_counts_agg[common_genes_final, ]
+
+print(paste("Final Common Genes:", length(common_genes_final)))
+```
+
+# 4. Prepare for DOT
+
+```{r prepare_dot}
+# Spatial Coords
+spatial_coords <- GetTissueCoordinates(seurat_obj)[colnames(spatial_counts_final), c("x", "y")]
+
+# Input Matrices for DOT
+# DOT can work with raw counts or normalized. Given we just aggregated raw counts,
+# we should verify if DOT requires normalization. The paper suggests normalized/scaled data 
+# might be better for feature transfer, but let's stick to the matrix we have match.
+# Typically, we pass the matched expression matrices.
+
+spatial_mat <- as.matrix(spatial_counts_final)
+sc_mat <- as.matrix(sc_counts_final)
+
+# SC Labels (No Subclustering)
+sc_labels <- as.character(Idents(seurat_ref))
+names(sc_labels) <- colnames(seurat_ref)
+# Filter sc_labels to match the cells in sc_mat (which might have changed order or been filtered if any dropped)
+# Note: aggregate.Matrix aggregates ROWS (genes), columns (cells) should remain, but let's be safe.
+sc_labels <- sc_labels[colnames(sc_mat)]
+
+print("Data ready for DOT.")
+```
+
+# 5. Run DOT
+
+```{r run_dot}
+print("Running DOT...")
+
+tryCatch({
+    # Correct workflow for saezlab/DOT (DOTr package)
+    
+    print("Pre-processing Reference (Single-Cell)...")
+    # sc_mat: genes x cells, sc_labels: character vector of labels
+    prep_sc <- DOTr::setup.ref(
+        ref_data = sc_mat, 
+        ref_annotations = sc_labels
+    )
+    
+    print("Pre-processing Target (Spatial)...")
+    # spatial_mat: genes x spots, spatial_coords: spots x 2
+    prep_srt <- DOTr::setup.srt(
+        srt_data = spatial_mat, 
+        srt_coords = spatial_coords,
+        verbose = TRUE
+    )
+    
+    print("Creating DOT Object...")
+    dot_obj <- DOTr::create.DOT(ref = prep_sc,
+        srt = prep_srt
+        
+    )
+    
+    print("Running DOT Algorithm (Frank-Wolfe)...")
+    dot_results <- DOTr::run.DOT.highresolution(
+        object = dot_obj
+    )
+    
+    # Define output path
+    output_dir <- "/home/mattia/Thesis/111125ST_def/Random data"
+    
+    saveRDS(dot_results, file.path(output_dir, "dot_results_exact_match.rds"))
+    print(paste("DOT Results saved to:", output_dir))
+    
+    # Also save the updated Seurat object with labels
+    # We do the argmax in the next step, but let's save the progress
+    saveRDS(seurat_obj, file.path(output_dir, "seurat_obj_dot.rds"))
+    
+    print("DOT Complete.")
+}, error = function(e) {
+    print("DOT Failed:")
+    print(e)
+})
+```
+
+# 6. Visualization: Most Likely Cell Type
+
+```{r plot_max}
+if (exists("dot_results")) {
+    print("Visualizing Results...")
+    
+    # Debug: Check slot names if any error occurs
+    # print(slotNames(dot_results))
+    
+    # DOT results are S4 objects; use @ to access slots
+    weights <- dot_results@weights 
+    
+    # 1. Find Max Cell Type per Spot
+    # argmax for each row (spot)
+    max_col_index <- max.col(weights, ties.method = "first")
+    max_cell_type <- colnames(weights)[max_col_index]
+    
+    # 2. Add to Metadata
+    seurat_obj <- AddMetaData(seurat_obj, metadata = max_cell_type, col.name = "Most_Likely_DOT")
+    
+    # 3. Plot (Tiled Version: No gaps between spots)
+    p <- SpatialDimPlot(seurat_obj, 
+                        group.by = "Most_Likely_DOT",
+                        image.alpha = 0,        
+                        pt.size.factor = 4.5,   # High value for perfect tiling/continuous palette
+                        stroke = 0) +           
+         ggtitle("Most Likely Cell Type (DOT Deconvolution)") +
+         theme_minimal() + 
+         theme(panel.grid = element_blank(),
+               axis.text = element_blank(),
+               axis.ticks = element_blank(),
+               axis.title = element_blank(),
+               legend.position = "right")
+    print(p)
+}
+```
+
+# 6.5 Interactive ROI Selection (Shiny Lasso)
+Run this chunk to manually select a region of interest (ROI) using the lasso tool. This will filter the `seurat_obj` for all subsequent steps.
+
+```{r shiny_lasso, eval=FALSE}
+library(shiny)
+library(plotly)
+
+# 1. Prepare data for plotting
+coords <- GetTissueCoordinates(seurat_obj)
+# Detect coordinate columns (usually col 1 and 2, but let's be safe)
+coord_cols <- colnames(coords)[1:2]
+print(paste("Detected coordinate columns:", paste(coord_cols, collapse = ", ")))
+
+plot_df <- as.data.frame(coords)
+plot_df$CellType <- seurat_obj$Most_Likely_DOT
+plot_df$Barcode <- rownames(plot_df)
+
+# UI
+ui <- fluidPage(
+    titlePanel("Interactive Spatial Selector (Lasso)"),
+    sidebarLayout(
+        sidebarPanel(
+            helpText("Use the Lasso tool on the plot to select spots to KEEP."),
+            actionButton("done", "Apply Selection & Exit", class = "btn-success"),
+            hr(),
+            verbatimTextOutput("selection_status")
+        ),
+        mainPanel(
+            plotlyOutput("spatial_plot", height = "700px")
+        )
+    )
+)
+
+# Server
+server <- function(input, output, session) {
+    # Store selected barcodes
+    selected_barcodes <- reactiveVal(NULL)
+    
+    output$spatial_plot <- renderPlotly({
+        # Dynamically map the detected columns to x and y
+        p <- plot_ly(plot_df, 
+                x = as.formula(paste0("~", coord_cols[1])), 
+                y = as.formula(paste0("~", coord_cols[2])), 
+                color = ~CellType,
+                key = ~Barcode,
+                type = 'scatter', 
+                mode = 'markers',
+                marker = list(size = 5)) %>%
+            layout(dragmode = "lasso",
+                   yaxis = list(autorange = "reversed"),
+                   xaxis = list(scaleanchor = "y", scaleratio = 1))
+        p
+    })
+    
+    observeEvent(event_data("plotly_selected"), {
+        d <- event_data("plotly_selected")
+        if (!is.null(d)) {
+            selected_barcodes(d$key)
+        }
+    })
+    
+    output$selection_status <- renderText({
+        if (is.null(selected_barcodes())) {
+            "No spots selected yet."
+        } else {
+            paste("Selected spots:", length(selected_barcodes()))
+        }
+    })
+    
+    observeEvent(input$done, {
+        if (!is.null(selected_barcodes())) {
+            # Update the global seurat_obj
+            seurat_obj <<- subset(seurat_obj, cells = selected_barcodes())
+            print(paste("Seurat object subsetted to", ncol(seurat_obj), "spots."))
+        } else {
+            print("No selection made. Seurat object remains unchanged.")
+        }
+        stopApp()
+    })
+}
+
+# Run the app
+runGadget(ui, server)
+```
+
+# 7. Post-Deconvolution Filtering (unk > 5%)
+
+```{r filtering_comparison}
+if (exists("dot_results")) {
+    print("Filtering spots with >5% unk proportion...")
+    
+    # 1. Extract 'unk' proportion
+    weights_mat <- dot_results@weights
+    if ("unk" %in% colnames(weights_mat)) {
+        unk_prop <- weights_mat[, "unk"]
+        seurat_obj <- AddMetaData(seurat_obj, metadata = unk_prop, col.name = "unk_proportion")
+        
+        # 2. Before Plot
+        p_before <- SpatialDimPlot(seurat_obj, group.by = "Most_Likely_DOT") + 
+                    ggtitle("Before Filtering (All Spots)") + 
+                    theme(legend.position = "right")
+        
+        # 3. Filter the object
+        seurat_obj_filtered <- subset(seurat_obj, subset = unk_proportion <= 0.05)
+        
+        # 4. After Plot
+        p_after <- SpatialDimPlot(seurat_obj_filtered, group.by = "Most_Likely_DOT") + 
+                   ggtitle("After Filtering (unk <= 5%)") + 
+                   theme(legend.position = "right")
+        
+        # 5. Display side-by-side (using cowplot or patchwork if available, else sequential)
+        # We'll use wrap_plots or just print them if patchwork isn't confirmed.
+        # But most Seurat environments have it.
+        if (requireNamespace("patchwork", quietly = TRUE)) {
+            library(patchwork)
+            print(p_before + p_after)
+        } else {
+            print(p_before)
+            print(p_after)
+        }
+        
+        # 6. Save filtered object
+        output_dir <- "/home/mattia/Thesis/111125ST_def/Random data"
+        saveRDS(seurat_obj_filtered, file.path(output_dir, "seurat_obj_dot_filtered.rds"))
+        print(paste("Filtered Seurat object saved to:", output_dir))
+        
+        # 7. CRITICAL: Overwrite main objects to ensure Section 8 uses filtered data
+        # Syncing Seurat object, weights matrix, and spatial coordinates
+        kept_barcodes <- colnames(seurat_obj_filtered)
+        seurat_obj <<- seurat_obj_filtered
+        dot_results@weights <<- dot_results@weights[kept_barcodes, ]
+        if (exists("prep_srt") && "C" %in% names(prep_srt)) {
+            prep_srt$C <<- prep_srt$C[kept_barcodes, ]
+        }
+        
+    } else {
+        print("Column 'unk' not found in weights results. Skipping filtering.")
+    }
+}
+```
+
+```{r filter_sync}
+# 7.5 Synchronization & Output
+# Ensures all downstream steps use ONLY the filtered spots.
+
+if (exists("seurat_obj")) {
+    kept_barcodes <- colnames(seurat_obj)
+    print(paste("Finalizing filter: Keeping", length(kept_barcodes), "spots."))
+    
+    # Update Weights Matrix
+    if (exists("dot_results")) {
+        dot_results@weights <- dot_results@weights[kept_barcodes, , drop = FALSE]
+    }
+    
+    # Update Preparation Object (for draw_maps)
+    if (exists("prep_srt")) {
+        prep_srt$C <- prep_srt$C[kept_barcodes, , drop = FALSE]
+        prep_srt$X <- prep_srt$X[kept_barcodes, , drop = FALSE]
+    }
+    
+    # Update original coordinates if used
+    if (exists("spatial_coords")) {
+        spatial_coords <- spatial_coords[kept_barcodes, , drop = FALSE]
+    }
+}
+```
+
+# 8. Advanced Visualizations (Paper Recommendations)
+
+## 8.1 Spatial Abundance Maps (`draw_maps`)
+The built-in `DOTr::draw_maps()` is optimized for the DOT object structure.
+
+```{r draw_maps}
+if (exists("dot_results") && exists("prep_srt")) {
+    print("Generating DOTr::draw_maps (All Cell Types)...")
+    
+    # source data from synchronized objects
+    weights_mat <- dot_results@weights
+    coords_mat <- prep_srt$C
+    
+    # Final check: intersection of barcodes
+    common_barcodes <- intersect(rownames(weights_mat), rownames(coords_mat))
+    weights_mat <- weights_mat[common_barcodes, , drop = FALSE]
+    coords_mat <- coords_mat[common_barcodes, , drop = FALSE]
+    
+    # Use all cell type columns instead of just the top 4
+    all_cts <- colnames(weights_mat)
+    
+    tryCatch({
+        # Using the signature provided by the user
+        DOTr::draw_maps(
+            spatial = coords_mat, 
+            weights = weights_mat[, all_cts, drop = FALSE],
+            normalize = TRUE,
+            ncol = 4, # Increased ncol to accommodate more maps
+            trans = "identity",
+            size = 0.5,
+            shape = 19,
+            flip_y = TRUE,
+            viridis_option = "magma",
+            legend_title = "abundance",
+            background = "gray90"
+        )
+    }, error = function(e) {
+        print("draw_maps failed with list input. Checking coordinates directly...")
+        print(e)
+    })
+}
+```
+
+## 8.2 Uncertainty Mapping (Entropy)
+Identifies spots where deconvolution is "uncertain" (high entropy).
+
+```{r uncertainty}
+if (exists("dot_results")) {
+    print("Calculating Deconvolution Uncertainty...")
+    
+    # Get weights matrix
+    w <- dot_results@weights
+    
+    # Calculate Shannon Entropy: -sum(p * log(p))
+    # Add a small epsilon to avoid log(0)
+    calc_entropy <- function(p) {
+        p <- p[p > 0]
+        -sum(p * log(p))
+    }
+    
+    entropy_scores <- apply(w, 1, calc_entropy)
+    
+    # Add to Seurat object
+    seurat_obj <- AddMetaData(seurat_obj, metadata = entropy_scores, col.name = "DOT_Entropy")
+    
+    # Plot
+    p <- SpatialFeaturePlot(seurat_obj, features = "DOT_Entropy") + 
+        ggtitle("DOT Deconvolution Uncertainty (Entropy)") +
+        scale_fill_viridis_c(option = "magma")
+    print(p)
+}
+```
+
+## 8.3 Spatial Correlation Analysis
+Correlation between DOT scores and spatial QC features.
+
+```{r spatial_cor}
+if (exists("dot_results")) {
+    print("Running Spatial Correlation Analysis...")
+    
+    # 1. Ensure QC metrics are present (Recalculate or check)
+    if (!"mean_expression" %in% colnames(seurat_obj@meta.data)) {
+        normalized_data <- GetAssayData(seurat_obj, assay = "SCT", layer = "data")
+        seurat_obj$mean_expression <- colMeans(normalized_data)
+    }
+    
+    if (!"percent.mt" %in% colnames(seurat_obj@meta.data)) {
+        seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt:")
+    }
+    
+    if (!"percent.ribo" %in% colnames(seurat_obj@meta.data)) {
+        seurat_obj[["percent.ribo"]] <- PercentageFeatureSet(seurat_obj, pattern = "^Rp[LS]")
+    }
+
+    # 2. Add DOT weights to metadata for correlation
+    weights_mat <- dot_results@weights
+    seurat_obj <- AddMetaData(seurat_obj, metadata = as.data.frame(weights_mat))
+    
+    # 3. Perform Correlation
+    meta <- seurat_obj@meta.data
+    dot_cols <- colnames(weights_mat)
+    qc_cols <- c("mean_expression", "percent.mt", "percent.ribo")
+    
+    # Filter for existing QC cols
+    qc_cols <- qc_cols[qc_cols %in% colnames(meta)]
+    
+    if (length(dot_cols) > 0 && length(qc_cols) > 0) {
+        cor_mat <- cor(meta[, dot_cols], meta[, qc_cols], use = "complete.obs")
+        
+        library(corrplot)
+        # cl.pos = 'n' removes the color legend labels (numbers on the right)
+        corrplot(cor_mat, method = "circle", 
+                 title = "Correlation: DOT vs Spatial QC", 
+                 mar = c(0,0,1,0),
+                 cl.pos = "n")
+    }
+}
+```
+
+# 9. Sub-clustering: Generating High-Resolution Reference Labels
+Objective: Split each cell type into 3 subclusters to resolve finer spatial patterns.
+
+```{r subclustering}
+if (exists("seurat_ref")) {
+    print("Starting sub-clustering of reference labels (k=3)...")
+    
+    # Identify the metadata column for cell types 
+    ct_col <- "cell_type" 
+    if (!ct_col %in% colnames(seurat_ref@meta.data)) {
+        ct_col <- "celltype"
+    }
+    
+    cell_types <- unique(seurat_ref[[ct_col, drop = TRUE]])
+    new_subcluster_labels <- character(ncol(seurat_ref))
+    names(new_subcluster_labels) <- colnames(seurat_ref)
+    
+    for (ct in cell_types) {
+        print(paste("Sub-clustering:", ct))
+        
+        # Subset to specific cell type
+        cells_of_type <- colnames(seurat_ref)[seurat_ref[[ct_col, drop = TRUE]] == ct]
+        subset_obj <- subset(seurat_ref, cells = cells_of_type)
+        
+        # Pipelines for Variable Features and PCA
+        try({
+            # Ensure normalization for the subset (fixes ScaleData error)
+            subset_obj <- NormalizeData(subset_obj, verbose = FALSE)
+            subset_obj <- FindVariableFeatures(subset_obj, selection.method = "vst", nfeatures = 1000, verbose = FALSE)
+            subset_obj <- ScaleData(subset_obj, verbose = FALSE)
+            subset_obj <- RunPCA(subset_obj, npcs = 10, verbose = FALSE)
+            
+            # K-means clustering (exactly 3)
+            pca_data <- Embeddings(subset_obj, "pca")
+            if (nrow(pca_data) >= 3) {
+                km_res <- kmeans(pca_data, centers = 3, nstart = 25)
+                new_labels <- paste0(ct, "_", km_res$cluster)
+            } else {
+                new_labels <- paste0(ct, "_1")
+            }
+            new_subcluster_labels[colnames(subset_obj)] <- new_labels
+        }, silent = FALSE)
+    }
+    
+    # Add to main reference object
+    seurat_ref$Subcluster_Labels <- new_subcluster_labels
+    
+    # Verify
+    print(table(seurat_ref$Subcluster_Labels))
+}
+```
+
+# 10. Subcluster Deconvolution: High-Resolution DOT
+Re-running the DOT algorithm using the new high-resolution labels.
+
+```{r dot_subclusters}
+if (exists("seurat_ref") && "Subcluster_Labels" %in% colnames(seurat_ref@meta.data)) {
+    print("Preparing data for Subcluster Deconvolution...")
+    
+    # 1. Get counts
+    spatial_counts_sub <- GetAssayData(seurat_obj, assay = "Spatial.016um", layer = "counts")
+    sc_counts_sub <- GetAssayData(seurat_ref, assay = "RNA", layer = "counts")
+    
+    # 2. Gene Cleaning
+    spatial_genes_clean_sub <- toupper(gsub("\\..*$", "", rownames(spatial_counts_sub)))
+    sc_genes_clean_sub <- toupper(gsub("\\..*$", "", rownames(sc_counts_sub)))
+    
+    rownames(spatial_counts_sub) <- spatial_genes_clean_sub
+    rownames(sc_counts_sub) <- sc_genes_clean_sub
+    
+    # 3. Aggressive Aggregation (dMeltAndSum logic)
+    print("Aggregating duplicates (Subclusters)...")
+    spatial_counts_agg_sub <- Matrix.utils::aggregate.Matrix(
+        spatial_counts_sub, 
+        group = rownames(spatial_counts_sub), 
+        fun = "sum"
+    )
+    
+    sc_counts_agg_sub <- Matrix.utils::aggregate.Matrix(
+        sc_counts_sub, 
+        group = rownames(sc_counts_sub), 
+        fun = "sum"
+    )
+    
+    # 4. Final Intersection
+    common_genes_sub <- intersect(rownames(spatial_counts_agg_sub), rownames(sc_counts_agg_sub))
+    spatial_mat_sub <- as.matrix(spatial_counts_agg_sub[common_genes_sub, ])
+    sc_mat_sub <- as.matrix(sc_counts_agg_sub[common_genes_sub, ])
+    
+    # 5. Prepare Labels
+    sc_labels_sub <- seurat_ref$Subcluster_Labels
+    names(sc_labels_sub) <- colnames(seurat_ref)
+    sc_labels_sub <- sc_labels_sub[colnames(sc_mat_sub)]
+    
+    # 6. Prepare Coords
+    spatial_coords_sub <- GetTissueCoordinates(seurat_obj)[colnames(spatial_mat_sub), c("x", "y")]
+    
+    # 2. DOTr Workflow
+    print("Pre-processing High-Res Reference...")
+    # Using setup.ref on the matched matrix
+    prep_sc_sub <- DOTr::setup.ref(
+        ref_data = sc_mat_sub, 
+        ref_annotations = sc_labels_sub
+    )
+    
+    print("Pre-processing High-Res Target...")
+    # prep_srt_sub is derived from the sub-matched spatial_mat_sub
+    prep_srt_sub <- DOTr::setup.srt(
+        srt_data = spatial_mat_sub, 
+        srt_coords = spatial_coords_sub,
+        verbose = TRUE
+    )
+    
+    print("Creating DOT Object (Subcl.)...")
+    dot_obj_sub <- DOTr::create.DOT(
+        ref = prep_sc_sub,
+        srt = prep_srt_sub
+    )
+    
+    print("Running High-Resolution DOT (Subclusters)...")
+    # Frank-Wolfe optimization at subcluster resolution
+    dot_results_sub <- DOTr::run.DOT.highresolution(
+        object = dot_obj_sub
+    )
+    
+    # Save Subcluster Results
+    output_dir <- "/home/mattia/Thesis/111125ST_def/Random data"
+    saveRDS(dot_results_sub, file.path(output_dir, "dot_results_subclusters.rds"))
+    print("Subcluster deconvolution complete.")
+}
+```
+
+# 11. Subcluster Filtering: ROI and Proportion-based QC
+Objective: Filter the high-resolution results to remove noisy spots.
+
+```{r subcluster_filtering}
+if (exists("dot_results_sub")) {
+    print("Applying filtering to Subcluster Deconvolution...")
+    
+    # 1. Identify Most Likely Subcluster
+    weights_sub <- dot_results_sub@weights
+    if (!is.matrix(weights_sub)) weights_sub <- as.matrix(weights_sub)
+    
+    # Argmax
+    max_idx <- max.col(weights_sub, ties.method = "first")
+    max_subcluster_vals <- colnames(weights_sub)[max_idx]
+    names(max_subcluster_vals) <- rownames(weights_sub)
+    
+    # 2. Sync with ROI
+    common_spots <- intersect(colnames(seurat_obj), rownames(weights_sub))
+    print(paste("Common Spots (ROI & DOT):", length(common_spots)))
+    
+    if (length(common_spots) == 0) {
+        stop("No common spots found.")
+    }
+    
+    seurat_sub <- subset(seurat_obj, cells = common_spots)
+    
+    # Add labels (Categorical)
+    # Ensure we only pick labels for the spots we have
+    matched_labels <- max_subcluster_vals[colnames(seurat_sub)]
+    seurat_sub$Subcluster_Label_Final <- as.character(matched_labels)
+    
+    # 3. unk Filtering (>5%)
+    if ("unk" %in% colnames(weights_sub)) {
+        unk_vec <- weights_sub[colnames(seurat_sub), "unk"]
+        seurat_sub$unk_prop_sub <- unk_vec
+        seurat_sub_filtered <- subset(seurat_sub, subset = unk_prop_sub < 0.05)
+    } else {
+        seurat_sub_filtered <- seurat_sub
+    }
+    
+    # 4. Cleanup & Diagnostics
+    print(paste("Final Spots for Subcluster Plotting:", ncol(seurat_sub_filtered)))
+    
+    if (ncol(seurat_sub_filtered) > 0) {
+        # Force discrete factors and drop NAs
+        final_vals <- seurat_sub_filtered$Subcluster_Label_Final
+        # Remove NA/Empty
+        valid_spots <- !is.na(final_vals) & final_vals != "" & final_vals != "unk"
+        seurat_sub_filtered <- subset(seurat_sub_filtered, cells = colnames(seurat_sub_filtered)[valid_spots])
+        
+        # FINAL CATEGORICAL ENFORCEMENT
+        seurat_sub_filtered$Subcluster_Label_Final <- factor(seurat_sub_filtered$Subcluster_Label_Final)
+        
+        print("Final Categories identified:")
+        print(table(seurat_sub_filtered$Subcluster_Label_Final))
+    }
+    
+    # Save objects
+    output_dir <- "/home/mattia/Thesis/111125ST_def/Random data"
+    saveRDS(seurat_sub_filtered, file.path(output_dir, "seurat_obj_subclusters_filtered.rds"))
+    
+    # Final weights sync for draw_maps
+    kept_barcodes_sub <- colnames(seurat_sub_filtered)
+    weights_sub_filtered <- weights_sub[kept_barcodes_sub, , drop = FALSE]
+}
+```
+
+# 12. Subcluster Visualization (High-Resolution Atlas)
+Objective: Generate the final continuous palette and uncertainty maps for subclusters.
+
+```{r subcluster_plots}
+if (exists("seurat_sub_filtered") && ncol(seurat_sub_filtered) > 0) {
+    print("Generating Subcluster Atlas...")
+    
+    # Final Discrete Check
+    if (is.factor(seurat_sub_filtered$Subcluster_Label_Final) && 
+        length(levels(seurat_sub_filtered$Subcluster_Label_Final)) > 0) {
+        
+        # 1. Tiled Most Likely Subcluster
+        p1 <- SpatialDimPlot(seurat_sub_filtered, 
+                            group.by = "Subcluster_Label_Final",
+                            image.alpha = 0,        
+                            pt.size.factor = 4.5,   
+                            stroke = 0) +           
+             ggtitle("High-Resolution Atlas: Subclusters") +
+             theme_void() + 
+             theme(legend.position = "right")
+        
+        print(p1)
+    } else {
+        cat("Error: Cannot plot. Subcluster_Label_Final has no valid category levels.\n")
+    }
+    
+    # 2. Detailed Abundance Maps (draw_maps)
+    # Re-extract coordinates for filtered spots
+    # CLEANING: Ensure only x and y columns are passed to avoid "discrete value" errors with barcodes
+    coords_sub <- GetTissueCoordinates(seurat_sub_filtered)
+    # Force numeric and keep only x/y
+    coords_sub_clean <- as.matrix(coords_sub[, c(1, 2)])
+    
+    # ENSURE WEIGHTS ARE NUMERIC
+    weights_numeric <- as.matrix(weights_sub_filtered)
+    # Remove 'unk' from abundance maps if present (optional but recommended for cleaner maps)
+    map_cols <- setdiff(colnames(weights_numeric), "unk")
+    
+    # BATCHING: Plot 9 subclusters per "window" (batch)
+    n_cols <- length(map_cols)
+    batch_size <- 9
+    n_batches <- ceiling(n_cols / batch_size)
+    
+    print(paste("Plotting", n_cols, "subcluster maps in", n_batches, "batches of 9..."))
+    
+    for (i in 1:n_batches) {
+        start_idx <- (i - 1) * batch_size + 1
+        end_idx <- min(i * batch_size, n_cols)
+        current_cols <- map_cols[start_idx:end_idx]
+        
+        print(paste("Batch", i, ": columns", start_idx, "to", end_idx))
+        
+        tryCatch({
+            # Capture and print since it's inside a loop
+            p_batch <- DOTr::draw_maps(
+                spatial = coords_sub_clean, 
+                weights = weights_numeric[, current_cols, drop = FALSE],
+                normalize = TRUE,
+                ncol = 3, # 3x3 grid for batch of 9
+                flip_y = TRUE,
+                viridis_option = "magma",
+                background = "gray90",
+                size = 0.5,
+                shape = 19
+            )
+            print(p_batch)
+        }, error = function(e) {
+            print(paste("Batch", i, "failed:"))
+            print(e)
+        })
+    }
+}
+```

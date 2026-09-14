@@ -1,0 +1,1065 @@
+---
+title: "Spatial Expression Profile Comparison (Mutant vs WT) — Batch-Corrected"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(zoo)
+library(pheatmap)
+library(ggrepel)
+library(harmony)
+library(patchwork)
+library(shiny)
+library(plotly)
+library(future)
+library(future.apply)
+
+# Ensure output directories exist
+if (!dir.exists("../figures/spatial_profile")) dir.create("../figures/spatial_profile", recursive = TRUE)
+if (!dir.exists("../Excels")) dir.create("../Excels", recursive = TRUE)
+```
+
+## 1. Load Data
+We load the whole segmented data from both experiments and subset into WT/Mutant groups for Harmony batch correction. We also load the `merged_guts.rds` objects for the specific gut comparisons.
+
+```{r load_data}
+# --- A. Load Whole Segmented Data ---
+path_seg_slide4 <- "../Random data/VisiumHD_Drosophila_Resolution_List.rds"
+path_seg_111125 <- "../../111125ST_def/Random data/VisiumHD_Drosophila_Resolution_List.rds"
+
+if (!file.exists(path_seg_slide4)) stop("Seg data for 03Slide4 not found at: ", path_seg_slide4)
+if (!file.exists(path_seg_111125)) stop("Seg data for 111125ST not found at: ", path_seg_111125)
+
+message("Loading 03Slide4 segmented data...")
+vhd_slide4 <- readRDS(path_seg_slide4)
+visium_slide4_full <- vhd_slide4$seg
+
+message("Loading 111125ST segmented data...")
+vhd_111125 <- readRDS(path_seg_111125)
+visium_111125_full <- vhd_111125$seg
+
+message(paste("03Slide4:", ncol(visium_slide4_full), "cells"))
+message(paste("111125ST:", ncol(visium_111125_full), "cells"))
+
+# --- Barcode Cleaning Helper (shared across chunks) ---
+clean_barcodes <- function(selection, all_cells) {
+  if (is.null(selection)) return(character(0))
+  selection <- trimws(selection)
+  normalized <- tryCatch(sprintf("cellid_%09d-1", as.numeric(selection)),
+                         warning = function(w) selection, error = function(e) selection)
+  valid_raw <- intersect(selection, all_cells)
+  valid_fmt <- intersect(normalized, all_cells)
+  if (length(valid_fmt) > length(valid_raw)) valid_fmt else valid_raw
+}
+```
+
+```{r subset_slide4}
+# --- B. Subset 03Slide4 into WT (3 guts) and Mutant (3 guts) ---
+csv_dir <- "../Random data/harmony_subsets"
+if (!dir.exists(csv_dir)) dir.create(csv_dir, recursive = TRUE)
+
+csv_files <- c("wt_gut1.csv", "wt_gut2.csv", "wt_gut3.csv",
+               "mut_gut1.csv", "mut_gut2.csv", "mut_gut3.csv")
+
+if (all(file.exists(file.path(csv_dir, csv_files)))) {
+  message("Loading 03Slide4 gut selections from saved CSVs...")
+  wt_gut1_cells  <- read.csv(file.path(csv_dir, "wt_gut1.csv"))$x
+  wt_gut2_cells  <- read.csv(file.path(csv_dir, "wt_gut2.csv"))$x
+  wt_gut3_cells  <- read.csv(file.path(csv_dir, "wt_gut3.csv"))$x
+  mut_gut1_cells <- read.csv(file.path(csv_dir, "mut_gut1.csv"))$x
+  mut_gut2_cells <- read.csv(file.path(csv_dir, "mut_gut2.csv"))$x
+  mut_gut3_cells <- read.csv(file.path(csv_dir, "mut_gut3.csv"))$x
+} else {
+  message("Launching Shiny app for 03Slide4 gut subsetting...")
+  coords_s4 <- visium_slide4_full@meta.data[, c("x_centroid", "y_centroid")]
+  colnames(coords_s4) <- c("x", "y")
+  coords_s4$barcode <- rownames(coords_s4)
+
+  ui_s4 <- fluidPage(
+    titlePanel("03Slide4 Gut Subsetting (WT + Mutant)"),
+    sidebarLayout(
+      sidebarPanel(
+        h4("Instructions"),
+        p("Use the Lasso tool to select points, then click the corresponding Save button."),
+        h5("WT Guts"),
+        actionButton("save_wt1", "Save WT Gut 1"), verbatimTextOutput("st_wt1"),
+        actionButton("save_wt2", "Save WT Gut 2"), verbatimTextOutput("st_wt2"),
+        actionButton("save_wt3", "Save WT Gut 3"), verbatimTextOutput("st_wt3"),
+        hr(), h5("Mutant Guts"),
+        actionButton("save_mut1", "Save Mutant Gut 1"), verbatimTextOutput("st_mut1"),
+        actionButton("save_mut2", "Save Mutant Gut 2"), verbatimTextOutput("st_mut2"),
+        actionButton("save_mut3", "Save Mutant Gut 3"), verbatimTextOutput("st_mut3"),
+        hr(), actionButton("done_btn", "DONE (Close & Save)")
+      ),
+      mainPanel(plotlyOutput("scatter_plot", height = "800px"))
+    )
+  )
+
+  server_s4 <- function(input, output, session) {
+    vals <- reactiveValues(wt1=NULL, wt2=NULL, wt3=NULL, mut1=NULL, mut2=NULL, mut3=NULL)
+    output$scatter_plot <- renderPlotly({
+      plot_ly(coords_s4, x=~x, y=~y, key=~barcode, type="scatter", mode="markers",
+              marker=list(size=2, color='gray', opacity=0.5), source="src") %>%
+        layout(dragmode="lasso", title="Select Gut Regions", yaxis=list(autorange="reversed"))
+    })
+    observeEvent(input$save_wt1,  { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$wt1 <- d$key })
+    observeEvent(input$save_wt2,  { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$wt2 <- d$key })
+    observeEvent(input$save_wt3,  { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$wt3 <- d$key })
+    observeEvent(input$save_mut1, { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$mut1 <- d$key })
+    observeEvent(input$save_mut2, { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$mut2 <- d$key })
+    observeEvent(input$save_mut3, { d <- event_data("plotly_selected", source="src"); if(!is.null(d)) vals$mut3 <- d$key })
+    output$st_wt1  <- renderText({ if(is.null(vals$wt1))  "Not saved" else paste(length(vals$wt1),  "cells") })
+    output$st_wt2  <- renderText({ if(is.null(vals$wt2))  "Not saved" else paste(length(vals$wt2),  "cells") })
+    output$st_wt3  <- renderText({ if(is.null(vals$wt3))  "Not saved" else paste(length(vals$wt3),  "cells") })
+    output$st_mut1 <- renderText({ if(is.null(vals$mut1)) "Not saved" else paste(length(vals$mut1), "cells") })
+    output$st_mut2 <- renderText({ if(is.null(vals$mut2)) "Not saved" else paste(length(vals$mut2), "cells") })
+    output$st_mut3 <- renderText({ if(is.null(vals$mut3)) "Not saved" else paste(length(vals$mut3), "cells") })
+    observeEvent(input$done_btn, {
+      stopApp(list(wt1=vals$wt1, wt2=vals$wt2, wt3=vals$wt3,
+                   mut1=vals$mut1, mut2=vals$mut2, mut3=vals$mut3))
+    })
+  }
+
+  sel_s4 <- runApp(shinyApp(ui_s4, server_s4))
+  all_cells_s4 <- Cells(visium_slide4_full)
+  wt_gut1_cells  <- clean_barcodes(sel_s4$wt1,  all_cells_s4)
+  wt_gut2_cells  <- clean_barcodes(sel_s4$wt2,  all_cells_s4)
+  wt_gut3_cells  <- clean_barcodes(sel_s4$wt3,  all_cells_s4)
+  mut_gut1_cells <- clean_barcodes(sel_s4$mut1, all_cells_s4)
+  mut_gut2_cells <- clean_barcodes(sel_s4$mut2, all_cells_s4)
+  mut_gut3_cells <- clean_barcodes(sel_s4$mut3, all_cells_s4)
+
+  write.csv(data.frame(x = wt_gut1_cells),  file.path(csv_dir, "wt_gut1.csv"),  row.names = FALSE)
+  write.csv(data.frame(x = wt_gut2_cells),  file.path(csv_dir, "wt_gut2.csv"),  row.names = FALSE)
+  write.csv(data.frame(x = wt_gut3_cells),  file.path(csv_dir, "wt_gut3.csv"),  row.names = FALSE)
+  write.csv(data.frame(x = mut_gut1_cells), file.path(csv_dir, "mut_gut1.csv"), row.names = FALSE)
+  write.csv(data.frame(x = mut_gut2_cells), file.path(csv_dir, "mut_gut2.csv"), row.names = FALSE)
+  write.csv(data.frame(x = mut_gut3_cells), file.path(csv_dir, "mut_gut3.csv"), row.names = FALSE)
+  message("Saved 03Slide4 gut selections to CSVs.")
+}
+
+message(paste("WT guts — Gut1:", length(wt_gut1_cells), "Gut2:", length(wt_gut2_cells), "Gut3:", length(wt_gut3_cells)))
+message(paste("Mutant guts — Gut1:", length(mut_gut1_cells), "Gut2:", length(mut_gut2_cells), "Gut3:", length(mut_gut3_cells)))
+```
+
+```{r subset_111125}
+# --- C. Isolate 111125ST Tissue from Background ---
+tissue_csv <- file.path(csv_dir, "tissue_111125.csv")
+
+if (file.exists(tissue_csv)) {
+  message("Loading 111125ST tissue selection from saved CSV...")
+  tissue_cells_111125 <- read.csv(tissue_csv)$x
+  visium_111125_tissue <- subset(visium_111125_full, cells = tissue_cells_111125)
+} else {
+  message("Launching Shiny app for 111125ST tissue selection...")
+  coords_111 <- visium_111125_full@meta.data[, c("x_centroid", "y_centroid")]
+  colnames(coords_111) <- c("x", "y")
+  coords_111$barcode <- rownames(coords_111)
+
+  ui_111 <- fluidPage(
+    titlePanel("111125ST Tissue Selection"),
+    sidebarLayout(
+      sidebarPanel(
+        p("Use Lasso to select tissue cells (exclude background)."),
+        actionButton("save_tissue", "Save Tissue Selection"),
+        verbatimTextOutput("st_tissue"), hr(),
+        actionButton("done_btn", "DONE")
+      ),
+      mainPanel(plotlyOutput("scatter_plot", height = "800px"))
+    )
+  )
+
+  server_111 <- function(input, output, session) {
+    vals <- reactiveValues(tissue = NULL)
+    output$scatter_plot <- renderPlotly({
+      plot_ly(coords_111, x=~x, y=~y, key=~barcode, type="scatter", mode="markers",
+              marker=list(size=2, color='gray', opacity=0.5), source="src111") %>%
+        layout(dragmode="lasso", title="Select Tissue Region", yaxis=list(autorange="reversed"))
+    })
+    observeEvent(input$save_tissue, {
+      d <- event_data("plotly_selected", source="src111")
+      if(!is.null(d)) vals$tissue <- d$key
+    })
+    output$st_tissue <- renderText({
+      if(is.null(vals$tissue)) "Not saved" else paste(length(vals$tissue), "cells")
+    })
+    observeEvent(input$done_btn, { stopApp(list(tissue = vals$tissue)) })
+  }
+
+  sel_111 <- runApp(shinyApp(ui_111, server_111))
+  tissue_cells_111125 <- clean_barcodes(sel_111$tissue, Cells(visium_111125_full))
+  write.csv(data.frame(x = tissue_cells_111125), tissue_csv, row.names = FALSE)
+  message("Saved 111125ST tissue selection to CSV.")
+  visium_111125_tissue <- subset(visium_111125_full, cells = tissue_cells_111125)
+}
+
+message(paste("111125ST tissue:", ncol(visium_111125_tissue), "cells"))
+```
+
+```{r create_subsets}
+# --- D. Create WT and Mutant Subsets from 03Slide4 ---
+slide4_wt_cells  <- c(wt_gut1_cells, wt_gut2_cells, wt_gut3_cells)
+slide4_mut_cells <- c(mut_gut1_cells, mut_gut2_cells, mut_gut3_cells)
+slide4_wt  <- subset(visium_slide4_full, cells = slide4_wt_cells)
+slide4_mut <- subset(visium_slide4_full, cells = slide4_mut_cells)
+
+# Exclude Ambiguous cells where Predicted_CellType exists
+for (obj_name in c("visium_111125_tissue", "slide4_wt", "slide4_mut")) {
+  obj <- get(obj_name)
+  if ("Predicted_CellType" %in% colnames(obj@meta.data)) {
+    obj <- subset(obj, cells = Cells(obj)[!grepl("ambiguous", obj$Predicted_CellType, ignore.case = TRUE)])
+    assign(obj_name, obj)
+  }
+}
+
+message(paste("111125ST tissue (filtered):", ncol(visium_111125_tissue), "cells"))
+message(paste("03Slide4 WT (filtered):", ncol(slide4_wt), "cells"))
+message(paste("03Slide4 Mutant (filtered):", ncol(slide4_mut), "cells"))
+
+# --- E. Load Merged Guts for Downstream Comparison ---
+path_slide4_merged <- "../Random data/merged_guts.rds"
+path_slide6_merged <- "../../03Slide6/Random data/merged_guts.rds"
+path_111125_merged <- "../../111125ST_def/Random data/merged_guts.rds"
+
+if (!file.exists(path_slide4_merged)) stop("merged_guts.rds for 03Slide4 not found")
+if (!file.exists(path_111125_merged)) stop("merged_guts.rds for 111125ST not found")
+
+message("Loading merged_guts.rds for downstream gut subsets...")
+merged_slide4 <- readRDS(path_slide4_merged)
+merged_111125 <- readRDS(path_111125_merged)
+
+# Load Slide6 for Cas9 comparison (Section 7)
+if (file.exists(path_slide6_merged)) {
+  merged_slide6 <- readRDS(path_slide6_merged)
+  gut1_cells_slide6 <- grep("^Gut1_", Cells(merged_slide6), value = TRUE)
+  gut1_slide6 <- subset(merged_slide6, cells = gut1_cells_slide6)
+  gut1_slide6 <- subset(gut1_slide6, cells = Cells(gut1_slide6)[
+    !grepl("ambiguous", gut1_slide6$Predicted_CellType, ignore.case = TRUE)])
+}
+
+# Subset specific guts for downstream spatial profiling
+gut1_cells_slide4 <- grep("^Gut1_", Cells(merged_slide4), value = TRUE)
+gut1_slide4 <- subset(merged_slide4, cells = gut1_cells_slide4)
+
+gut3_cells_111125 <- grep("^Gut3_", Cells(merged_111125), value = TRUE)
+gut3_111125 <- subset(merged_111125, cells = gut3_cells_111125)
+
+gut1_slide4 <- subset(gut1_slide4, cells = Cells(gut1_slide4)[
+  !grepl("ambiguous", gut1_slide4$Predicted_CellType, ignore.case = TRUE)])
+gut3_111125 <- subset(gut3_111125, cells = Cells(gut3_111125)[
+  !grepl("ambiguous", gut3_111125$Predicted_CellType, ignore.case = TRUE)])
+
+message(paste("Mutant (Slide4 Gut 1):", ncol(gut1_slide4), "cells"))
+message(paste("WT (111125ST Gut 3):", ncol(gut3_111125), "cells"))
+```
+
+
+## 2. Batch Correction with Harmony
+We train Harmony **only on the WT data** (111125ST + 03Slide4 WT guts), so the correction learns only inter-experiment technical differences. We then project the mutant cells into the corrected space using the learned model, preserving biological differences.
+
+```{r batch_correction_all, fig.width=14, fig.height=10}
+# --- A. Remove Images to Prevent Subset Errors ---
+for (img in Images(visium_111125_tissue)) visium_111125_tissue[[img]] <- NULL
+for (img in Images(slide4_wt)) slide4_wt[[img]] <- NULL
+for (img in Images(slide4_mut)) slide4_mut[[img]] <- NULL
+
+# --- B. Step 1: Merge WT-ONLY (111125ST + Slide4 WT) for Harmony Training ---
+combined_wt <- merge(visium_111125_tissue,
+                     y = list(slide4_wt),
+                     add.cell.ids = c("S111125", "S4WT"))
+
+combined_wt$Sample <- ifelse(grepl("^S111125_", Cells(combined_wt)), "111125ST", "03Slide4")
+combined_wt$Condition <- "WT"
+
+message(paste("WT-only combined object:", ncol(combined_wt), "cells"))
+message("Distribution by Sample:"); print(table(combined_wt$Sample))
+
+# --- C. SCTransform + PCA + Harmony on WT-only ---
+combined_wt <- JoinLayers(combined_wt)
+
+message("Running SCTransform on WT-only merge with Sample regression...")
+combined_wt <- SCTransform(combined_wt, assay = "Segmented", vars.to.regress = "Sample", verbose = FALSE)
+
+message("Running PCA on WT-only merge...")
+combined_wt <- RunPCA(combined_wt, npcs = 30, verbose = FALSE)
+
+message("Running Harmony batch correction on WT-only (correcting for Sample)...")
+combined_wt <- RunHarmony(combined_wt, group.by.vars = "Sample",
+                          reduction.use = "pca", dims.use = 1:20,
+                          plot_convergence = FALSE)
+
+# --- D. Step 2: Now merge ALL data and project mutant into corrected space ---
+# Create the full combined object (111125ST + S4WT + S4Mut)
+combined_all <- merge(visium_111125_tissue,
+                      y = list(slide4_wt, slide4_mut),
+                      add.cell.ids = c("S111125", "S4WT", "S4Mut"))
+
+combined_all$Sample <- ifelse(grepl("^S111125_", Cells(combined_all)), "111125ST", "03Slide4")
+combined_all$Condition <- dplyr::case_when(
+  grepl("^S111125_", Cells(combined_all)) ~ "WT",
+  grepl("^S4WT_", Cells(combined_all))    ~ "WT",
+  grepl("^S4Mut_", Cells(combined_all))   ~ "Mutant"
+)
+
+message(paste("Full combined object:", ncol(combined_all), "cells"))
+message("Distribution by Condition:"); print(table(combined_all$Condition))
+
+# --- E. SCTransform the full object using the SAME model ---
+combined_all <- JoinLayers(combined_all)
+combined_all <- SCTransform(combined_all, assay = "Segmented", vars.to.regress = "Sample", verbose = FALSE)
+combined_all <- RunPCA(combined_all, npcs = 30, verbose = FALSE)
+
+# --- F. Project ALL cells using the WT-trained Harmony model ---
+# Extract the Harmony model (rotation/scaling) learned from WT-only
+harmony_model <- combined_wt@reductions$harmony
+
+# Get PCA embeddings for all cells in the full object
+pca_all <- Embeddings(combined_all, "pca")[, 1:20]
+
+# Apply Harmony correction using the WT-trained model
+message("Projecting all cells (including mutant) through WT-trained Harmony model...")
+harmony_obj <- harmony::HarmonyMatrix(
+  data_mat = pca_all,
+  meta_data = combined_all$Sample,
+  do_pca = FALSE,       # We already have PCA
+  verbose = FALSE
+)
+
+# Store corrected embeddings
+combined_all[["harmony"]] <- CreateDimReducObject(
+  embeddings = harmony_obj,
+  key = "harmony_",
+  assay = DefaultAssay(combined_all)
+)
+
+# --- G. UMAP Validation (Before vs After Harmony) ---
+message("Generating validation UMAPs...")
+combined_all <- RunUMAP(combined_all, reduction = "pca", dims = 1:20,
+                        reduction.name = "umap_uncorrected", verbose = FALSE)
+combined_all <- RunUMAP(combined_all, reduction = "harmony", dims = 1:20,
+                        reduction.name = "umap_corrected", verbose = FALSE)
+
+# Colored by Condition (WT vs Mutant)
+p_cond_before <- DimPlot(combined_all, reduction = "umap_uncorrected", group.by = "Condition",
+                         cols = c("Mutant" = "#E41A1C", "WT" = "#377EB8")) +
+  ggtitle("Before Harmony (Condition)") + theme(legend.position = "bottom")
+
+p_cond_after <- DimPlot(combined_all, reduction = "umap_corrected", group.by = "Condition",
+                        cols = c("Mutant" = "#E41A1C", "WT" = "#377EB8")) +
+  ggtitle("After Harmony (Condition)") + theme(legend.position = "bottom")
+
+# Colored by Sample (111125ST vs 03Slide4)
+p_sample_before <- DimPlot(combined_all, reduction = "umap_uncorrected", group.by = "Sample",
+                           cols = c("111125ST" = "#4DAF4A", "03Slide4" = "#984EA3")) +
+  ggtitle("Before Harmony (Sample)") + theme(legend.position = "bottom")
+
+p_sample_after <- DimPlot(combined_all, reduction = "umap_corrected", group.by = "Sample",
+                          cols = c("111125ST" = "#4DAF4A", "03Slide4" = "#984EA3")) +
+  ggtitle("After Harmony (Sample)") + theme(legend.position = "bottom")
+
+p_harmony_validation <- (p_cond_before | p_cond_after) / (p_sample_before | p_sample_after)
+ggsave("../figures/spatial_profile/Batch_Correction_Validation.png",
+       p_harmony_validation, width = 14, height = 10)
+p_harmony_validation
+```
+
+
+```{r apply_correction}
+# --- F. Apply Harmony Correction to Specific Gut Subsets ---
+# Map barcodes from merged_guts objects to the combined_all object
+gut3_orig <- gsub("^Gut3_", "", Cells(gut3_111125))
+gut3_in_combined <- paste0("S111125_", gut3_orig)
+
+gut1_orig <- gsub("^Gut1_", "", Cells(gut1_slide4))
+gut1_in_combined <- paste0("S4Mut_", gut1_orig)
+
+# Validate matching
+gut3_valid <- intersect(gut3_in_combined, Cells(combined_all))
+gut1_valid <- intersect(gut1_in_combined, Cells(combined_all))
+
+message(paste("WT Gut 3 cells matched:", length(gut3_valid), "/", length(gut3_in_combined)))
+message(paste("Mutant Gut 1 cells matched:", length(gut1_valid), "/", length(gut1_in_combined)))
+
+# Subset combined_all to comparison guts
+combined <- subset(combined_all, cells = c(gut3_valid, gut1_valid))
+
+# Add Batch metadata for downstream compatibility
+combined$Batch <- ifelse(grepl("^S111125_", Cells(combined)), "WT", "Mutant")
+
+# Transfer Spatial_Pseudotime from merged_guts objects
+gut3_pt <- setNames(gut3_111125$Spatial_Pseudotime,
+                    paste0("S111125_", gsub("^Gut3_", "", Cells(gut3_111125))))
+gut1_pt <- setNames(gut1_slide4$Spatial_Pseudotime,
+                    paste0("S4Mut_", gsub("^Gut1_", "", Cells(gut1_slide4))))
+pt_map <- c(gut3_pt, gut1_pt)
+combined$Spatial_Pseudotime <- pt_map[Cells(combined)]
+
+message(paste("Final comparison object:", ncol(combined), "cells"))
+message("Batch distribution:")
+print(table(combined$Batch))
+```
+
+## 3. Spatial Expression Profiling
+We bin the spatial pseudotime (0-100) and calculate smoothed expression for each batch.
+
+```{r spatial_profiling}
+library(gridExtra)
+
+# Define genes for the profiles (top variable genes)
+var_genes <- VariableFeatures(combined)
+if (length(var_genes) == 0) {
+  combined <- FindVariableFeatures(combined, nfeatures = 2000, verbose = FALSE)
+  var_genes <- VariableFeatures(combined)
+}
+
+# 1. Binning by Spatial_Pseudotime (0-100)
+# Ensure Bin is defined for all cells
+combined$Bin <- cut(combined$Spatial_Pseudotime, breaks = 100, labels = FALSE)
+
+# 2. Function to calculate smoothed expression averages per bin
+get_smoothed_profiles <- function(seurat_obj, batch_name, genes, n_bins = 100, window = 5, assay = NULL) {
+  sub <- subset(seurat_obj, Batch == batch_name)
+  
+  if (ncol(sub) == 0) {
+    message(paste("No cells found for batch", batch_name))
+    return(NULL)
+  }
+  
+  # Extract expression data (using provided assay, or SCT if present, otherwise default)
+  if (is.null(assay)) {
+    if ("SCT" %in% names(sub@assays)) {
+      assay_to_use <- "SCT"
+    } else {
+      assay_to_use <- DefaultAssay(sub)
+    }
+  } else {
+    assay_to_use <- assay
+  }
+  message(paste("Using assay:", assay_to_use, "for batch", batch_name))
+  
+  # Ensure all genes exist in the assay
+  genes <- intersect(genes, rownames(sub[[assay_to_use]]))
+  if (length(genes) == 0) return(NULL)
+  
+  exp_mat <- GetAssayData(sub, assay = assay_to_use, layer = "data")[genes, , drop = FALSE]
+  
+  # Calculate mean expression per bin
+  bin_means <- t(apply(exp_mat, 1, function(x) {
+    res <- tapply(x, sub$Bin, mean, na.rm = TRUE)
+    # Ensure all bins 1:n_bins are present
+    full_res <- setNames(rep(NA, n_bins), 1:n_bins)
+    full_res[names(res)] <- res
+    return(full_res)
+  }))
+  
+  # Interpolate missing bins (safety)
+  bin_means <- t(apply(bin_means, 1, function(x) {
+    if (all(is.na(x))) return(rep(0, n_bins))
+    zoo::na.approx(x, xout = 1:n_bins, na.rm = FALSE, rule = 2)
+  }))
+  
+  # Smooth using sliding window (zoo::rollapply)
+  bin_smoothed <- t(apply(bin_means, 1, function(x) {
+    zoo::rollapply(x, width = window, FUN = mean, fill = "extend")
+  }))
+  
+  colnames(bin_smoothed) <- 1:n_bins
+  return(bin_smoothed)
+}
+
+message("Calculating smoothed profiles for Mutant...")
+mutant_profiles <- get_smoothed_profiles(combined, "Mutant", var_genes)
+
+message("Calculating smoothed profiles for WT...")
+wt_profiles <- get_smoothed_profiles(combined, "WT", var_genes)
+```
+
+## 4. Comparison Heatmaps
+Visualizing the spatial transitions across the gut for both experiments.
+
+```{r spatial_heatmaps, fig.width=14, fig.height=11}
+# 1. Identify Genes of Interest
+gene_var <- apply(wt_profiles, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:60]
+
+# 2. Derive Gene Ordering based on WT Peak Position
+peak_pos <- apply(wt_profiles[top_genes, ], 1, which.max)
+ordered_genes <- names(sort(peak_pos))
+
+# 3. Disruption Scoring with Shift Compensation (20% Window)
+# We account for gut length heterogeneity by searching for the best spatial alignment
+# within a +/- 20 bin window (20% of the gut axis).
+calculate_disruption <- function(wt_prof, mut_prof, window = 10) {
+  n <- length(wt_prof)
+  corrs <- sapply(-window:window, function(s) {
+    # Define overlapping ranges
+    wt_range <- max(1, 1+s):min(n, n+s)
+    mut_range <- max(1, 1-s):min(n, n-s)
+    
+    if (length(wt_range) < 20) return(-1) # Require sufficient overlap
+    cor(wt_prof[wt_range], mut_prof[mut_range], method = "spearman")
+  })
+  return(max(corrs, na.rm = TRUE))
+}
+
+message("Calculating shift-compensated disruption scores...")
+disruption_scores <- sapply(ordered_genes, function(g) {
+  calculate_disruption(wt_profiles[g, ], mutant_profiles[g, ], window = 10)
+})
+
+# Define "Disrupted" status (e.g., Correlation < 0.5)
+# This flags genes whose expression pattern is intrinsically different, not just shifted.
+is_disrupted <- disruption_scores < 0.5
+disrupted_genes <- names(is_disrupted)[is_disrupted]
+
+# 4. Prepare Heatmap Data and Annotations
+scale_rows <- function(x) t(apply(x, 1, function(y) {
+  if(sd(y) == 0) return(rep(0, length(y)))
+  (y - mean(y)) / sd(y)
+}))
+
+wt_plot <- scale_rows(wt_profiles[ordered_genes, ])
+mutant_plot <- scale_rows(mutant_profiles[ordered_genes, ])
+
+# Row annotation for disruption status
+anno_row <- data.frame(Status = ifelse(is_disrupted, "Disrupted", "Stable"))
+rownames(anno_row) <- ordered_genes
+anno_colors <- list(Status = c(Disrupted = "#E41A1C", Stable = "#4DAF4A"))
+
+# 5. Generate Heatmaps
+col_palette <- colorRampPalette(c("#440154", "#21908C", "#FDE725"))(100) # Viridis
+break_val <- seq(-2, 2, length.out = 101)
+
+# WT Heatmap
+p_wt_obj <- pheatmap(wt_plot, cluster_rows = FALSE, cluster_cols = FALSE, 
+                    show_colnames = FALSE, annotation_row = anno_row,
+                    annotation_colors = anno_colors, main = "WT (Gut 3) - Peak Ordered",
+                    color = col_palette, breaks = break_val, silent = TRUE)
+
+# Mutant Heatmap
+p_mut_obj <- pheatmap(mutant_plot, cluster_rows = FALSE, cluster_cols = FALSE, 
+                     show_colnames = FALSE, annotation_row = anno_row,
+                     annotation_colors = anno_colors, main = "Mutant (Gut 1) - Synchronized",
+                     color = col_palette, breaks = break_val, silent = TRUE)
+
+# --- Post-processing to color disrupted gene labels RED ---
+customize_labels <- function(p_obj, disrupted_list, all_genes) {
+  g <- p_obj$gtable
+  # Find the row names grob
+  rn_idx <- which(g$layout$name == "row_names")
+  if (length(rn_idx) > 0) {
+    # Update colors in gp (graphical parameters)
+    g$grobs[[rn_idx]]$gp$col <- ifelse(all_genes %in% disrupted_list, "#E41A1C", "black")
+    # Make disrupted labels bold as well for extra emphasis
+    g$grobs[[rn_idx]]$gp$fontface <- ifelse(all_genes %in% disrupted_list, "bold", "plain")
+  }
+  return(g)
+}
+
+p_wt_final <- customize_labels(p_wt_obj, disrupted_genes, ordered_genes)
+p_mut_final <- customize_labels(p_mut_obj, disrupted_genes, ordered_genes)
+
+# Display Side-by-Side
+grid.arrange(p_wt_final, p_mut_final, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/Spatial_Disruption_Heatmap.png", width = 1600, height = 1200, res = 150)
+grid.arrange(p_wt_final, p_mut_final, ncol = 2)
+dev.off()
+```
+
+## 4b. Cell Type Marker Comparison Heatmaps
+Visualizing the spatial transitions of known cell type markers across the gut.
+
+```{r celltype_marker_heatmaps, fig.width=14, fig.height=14}
+# 1. Define Cell Type Markers (10 per cluster)
+marker_genes_list <- list(
+  aEC    = c("CG12374", "tobi", "Mal-A6", "CG13324", "betaTry", "Amy-p", "Amy-d", "CG5107", "CG6295", "LysD"),
+  mEC    = c("CG9682", "CG18404", "CG10477", "Peritrophin-15a", "thetaTry", "Gs1", "CG15423", "CG6277", "Tsp42Ec", "CG17109"),
+  pEC    = c("CG33306", "lambdaTry", "CG18585", "LManII", "LManVI", "CG7968", "CG7381", "Mal-A3"),
+  Copper = c("CG31446", "Vha100-4", "CG8661", "CG31663", "CG5767", "CG30479", "CG6901", "CG5770"),
+  LFC    = c("Jon66Ci", "CG8562", "Jon65Aii", "Jon25Biii", "CG17571", "CG11912", "CG8560", "CG11911", "CG10472"),
+  EE     = c("AstA", "IA-2", "CG4577", "AstC", "CCHa1", "CG34386", "fry", "CG9568", "cher", "CG7298")
+)
+
+# Flatten list and filter for genes present in both profile matrices
+all_markers <- unlist(marker_genes_list)
+all_markers <- all_markers[all_markers %in% rownames(wt_profiles) & all_markers %in% rownames(mutant_profiles)]
+all_markers <- unique(all_markers)
+
+message(paste("Using", length(all_markers), "cell type markers for comparison."))
+
+# 2. Derive Gene Ordering based on WT Peak Position
+peak_pos_markers <- apply(wt_profiles[all_markers, ], 1, which.max)
+ordered_markers <- names(sort(peak_pos_markers))
+
+# 3. Prepare Heatmap Data
+wt_plot_m <- scale_rows(wt_profiles[ordered_markers, ])
+mutant_plot_m <- scale_rows(mutant_profiles[ordered_markers, ])
+
+# 4. Row Annotation for Cell Types
+# Map each gene to its original cluster from marker_genes_list
+marker_to_cluster <- stack(marker_genes_list)
+colnames(marker_to_cluster) <- c("gene", "CellType")
+anno_row_m <- marker_to_cluster[match(ordered_markers, marker_to_cluster$gene), "CellType", drop = FALSE]
+rownames(anno_row_m) <- ordered_markers
+
+# 5. Generate Heatmaps
+p_wt_m_obj <- pheatmap(wt_plot_m, cluster_rows = FALSE, cluster_cols = FALSE, 
+                      show_colnames = FALSE, annotation_row = anno_row_m,
+                      main = "WT (Gut 3) - Cell Type markers (Peak Ordered)",
+                      color = col_palette, breaks = break_val, silent = TRUE)
+
+p_mut_m_obj <- pheatmap(mutant_plot_m, cluster_rows = FALSE, cluster_cols = FALSE, 
+                       show_colnames = FALSE, annotation_row = anno_row_m,
+                       main = "Mutant (Gut 1) - Cell Type markers (Synchronized)",
+                       color = col_palette, breaks = break_val, silent = TRUE)
+
+# Show side-by-side
+grid.arrange(p_wt_m_obj$gtable, p_mut_m_obj$gtable, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/CellType_Marker_Disruption_Heatmap.png", width = 1800, height = 1500, res = 150)
+grid.arrange(p_wt_m_obj$gtable, p_mut_m_obj$gtable, ncol = 2)
+dev.off()
+```
+
+## 4b-ii. Specific Marker Comparison (mEC/Copper and LFC)
+Focused visualization for 10 specific markers from mEC/Copper and LFC populations.
+
+```{r specific_marker_heatmaps, fig.width=14, fig.height=8}
+# 1. Define Selected Markers
+selected_markers <- c(
+  "CG9682", "CG18404", "CG31446", "Vha100-4", "CG8661", # mEC / Copper
+  "Jon66Ci", "CG8562", "Jon65Aii", "Jon25Biii", "CG17571" # LFC
+)
+
+# Filter for genes present in both profile matrices
+selected_markers <- selected_markers[selected_markers %in% rownames(wt_profiles) & selected_markers %in% rownames(mutant_profiles)]
+
+# 2. Derive Gene Ordering based on WT Peak Position
+peak_pos_sel <- apply(wt_profiles[selected_markers, ], 1, which.max)
+ordered_sel <- names(sort(peak_pos_sel))
+
+# 3. Calculate Disruption Scores
+max_shift_sel <- 10
+disruption_sel <- sapply(ordered_sel, function(g) {
+  w <- wt_profiles[g, ]
+  m <- mutant_profiles[g, ]
+  
+  cor_vals <- sapply(-max_shift_sel:max_shift_sel, function(s) {
+    if(s == 0) return(cor(w, m, method = "spearman"))
+    if(s > 0) return(cor(w[(s+1):length(w)], m[1:(length(m)-s)], method = "spearman"))
+    if(s < 0) return(cor(w[1:(length(w)+s)], m[(-s+1):length(m)], method = "spearman"))
+  })
+  max(cor_vals, na.rm = TRUE)
+})
+
+is_disrupted_sel <- disruption_sel < 0.5
+disrupted_sel_genes <- names(is_disrupted_sel)[is_disrupted_sel]
+
+# 4. Prepare Heatmap Data
+wt_plot_sel <- scale_rows(wt_profiles[ordered_sel, ])
+mutant_plot_sel <- scale_rows(mutant_profiles[ordered_sel, ])
+
+# 5. Generate Heatmaps
+p_wt_sel_obj <- pheatmap(wt_plot_sel, cluster_rows = FALSE, cluster_cols = FALSE, 
+                       show_colnames = FALSE, main = "WT (Gut 3) - Specific Markers (Peak Ordered)",
+                       color = col_palette, breaks = break_val, silent = TRUE)
+
+p_mut_sel_obj <- pheatmap(mutant_plot_sel, cluster_rows = FALSE, cluster_cols = FALSE, 
+                        show_colnames = FALSE, main = "Mutant (Gut 1) - Specific Markers (Synchronized)",
+                        color = col_palette, breaks = break_val, silent = TRUE)
+
+# Apply red labels to disrupted genes
+p_wt_sel_final <- customize_labels(p_wt_sel_obj, disrupted_sel_genes, ordered_sel)
+p_mut_sel_final <- customize_labels(p_mut_sel_obj, disrupted_sel_genes, ordered_sel)
+
+# Show side-by-side
+grid.arrange(p_wt_sel_final, p_mut_sel_final, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/Specific_Markers_Heatmap.png", width = 1600, height = 800, res = 150)
+grid.arrange(p_wt_sel_final, p_mut_sel_final, ncol = 2)
+dev.off()
+```
+
+## 4c. Transcription Factor Comparison Heatmaps
+Visualizing the spatial transitions of regionalized Transcription Factors (TFs) and highlighting potential disruptions.
+
+```{r tf_comparison_heatmaps, fig.width=14, fig.height=14}
+# 1. Define Transcription Factors (Regionalized in Drosophila Gut)
+# Based on Buchon, Dutta, Spradling and other literature
+tf_genes <- c(
+  "lab", "dve", "cad", "abd-A", "Abd-B", "cas", "hth", "exex", "fkh", 
+  "slp1", "slp2", "GATAe", "unpg", "Ptx1", "bin", "pros", "svp", "nub", 
+  "pdm3", "oc", "mirr", "caup", "B-H1", "B-H2", "sna", "esg", 
+  "Myc", "pan", "Mad", "med", "tll", "ken", "Stat92E", "Eip74EF", 
+  "Eip75B", "Hr96", "Hr38", "Hr39", "Hnf4", "vri", "CrebA", "Xbp1", 
+  "Atf3", "Jra", "kay", "srp", "grh", "sc", "ase", "sens", "D", 
+  "Sox21b", "ush", "grn", "en", "dan", "danr", "apt", "croc", "Dr", 
+  "C15", "bowl", "sob", "drm", "odd"
+)
+
+# Filter for genes present in both profile matrices
+tf_genes <- tf_genes[tf_genes %in% rownames(wt_profiles) & tf_genes %in% rownames(mutant_profiles)]
+tf_genes <- unique(tf_genes)
+
+message(paste("Using", length(tf_genes), "Transcription Factors for comparison."))
+
+# 2. Derive Gene Ordering based on WT Peak Position
+peak_pos_tf <- apply(wt_profiles[tf_genes, ], 1, which.max)
+ordered_tf <- names(sort(peak_pos_tf))
+
+# 3. Calculate Disruption Scores (Shift-compensated Correlation)
+# Same logic as step 4
+max_shift <- 10
+sync_scores_tf <- sapply(ordered_tf, function(g) {
+  w <- wt_profiles[g, ]
+  m <- mutant_profiles[g, ]
+  
+  cor_vals <- sapply(-max_shift:max_shift, function(s) {
+    if(s == 0) return(cor(w, m, method = "spearman"))
+    if(s > 0) return(cor(w[(s+1):length(w)], m[1:(length(m)-s)], method = "spearman"))
+    if(s < 0) return(cor(w[1:(length(w)+s)], m[(-s+1):length(m)], method = "spearman"))
+  })
+  max(cor_vals, na.rm = TRUE)
+})
+
+# Identify Disrupted TFs (Threshold 0.5)
+disrupted_tf <- names(sync_scores_tf[sync_scores_tf < 0.5])
+message(paste("Identified", length(disrupted_tf), "disrupted TFs."))
+
+# 4. Prepare Heatmap Data
+wt_plot_tf <- scale_rows(wt_profiles[ordered_tf, ])
+mutant_plot_tf <- scale_rows(mutant_profiles[ordered_tf, ])
+
+# 5. Global Heatmap Visualization
+# WT Heatmap
+p_wt_tf <- pheatmap(wt_plot_tf, cluster_rows = FALSE, cluster_cols = FALSE, 
+                   show_colnames = FALSE, main = "WT (Gut 3) - Transcription Factors",
+                   color = col_palette, breaks = break_val, silent = TRUE)
+
+# Mutant Heatmap - Underline Disrupted Genes in red
+row_colors_tf <- rep("black", length(ordered_tf))
+row_colors_tf[ordered_tf %in% disrupted_tf] <- "red"
+
+p_mut_tf <- pheatmap(mutant_plot_tf, cluster_rows = FALSE, cluster_cols = FALSE, 
+                    show_colnames = FALSE, main = "Mutant (Gut 1) - Transcription Factors",
+                    color = col_palette, breaks = break_val, silent = TRUE)
+
+# Apply red labels to Mutant heatmap
+p_mut_tf$gtable$grobs[[which(p_mut_tf$gtable$layout$name == "row_names")]]$gp$col <- row_colors_tf
+
+# Show side-by-side
+grid.arrange(p_wt_tf$gtable, p_mut_tf$gtable, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/TF_Regional_Heatmap.png", width = 1800, height = 1500, res = 150)
+grid.arrange(p_wt_tf$gtable, p_mut_tf$gtable, ncol = 2)
+dev.off()
+```
+
+## 4d. Signaling Pathway Activity Heatmaps (Collapsed)
+Visualizing collapsed activity scores for ligands and receptors across key signaling pathways.
+
+```{r signaling_activity_heatmaps, fig.width=14, fig.height=10}
+# 1. Define Ligands and Receptors for each pathway (Drosophila Gut)
+# We aim for ~5 each where biologically applicable
+pathway_components <- list(
+  Wnt_Ligands      = c("wg", "Wnt2", "Wnt4", "Wnt5", "Wnt10"),
+  Wnt_Receptors    = c("fz", "fz2", "fz3", "fz4", "arr"),
+  
+  JAK_STAT_Ligands = c("upd1", "upd2", "upd3"), # Only 3 main ligands
+  JAK_STAT_Receptors = c("dome"),              # 1 main receptor
+  
+  BMP_Ligands      = c("dpp", "gbb", "scw", "daw", "mav"),
+  BMP_Receptors    = c("tkv", "sax", "put", "wit", "babo"),
+  
+  Hippo_Ligands    = c("ds", "ft", "fj", "crb", "app"),
+  Hippo_Receptors  = c("ex", "mer", "kibra", "sav", "hpo"), # Scaffold/Receptor-like
+  
+  EGFR_Ligands     = c("spi", "vn", "krn", "grk"),
+  EGFR_Receptors   = c("egfr"),
+  
+  JNK_Ligands      = c("egr"),
+  JNK_Receptors    = c("grnd", "wgn")
+)
+
+# Helper function to calculate a "Collapsed Activity Score"
+get_collapsed_activity <- function(profiles, gene_list) {
+  # Filter for present genes
+  valid <- gene_list[gene_list %in% rownames(profiles)]
+  if(length(valid) == 0) return(rep(0, ncol(profiles)))
+  
+  # Scale each gene 0-1 across its profile to ensure equal contribution to "activity"
+  scaled_mat <- t(apply(profiles[valid, , drop=FALSE], 1, function(x) {
+    if(max(x) == min(x)) return(rep(0, length(x)))
+    (x - min(x)) / (max(x) - min(x))
+  }))
+  
+  # Return average
+  colMeans(scaled_mat)
+}
+
+# 2. Calculate Activity Matrices
+activity_wt <- do.call(rbind, lapply(pathway_components, function(gl) get_collapsed_activity(wt_profiles, gl)))
+activity_mut <- do.call(rbind, lapply(pathway_components, function(gl) get_collapsed_activity(mutant_profiles, gl)))
+
+rownames(activity_wt) <- names(pathway_components)
+rownames(activity_mut) <- names(pathway_components)
+
+# 3. Order Pathways by Peak Position in WT
+peak_pos_act <- apply(activity_wt, 1, which.max)
+ordered_act <- names(sort(peak_pos_act))
+
+# 4. Prepare Heatmap Visualization
+# Annotation for Pathway Type (Ligand vs Receptor)
+anno_row_act <- data.frame(
+  Type = ifelse(grepl("Ligands", ordered_act), "Ligand", "Receptor"),
+  Pathway = gsub("_Ligands|_Receptors", "", ordered_act)
+)
+rownames(anno_row_act) <- ordered_act
+
+# Plot WT
+p_wt_act <- pheatmap(activity_wt[ordered_act, ], cluster_rows = FALSE, cluster_cols = FALSE,
+                    show_colnames = FALSE, annotation_row = anno_row_act,
+                    main = "WT (Gut 3) - Signaling Activity (Collapsed)",
+                    color = col_palette, breaks = break_val, silent = TRUE)
+
+# Plot Mutant
+p_mut_act <- pheatmap(activity_mut[ordered_act, ], cluster_rows = FALSE, cluster_cols = FALSE,
+                     show_colnames = FALSE, annotation_row = anno_row_act,
+                     main = "Mutant (Gut 1) - Signaling Activity (Collapsed)",
+                     color = col_palette, breaks = break_val, silent = TRUE)
+
+# Show side-by-side
+grid.arrange(p_wt_act$gtable, p_mut_act$gtable, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/Signaling_Activity_Collapsed_Heatmap.png", width = 1800, height = 1200, res = 150)
+grid.arrange(p_wt_act$gtable, p_mut_act$gtable, ncol = 2)
+dev.off()
+```
+
+## 4e. TF Regulatory Network Comparison Heatmaps
+Visualizing the collapsed activity scores for major Transcription Factor (TF) regulons.
+
+```{r tf_regulon_heatmaps, fig.width=14, fig.height=10}
+# 1. Define TF Regulons (Targets from literature: Dutta, Buchon, Hung)
+regulons <- list(
+  lab_Regulon = c("lab", "dpp", "tkR86C", "betaTry", "alphaTry", "Jon66C", "Jon66Ci", "Jon66Cii", "Met71E", "LMan4", "Vha100-4", "Amy-p", "CG13321", "CG3106"),
+  dve_Regulon = c("dve", "mag", "GstE1", "Mal-A1", "Jon99C", "Ptx1", "CREG1", "apt", "Idgf1", "Idgf2", "Idgf3", "GstE9", "Mur11D", "lectin-46Ca", "Hnf4"),
+  cad_Regulon = c("cad", "byn", "fkh", "odd", "Wnt5", "Hn", "Cyp18a1", "mthl7", "GstT2", "Try29F", "Jon25B", "abd-A", "Abd-B"),
+  fkh_Regulon = c("fkh", "cad", "byn", "odd", "ct", "Wnt5", "Hn", "Cyp18a1", "GstT2", "lambdaTry"),
+  nub_Regulon = c("nub", "AttA", "AttB", "DptA", "DptB", "Mtk", "Drs", "cas", "svp", "Idgf4", "Idgf6", "GstD2"),
+  hth_Regulon = c("hth", "Ance", "Vha100-4", "Vha16-1", "VhaAC39", "CG3106", "CG3121", "alpha-Est1", "ex", "ds", "dp"),
+  svp_Regulon = c("svp", "Hnf4", "dve", "kn", "pros", "Pka-C1", "CG14687", "Idgf1"),
+  cas_Regulon = c("cas", "nub", "svp", "grh", "dimm", "Dll")
+)
+
+# 2. Calculate Regulon Activity Matrices (Averaging 0-1 scaled target profiles)
+reg_activity_wt <- do.call(rbind, lapply(regulons, function(gl) get_collapsed_activity(wt_profiles, gl)))
+reg_activity_mut <- do.call(rbind, lapply(regulons, function(gl) get_collapsed_activity(mutant_profiles, gl)))
+
+rownames(reg_activity_wt) <- names(regulons)
+rownames(reg_activity_mut) <- names(regulons)
+
+# 3. Order Regulons by Peak Position in WT
+reg_peak_pos <- apply(reg_activity_wt, 1, which.max)
+reg_ordered <- names(sort(reg_peak_pos))
+
+# 4. Generate Heatmaps
+p_wt_reg <- pheatmap(reg_activity_wt[reg_ordered, ], cluster_rows = FALSE, cluster_cols = FALSE,
+                    show_colnames = FALSE, main = "WT (Gut 3) - TF Regulon Activity (Collapsed)",
+                    color = col_palette, breaks = break_val, silent = TRUE)
+
+p_mut_reg <- pheatmap(reg_activity_mut[reg_ordered, ], cluster_rows = FALSE, cluster_cols = FALSE,
+                     show_colnames = FALSE, main = "Mutant (Gut 1) - TF Regulon Activity (Collapsed)",
+                     color = col_palette, breaks = break_val, silent = TRUE)
+
+# Show side-by-side
+grid.arrange(p_wt_reg$gtable, p_mut_reg$gtable, ncol = 2)
+
+# Save Comparison
+png("../figures/spatial_profile/TF_Regulon_Activity_Heatmap.png", width = 1800, height = 1200, res = 150)
+grid.arrange(p_wt_reg$gtable, p_mut_reg$gtable, ncol = 2)
+dev.off()
+```
+
+## 5. Target Gene Comparison
+Comparison of individual genes along the Anterior-Posterior axis.
+
+```{r target_gene_plot, fig.width=10, fig.height=6}
+plot_spatial_comparison <- function(seurat_obj, gene_name) {
+  if (!gene_name %in% rownames(seurat_obj)) {
+    message(paste("Gene", gene_name, "not found in dataset."))
+    return(NULL)
+  }
+  
+  # Get expression from the appropriate assay
+  if ("SCT" %in% names(seurat_obj@assays)) {
+    assay_to_use <- "SCT"
+  } else {
+    assay_to_use <- DefaultAssay(seurat_obj)
+  }
+  
+  plot_data <- data.frame(
+    Pseudotime = seurat_obj$Spatial_Pseudotime,
+    Expression = GetAssayData(seurat_obj, assay = assay_to_use, layer = "data")[gene_name, ],
+    Batch = seurat_obj$Batch
+  )
+  
+  p <- ggplot(plot_data, aes(x = Pseudotime, y = Expression, color = Batch)) +
+    geom_point(alpha = 0.1, size = 0.5) +
+    geom_smooth(method = "loess", span = 0.25, linewidth = 1.2) +
+    scale_color_manual(values = c("Mutant" = "#E41A1C", "WT" = "#377EB8")) +
+    theme_classic(base_size = 14) +
+    labs(title = paste("Spatial Expression Profile:", gene_name),
+         subtitle = paste("Comparison using", assay_to_use, "Corrected Data"),
+         x = "Spatial Pseudotime (Anterior -> Posterior)",
+         y = "Normalized Expression") +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "bottom")
+  
+  return(p)
+}
+
+# Example gene: fz3 (replace with gene of interest)
+target_gene <- "fz3" # This is often differentially expressed in these experiments
+p_fz3 <- plot_spatial_comparison(combined, target_gene)
+
+if (!is.null(p_fz3)) {
+  ggsave(paste0("../figures/spatial_profile/Comparison_", target_gene, ".png"), 
+         p_fz3, width = 10, height = 6)
+  p_fz3
+}
+```
+
+## 6. Spatial Heatmaps (Uncorrected)
+To assess the impact of batch effect removal, we visualize the spatial profiles using normalized but uncorrected expression data from the original `Segmented` assay.
+
+```{r uncorrected_heatmaps, fig.width=14, fig.height=10}
+# 1. Prepare Uncorrected Normalized Data
+# We run NormalizeData on the Segmented assay (without Batch regression)
+combined <- NormalizeData(combined, assay = "Segmented", verbose = FALSE)
+
+# 2. Calculate Uncorrected Smoothed Profiles
+# We force use of the "Segmented" assay to see the effect of missing correction
+message("Calculating uncorrected profiles for Mutant...")
+mutant_profiles_uncorr <- get_smoothed_profiles(combined, "Mutant", ordered_genes, assay = "Segmented")
+
+message("Calculating uncorrected profiles for WT...")
+wt_profiles_uncorr <- get_smoothed_profiles(combined, "WT", ordered_genes, assay = "Segmented")
+
+# 3. Scaling and Z-score for Heatmaps
+wt_plot_uncorr <- scale_rows(wt_profiles_uncorr)
+mutant_plot_uncorr <- scale_rows(mutant_profiles_uncorr)
+
+# 4. Generate Heatmaps
+p_wt_uncorr <- pheatmap(wt_plot_uncorr, 
+                        cluster_rows = FALSE, cluster_cols = FALSE, 
+                        show_colnames = FALSE,
+                        main = "WT (Gut 3) - Uncorrected", 
+                        color = col_palette,
+                        breaks = break_val, 
+                        silent = TRUE)$gtable
+
+p_mutant_uncorr <- pheatmap(mutant_plot_uncorr, 
+                            cluster_rows = FALSE, cluster_cols = FALSE, 
+                            show_colnames = FALSE,
+                            main = "Mutant (Gut 1) - Uncorrected", 
+                            color = col_palette,
+                            breaks = break_val, 
+                            silent = TRUE)$gtable
+
+# Combine and Display
+grid.arrange(p_wt_uncorr, p_mutant_uncorr, ncol = 2)
+
+# Save the uncorrected comparison
+png("../figures/spatial_profile/Spatial_Uncorrected_Peak_Heatmap.png", width = 1400, height = 1100, res = 150)
+grid.arrange(p_wt_uncorr, p_mutant_uncorr, ncol = 2)
+dev.off()
+```
+## 7. Slide 6 Control Comparison (WT + GFP/Cas9 vs WT)
+This section replicates the Section 4 logic for the Slide 6 control, providing a baseline for Cas9/GFP expression effects.
+
+```{r cas9_comparison, fig.width=14, fig.height=11}
+# --- A. Batch Correction (Slide 6 Gut 1 vs WT) ---
+# Create fresh subset of WT Gut 3 to avoid conflicting metadata from Section 2
+gut3_111125_cas9 <- subset(merged_111125, cells = gut3_cells_111125)
+gut3_111125_cas9 <- subset(gut3_111125_cas9, cells = Cells(gut3_111125_cas9)[!grepl("ambiguous", gut3_111125_cas9$Predicted_CellType, ignore.case = TRUE)])
+
+# Remove images
+for (img in Images(gut1_slide6)) gut1_slide6[[img]] <- NULL
+for (img in Images(gut3_111125_cas9)) gut3_111125_cas9[[img]] <- NULL
+
+combined_cas9 <- merge(gut1_slide6, gut3_111125_cas9, add.cell.ids = c("Cas9", "WT"))
+combined_cas9$Batch <- ifelse(grepl("^Cas9_", Cells(combined_cas9)), "Cas9", "WT")
+
+combined_cas9 <- JoinLayers(combined_cas9)
+message("Batch correcting Slide 6 vs WT...")
+combined_cas9 <- SCTransform(combined_cas9, assay = "Segmented", vars.to.regress = "Batch", verbose = FALSE)
+combined_cas9 <- RunPCA(combined_cas9, npcs = 30, verbose = FALSE)
+combined_cas9 <- RunHarmony(combined_cas9, group.by.vars = "Batch", reduction.use = "pca", dims.use = 1:20, plot_convergence = FALSE)
+
+# --- B. Profiling ---
+combined_cas9$Bin <- cut(combined_cas9$Spatial_Pseudotime, breaks = 100, labels = FALSE)
+
+# Filter var_genes to only those present in the combined_cas9 object
+genes_to_plot_cas9 <- var_genes[var_genes %in% rownames(combined_cas9)]
+if (length(genes_to_plot_cas9) < length(var_genes)) {
+  message(paste("Note: Filtering from", length(var_genes), "to", length(genes_to_plot_cas9), "genes present in Slide 6."))
+}
+
+cas9_profiles <- get_smoothed_profiles(combined_cas9, "Cas9", genes_to_plot_cas9)
+wt_profiles_cas9 <- get_smoothed_profiles(combined_cas9, "WT", genes_to_plot_cas9)
+
+# Update ordered_genes to only those present
+ordered_genes_cas9 <- ordered_genes[ordered_genes %in% genes_to_plot_cas9]
+message(paste("Using", length(ordered_genes_cas9), "of 60 top genes for synchronized heatmap."))
+
+# --- C. Disruption Scoring ---
+message("Calculating disruption scores for Cas9/GFP Control...")
+disruption_cas9 <- sapply(ordered_genes_cas9, function(g) {
+  calculate_disruption(wt_profiles_cas9[g, ], cas9_profiles[g, ], window = 20)
+})
+
+is_disrupted_cas9 <- disruption_cas9 < 0.5
+disrupted_cas9_genes <- names(is_disrupted_cas9)[is_disrupted_cas9]
+
+# --- D. Heatmaps ---
+wt_plot_cas9 <- scale_rows(wt_profiles_cas9[ordered_genes_cas9, ])
+cas9_plot_c <- scale_rows(cas9_profiles[ordered_genes_cas9, ])
+
+anno_row_cas9 <- data.frame(Status = ifelse(is_disrupted_cas9, "Disrupted", "Stable"))
+rownames(anno_row_cas9) <- ordered_genes_cas9
+
+p_wt_cas9_obj <- pheatmap(wt_plot_cas9, cluster_rows = FALSE, cluster_cols = FALSE, 
+                        show_colnames = FALSE, annotation_row = anno_row_cas9,
+                        annotation_colors = anno_colors, main = "WT (Gut 3) - Peak Ordered",
+                        color = col_palette, breaks = break_val, silent = TRUE)
+
+p_cas9_obj_c <- pheatmap(cas9_plot_c, cluster_rows = FALSE, cluster_cols = FALSE, 
+                       show_colnames = FALSE, annotation_row = anno_row_cas9,
+                       annotation_colors = anno_colors, main = "Control (WT+Cas9/GFP) - Synchronized",
+                       color = col_palette, breaks = break_val, silent = TRUE)
+
+p_wt_cas9_final <- customize_labels(p_wt_cas9_obj, disrupted_cas9_genes, ordered_genes_cas9)
+p_cas9_final <- customize_labels(p_cas9_obj_c, disrupted_cas9_genes, ordered_genes_cas9)
+
+# Display and Save
+grid.arrange(p_wt_cas9_final, p_cas9_final, ncol = 2)
+
+png("../figures/spatial_profile/Spatial_Disruption_Heatmap_Cas9.png", width = 1600, height = 1200, res = 150)
+grid.arrange(p_wt_cas9_final, p_cas9_final, ncol = 2)
+dev.off()
+```

@@ -1,0 +1,331 @@
+---
+title: "LFC Sub-Cluster Analysis & Similarity Mapping"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(htmlwidgets)
+library(pheatmap)
+```
+
+## 1. Load Data
+```{r load_data}
+path_sc <- "../Random data/sc_with_spatial_scores.rds"
+if(!file.exists(path_sc)) stop("Cannot locate single-cell object at ", path_sc)
+
+cat("Loading Single Cell Object...\n")
+sc_obj <- readRDS(path_sc)
+
+# Verify spatial data is present
+if (!"Smoothed_Pseudotime" %in% colnames(sc_obj@meta.data)) {
+  warning("Smoothed_Pseudotime not found in metadata. Defaulting to Transferred_Pseudotime if available.")
+  if ("Transferred_Pseudotime" %in% colnames(sc_obj@meta.data)) {
+    sc_obj$Smoothed_Pseudotime <- sc_obj$Transferred_Pseudotime
+  } else {
+    stop("No spatial pseudotime found in the Seurat object.")
+  }
+}
+
+# Subset for LFCs purely based on prior cell classifications
+# Using the user-confirmed 'celltype' metadata column
+lfc_cells <- subset(sc_obj, subset = celltype == "LFC")
+cat("Isolated", ncol(lfc_cells), "LFC cells out of", ncol(sc_obj), "total cells.\n")
+```
+
+## 2. Re-Clustering & 3D UMAP Generation
+We re-process the LFC subset uniquely and generate a 3-dimensional UMAP to visualize the structural divide between the distinct populations.
+
+```{r clustering_3d}
+# Instead of re-running PCA and UMAP, we retain the global transcription space
+# inherited from the full single-cell dataset. This ensures clustering uses the global context.
+
+# Cluster directly on the global PCA space. 
+# Increase k.param slightly and lower resolution to limit to ~3 clusters
+lfc_cells <- FindNeighbors(lfc_cells, reduction = "pca", dims = 1:20, k.param = 15)
+
+# Moderate resolution to capture the main splits (approx 3 clusters)
+lfc_cells <- FindClusters(lfc_cells, resolution = 0.5)
+
+# Extract rendering coordinates and inject Space as the 3rd Dimension
+umap_coords <- as.data.frame(Embeddings(lfc_cells, "umap"))
+umap_coords$Space <- lfc_cells$Smoothed_Pseudotime
+umap_coords$Cluster <- as.character(lfc_cells$seurat_clusters)
+
+# Define global output directory constraints
+dir.create("../figures/LFC_Analysis", recursive=TRUE, showWarnings=FALSE)
+
+cat("✓ Re-clustering complete. Defined", length(unique(lfc_cells$seurat_clusters)), "clusters natively.\n")
+
+# 3D Plot for Cluster Imputation (2 Genetic + 1 Spatial Phase)
+p_3d_cluster <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Cluster, colors = c("#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B4", "#91D1C2"),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "LFC Sub-Clusters (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_cluster, file = "../figures/LFC_Analysis/3D_UMAP_LFC_Clusters.html")
+p_3d_cluster
+```
+
+```{r analysis}
+## 3. 3D UMAP Feature Projections
+# Visualizing top driving phenotypic parameters (such as structural layout spatiality) directly across the 3D space.
+
+p_3d_feature <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Space, colors = colorRamp(c("navy", "yellow", "firebrick3")),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "LFC Spatial Topography (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_feature, file = "../figures/LFC_Analysis/3D_Hybrid_LFC_Pseudotime.html")
+p_3d_feature
+```
+
+## 4. Differential Gene Expression (DGE) 
+Identifying the unique transcription boundaries pushing the limits of the detected pools.
+
+```{r dge_analysis}
+Idents(lfc_cells) <- "seurat_clusters"
+cat("Running FindAllMarkers to isolate distinct expression limits...\n")
+
+lfc_markers <- FindAllMarkers(lfc_cells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top_lfc <- lfc_markers %>% group_by(cluster) %>% slice_max(n = 15, order_by = avg_log2FC)
+
+write.csv(lfc_markers, "../figures/LFC_Analysis/LFC_Cluster_DGE.csv", row.names=FALSE)
+
+cat("\n--- TOP DIFFERENTIAL MARKERS ---\n")
+library(knitr)
+# Safely handle potential empty marker results
+if(nrow(top_lfc) > 0) {
+    print(kable(top_lfc %>% dplyr::select(cluster, gene, avg_log2FC, p_val_adj), format="pipe"))
+} else {
+    cat("No significant markers found for the current clusters.\n")
+}
+```
+
+## 5. Global Celltype Similarity Matrix
+Computing average expression profiles seamlessly across all functional cell classes inside the original dataset to trace where the specific isolated LFC clusters map.
+
+```{r similarity_matrix, fig.width=10, fig.height=8}
+# Re-integrate the newly modeled LFC identities into the master dataset structurally
+sc_obj$LFC_Split_Identity <- as.character(sc_obj$celltype)
+
+# Safely swap purely the LFC cells for their new structurally defined IDs
+new_ids <- paste0("LFC_Subcluster_", lfc_cells$seurat_clusters)
+sc_obj$LFC_Split_Identity[Cells(lfc_cells)] <- new_ids
+
+Idents(sc_obj) <- "LFC_Split_Identity"
+
+cat("Computing holistic AverageExpression arrays across all structural lineages...\n")
+# Get current default assay to be safe
+def_assay <- DefaultAssay(sc_obj)
+avg_exp <- AverageExpression(sc_obj, assays = def_assay)
+
+# Extract the matrix from the list (Seurat V4/V5 returns a list of matrices)
+if (is.list(avg_exp)) {
+    exp_matrix <- as.matrix(avg_exp[[1]])
+} else {
+    exp_matrix <- as.matrix(avg_exp)
+}
+
+# Ensure there are no NA/Inf values which break correlation
+exp_matrix[is.na(exp_matrix)] <- 0
+
+cat("Calculating Pearson correlation matrix on assay:", names(avg_exp)[1], "\n")
+sim_matrix <- cor(exp_matrix, method = "pearson")
+
+# Trim generic uninformative or ambiguous arrays before plotting
+valid_cols <- !grepl("ambiguous|unknown", colnames(sim_matrix), ignore.case=TRUE)
+clean_matrix <- sim_matrix[valid_cols, valid_cols]
+
+png("../figures/LFC_Analysis/LFC_Similarity_Heatmap.png", width=3200, height=2600, res=300)
+pheatmap(clean_matrix, 
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         display_numbers = FALSE,
+         fontsize_row = 12, fontsize_col = 12,
+         main = "Global Transcriptomic Similarity Matrix (Pearson)")
+dev.off()
+
+# Print inline for the RMarkdown
+pheatmap(clean_matrix, 
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         display_numbers = FALSE,
+         fontsize_row = 12, fontsize_col = 12,
+         main = "Global Transcriptomic Similarity Matrix (Pearson)")
+
+cat("✓ Execution completed. Matrices stored securely in figures directory.\n")
+```
+
+## 5.5 Global 3D Visualization
+Visualizing the full single-cell dataset in 3D (UMAP1, UMAP2, and Smoothed_Pseudotime) to see how the local subclusters or specific cell types map globally. 
+
+```{r global_3d_viz}
+# We use the global UMAP and Spatial coordinates present in the main sc_obj.
+global_coords <- data.frame(
+  UMAP1 = Embeddings(sc_obj, "umap")[, 1],
+  UMAP2 = Embeddings(sc_obj, "umap")[, 2],
+  Space = sc_obj$Smoothed_Pseudotime,
+  CellType = as.character(sc_obj$celltype),
+  SplitIdentity = sc_obj$LFC_Split_Identity
+)
+
+# 1. Global Plot with LFC Subclusters
+p_global_split <- plot_ly(data = global_coords, 
+                          x = ~UMAP1, y = ~UMAP2, z = ~Space, 
+                          color = ~SplitIdentity, 
+                          type = "scatter3d", mode = "markers",
+                          marker = list(size = 2, opacity = 0.6)) %>%
+  layout(title = "Global 3D Space (All Cells + LFC Subclusters)",
+         scene = list(xaxis = list(title = "UMAP_1"),
+                      yaxis = list(title = "UMAP_2"),
+                      zaxis = list(title = "Smoothed Pseudotime")))
+
+htmlwidgets::saveWidget(p_global_split, file = "../figures/LFC_Analysis/3D_Global_LFC_Split.html")
+p_global_split
+
+# 2. Custom Plot: All Cells Labeled + LFC Subcluster 0 Re-assigned to 'Iron cells'
+# The user wants all cells labeled natively, but the specific LFC subcluster 0 should be renamed to "Iron cells",
+# while the rest of the LFC subclusters remain labeled simply as "LFC".
+global_coords$Custom_Label <- as.character(global_coords$CellType)
+
+# Find the specific cell barcodes that belong to LFC Subcluster 0
+lfc_subcluster_0_cells <- Cells(lfc_cells)[lfc_cells$seurat_clusters == 0]
+
+# Override their label
+# We use match() to ensure safe assignment even if ordering differs
+global_coords$Custom_Label[rownames(global_coords) %in% lfc_subcluster_0_cells] <- "Iron cells"
+
+p_global_custom <- plot_ly(data = global_coords, 
+                          x = ~UMAP1, y = ~UMAP2, z = ~Space, 
+                          color = ~Custom_Label, 
+                          type = "scatter3d", mode = "markers",
+                          marker = list(size = 2, opacity = 0.6)) %>%
+  layout(title = "Global 3D Space (LFC Subcluster 0 -> Iron cells)",
+         scene = list(xaxis = list(title = "UMAP_1"),
+                      yaxis = list(title = "UMAP_2"),
+                      zaxis = list(title = "Smoothed Pseudotime")))
+
+htmlwidgets::saveWidget(p_global_custom, file = "../figures/LFC_Analysis/3D_Global_LFC_0_is_Iron.html")
+p_global_custom
+```
+
+## 6. Gene Ontology (GO)
+We run GO Biological Process enrichment on the specific markers of each subcluster.
+```{r go_analysis, fig.width=10, fig.height=8}
+library(clusterProfiler)
+library(org.Dm.eg.db)
+
+# Run GO Enrichment using significant markers only
+lfc_markers_sig <- lfc_markers %>% filter(p_val_adj < 0.05)
+
+if (nrow(lfc_markers_sig) > 0) {
+  go_results <- compareCluster(
+    gene ~ cluster, 
+    data = lfc_markers_sig, 
+    fun = "enrichGO",
+    OrgDb = org.Dm.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+
+  if (!is.null(go_results) && nrow(as.data.frame(go_results)) > 0) {
+    # Simplify to reduce redundant terms
+    tryCatch({
+      go_results_simp <- clusterProfiler::simplify(go_results, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      
+      p_go <- dotplot(go_results_simp, showCategory = 10) + 
+        ggtitle("GO BP Enrichment: LFC Subclusters")
+      print(p_go)
+    }, error = function(e) {
+      message("Could not simplify GO terms. Plotting original results.")
+      p_go <- dotplot(go_results, showCategory = 10) + 
+        ggtitle("GO BP Enrichment: LFC Subclusters")
+      print(p_go)
+    })
+  } else {
+    message("No significant GO terms found for the subclusters.")
+  }
+} else {
+  message("Not enough significant markers for GO analysis.")
+}
+```
+
+## 7. Global DGE & GO: Iron cells vs All Other Cells
+In this section, we compare the newly defined "Iron cells" (LFC Subcluster 0) against all other cells in the dataset to define their global transcriptomic identity.
+
+```{r global_iron_dge}
+# Ensure the Custom_Label we created for plotting is added to the Seurat object
+sc_obj$Custom_Label <- global_coords$Custom_Label
+Idents(sc_obj) <- "Custom_Label"
+
+cat("Running Global DGE: 'Iron cells' vs All Other Cells...\n")
+global_iron_markers <- FindMarkers(sc_obj, ident.1 = "Iron cells", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Add gene names as a column for easier manipulation
+global_iron_markers$gene <- rownames(global_iron_markers)
+
+# Filter for significance
+global_iron_sig <- global_iron_markers %>% filter(p_val_adj < 0.05)
+
+write.csv(global_iron_sig, "../figures/LFC_Analysis/Global_Iron_Cells_vs_All_Markers.csv", row.names=FALSE)
+
+cat("\n--- TOP GLOBAL MARKERS FOR 'IRON CELLS' ---\n")
+if(nrow(global_iron_sig) > 0) {
+    top_global_iron <- global_iron_sig %>% top_n(n = 15, wt = avg_log2FC)
+    print(kable(top_global_iron %>% dplyr::select(gene, avg_log2FC, p_val_adj), format="pipe"))
+} else {
+    cat("No globally significant markers found for 'Iron cells' vs all other cells.\n")
+}
+```
+
+```{r global_iron_go, fig.width=10, fig.height=8}
+# Run standard enrichGO on the global Iron cell markers
+if (nrow(global_iron_sig) > 0) {
+  cat("Running Global GO Enrichment for 'Iron cells'...\n")
+  global_iron_go <- enrichGO(
+    gene = global_iron_sig$gene,
+    OrgDb = org.Dm.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if (!is.null(global_iron_go) && nrow(as.data.frame(global_iron_go)) > 0) {
+    tryCatch({
+      global_iron_go_simp <- clusterProfiler::simplify(global_iron_go, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      
+      p_global_iron_go <- dotplot(global_iron_go_simp, showCategory = 15) + 
+        ggtitle("Global GO BP Enrichment: Iron cells vs All Other Cells")
+      print(p_global_iron_go)
+    }, error = function(e) {
+      p_global_iron_go <- dotplot(global_iron_go, showCategory = 15) + 
+        ggtitle("Global GO BP Enrichment: Iron cells vs All Other Cells")
+      print(p_global_iron_go)
+    })
+  } else {
+    message("No significant global GO terms found for 'Iron cells'.")
+  }
+} else {
+  message("Not enough significant global markers for GO analysis.")
+}
+```

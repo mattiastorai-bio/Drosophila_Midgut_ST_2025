@@ -1,0 +1,297 @@
+---
+title: "Topological Association Analysis (SC Dataset - 03Slide4)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(dplyr)
+library(plotly)
+library(clusterProfiler)
+library(org.Dm.eg.db) 
+library(dbscan) 
+library(ggplot2)
+```
+
+## Introduction
+This script identifies topologically associated areas in the 3D midgut mesh—regions that are physically touching (low Euclidean distance) but topologically distant along the gut tube (high pseudotime distance, >15%). It clusters the contacts into unique pairs of touching segments, performs Differential Gene Expression (DGE) and Gene Ontology (GO) Enrichment, and visualizations the expression linearly.
+
+```{r load_data}
+seurat_obj_path <- "/home/mattia/Thesis/03Slide4/Random data/sc_with_spatial_scores.rds"
+mesh_cache_file <- "/home/mattia/Thesis/03Slide4/figures/3D_mesh_plots_starvation/tube_mesh_cache.rds"
+
+if (!file.exists(mesh_cache_file)) {
+  stop("Mesh cache not found. Please run plot_3D_expression_Starvation.Rmd first to generate the mesh.")
+}
+
+seurat_obj <- readRDS(seurat_obj_path)
+mesh_data <- readRDS(mesh_cache_file)
+centerline_pts <- mesh_data$centerline_pts
+```
+
+## Find Unique Contact Associations
+We look for pairs of centerline points separated by >15% of the gut length, but physically closer than the gut diameter. We cluster them in 2D pseudotime space to guarantee each association connects exactly two continuous segments.
+
+```{r find_contacts}
+# 1. Calculate pairwise Euclidean distance matrix
+coords <- as.matrix(centerline_pts[, 1:3])
+euc_dist <- as.matrix(dist(coords))
+
+# 2. Calculate pairwise Pseudotime distance matrix
+pt_dist <- as.matrix(dist(centerline_pts$pt_scale))
+
+# Find the normal gut radius
+normal_radius <- mean(centerline_pts$radius, na.rm = TRUE)
+
+# 3. Define contact pairs
+# Physically close (Euclidean distance < 2 * normal_radius)
+# Topologically distant (Pseudotime distance > 15%)
+contact_matrix <- (euc_dist < (normal_radius * 2)) & (pt_dist > 15)
+
+contact_pairs <- which(contact_matrix, arr.ind = TRUE)
+contact_pairs <- contact_pairs[contact_pairs[,1] < contact_pairs[,2], ] # Keep upper triangle
+
+if(nrow(contact_pairs) == 0) {
+  stop("No topological contacts found with current thresholds.")
+}
+
+# 4. Group into Unique Associations (2D Pseudotime Clustering)
+# Each pair has a pt1 and pt2 coordinate. Clustering these 2D points ensures 
+# we only group pairs that link the exact same two continuous segments.
+pt_coords <- data.frame(
+  pt1 = centerline_pts$pt_scale[contact_pairs[,1]],
+  pt2 = centerline_pts$pt_scale[contact_pairs[,2]]
+)
+
+# Cluster the contact links into continuous areas (using a strict 1.5% pseudotime window to enforce true continuity)
+eps_val <- 1.5 
+clusters <- dbscan::dbscan(pt_coords, eps = eps_val, minPts = 3)
+
+contact_pairs_df <- data.frame(
+  idx1 = contact_pairs[,1],
+  idx2 = contact_pairs[,2],
+  pt1 = pt_coords$pt1,
+  pt2 = pt_coords$pt2,
+  cluster = clusters$cluster
+)
+
+# Filter out noise (cluster 0)
+contact_pairs_df <- contact_pairs_df %>% filter(cluster > 0)
+num_clusters <- length(unique(contact_pairs_df$cluster))
+cat(paste("Found", num_clusters, "unique topological associations (pairs of segments).\n"))
+```
+
+## Map Cells to Contact Associations
+```{r map_cells}
+contact_regions_list <- list()
+
+for (c in unique(contact_pairs_df$cluster)) {
+  c_pairs <- contact_pairs_df %>% filter(cluster == c)
+  # A unique association is composed of exactly two segment ranges
+  seg1_range <- c(min(c_pairs$pt1), max(c_pairs$pt1))
+  seg2_range <- c(min(c_pairs$pt2), max(c_pairs$pt2))
+  contact_regions_list[[as.character(c)]] <- list(seg1 = seg1_range, seg2 = seg2_range)
+}
+
+cell_pt <- seurat_obj$Smoothed_Pseudotime
+window <- 2 # Match cells within +/- 2% pseudotime of the boundaries
+```
+
+## Differential Gene Expression & Linear Visualization
+```{r perform_dge_and_plot}
+dge_results <- list()
+top_genes_list <- list()
+all_plots_list <- list()
+
+for (c in names(contact_regions_list)) {
+  assoc_name <- paste0("Association_", c)
+  cat(paste("\n--- Analyzing", assoc_name, "---\n"))
+  
+  bounds <- contact_regions_list[[c]]
+  
+  # Identify cells in Seg1 and Seg2 separately
+  is_in_seg1 <- sapply(cell_pt, function(x) {
+    if(is.na(x)) return(FALSE)
+    return(x >= (bounds$seg1[1] - window) && x <= (bounds$seg1[2] + window))
+  })
+  
+  is_in_seg2 <- sapply(cell_pt, function(x) {
+    if(is.na(x)) return(FALSE)
+    return(x >= (bounds$seg2[1] - window) && x <= (bounds$seg2[2] + window))
+  })
+  
+  cells_in_seg1 <- colnames(seurat_obj)[is_in_seg1]
+  cells_in_seg2 <- colnames(seurat_obj)[is_in_seg2]
+  cells_in_contact <- unique(c(cells_in_seg1, cells_in_seg2))
+  cells_out <- colnames(seurat_obj)[!colnames(seurat_obj) %in% cells_in_contact]
+  
+  if (length(cells_in_contact) > 10 && length(cells_out) > 10) {
+    # Create a temporary identity vector
+    ident_vec <- rep("Rest", ncol(seurat_obj))
+    names(ident_vec) <- colnames(seurat_obj)
+    ident_vec[cells_in_contact] <- "Contact"
+    Idents(seurat_obj) <- ident_vec
+    
+    # Relaxed parameters to allow baseline expression outside the contact
+    markers <- FindMarkers(seurat_obj, ident.1 = "Contact", ident.2 = "Rest", 
+                           min.pct = 0.10, logfc.threshold = 0.20, return.thresh = 0.05)
+    
+    # --- ENFORCE CO-EXPRESSION IN BOTH DOMAINS ---
+    # We require the gene to be expressed in at least 10% of cells in Seg1 AND 10% in Seg2
+    expr_data <- GetAssayData(seurat_obj, layer = "data")[rownames(markers), , drop=FALSE]
+    pct_seg1 <- rowMeans(expr_data[, cells_in_seg1, drop=FALSE] > 0)
+    pct_seg2 <- rowMeans(expr_data[, cells_in_seg2, drop=FALSE] > 0)
+    
+    valid_genes <- rownames(markers)[pct_seg1 >= 0.10 & pct_seg2 >= 0.10]
+    markers <- markers[valid_genes, ]
+    
+    dge_results[[assoc_name]] <- markers
+    
+    # All significant markers for plotting
+    top_markers <- markers %>% filter(avg_log2FC > 0 & p_val_adj < 0.05)
+    
+    if(nrow(top_markers) > 0) {
+      top_genes_list[[assoc_name]] <- rownames(top_markers)
+      
+      # Prepare data for Linear Plot
+      for (gene in rownames(top_markers)) {
+        
+        # Calculate Scores
+        logfc_score <- round(top_markers[gene, "avg_log2FC"], 2)
+        pct_in <- round(top_markers[gene, "pct.1"] * 100, 1)
+        pct_out <- round(top_markers[gene, "pct.2"] * 100, 1)
+        
+        score_text <- paste0("Enrichment (Log2FC): ", logfc_score, 
+                             " | Expressed: ", pct_in, "% (In Loop) vs ", pct_out, "% (Out Loop)")
+        
+        data_df <- FetchData(seurat_obj, vars = c(gene, "Smoothed_Pseudotime"))
+        colnames(data_df) <- c("Expression", "Pseudotime")
+        data_df <- data_df[!is.na(data_df$Pseudotime), ]
+        
+        y_min <- min(data_df$Expression, na.rm = TRUE) - 0.5
+        y_max <- max(data_df$Expression, na.rm = TRUE) + 0.5
+        
+        p <- ggplot(data_df, aes(x = Pseudotime, y = Expression)) +
+          geom_point(alpha = 0.1, size = 0.5, color = "grey50") +
+          geom_smooth(method = "loess", span = 0.3, color = "darkblue", se = FALSE) +
+          # Highlight Segment 1
+          geom_rect(aes(xmin = bounds$seg1[1] - window, xmax = bounds$seg1[2] + window, 
+                        ymin = y_min, ymax = y_max), fill = "red", alpha = 0.01, inherit.aes = FALSE) +
+          # Highlight Segment 2
+          geom_rect(aes(xmin = bounds$seg2[1] - window, xmax = bounds$seg2[2] + window, 
+                        ymin = y_min, ymax = y_max), fill = "blue", alpha = 0.01, inherit.aes = FALSE) +
+          theme_minimal() +
+          labs(title = paste(gene, "Expression Along Gut -", assoc_name),
+               subtitle = score_text)
+        
+        # Save to interactive list for HTML Export (Base64 static for extreme speed and perfect layout)
+        tmp_img <- tempfile(fileext = ".png")
+        suppressWarnings(ggsave(tmp_img, plot = p, width = 8, height = 4, dpi = 150))
+        img_uri <- base64enc::dataURI(file = tmp_img, mime = "image/png")
+        
+        div_wrapper <- htmltools::tags$div(
+          style = "margin-bottom: 30px; padding: 15px; border-left: 5px solid #007bff; background: #f8f9fa;",
+          htmltools::tags$h4(paste("Gene:", gene), style = "margin-top: 0; color: #007bff;"),
+          htmltools::tags$p(score_text, style = "font-weight: bold; color: #444; margin-bottom: 15px;"),
+          htmltools::tags$img(src = img_uri, style = "width: 100%; max-width: 800px; display: block;")
+        )
+        all_plots_list[[paste0(assoc_name, "_1_Gene_", gene)]] <- div_wrapper
+      }
+    }
+  }
+}
+```
+
+## Gene Ontology Enrichment
+```{r go_enrichment, fig.width=8, fig.height=6}
+for (region_name in names(dge_results)) {
+  markers <- dge_results[[region_name]]
+  up_genes <- rownames(markers %>% filter(avg_log2FC > 0.25 & p_val_adj < 0.05))
+  
+  if (length(up_genes) > 0) {
+    cat(paste("\nRunning GO enrichment for", region_name, "with", length(up_genes), "genes...\n"))
+    
+    gene_df <- bitr(up_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Dm.eg.db)
+    
+    if (nrow(gene_df) > 0) {
+      go_res <- enrichGO(gene = gene_df$ENTREZID,
+                         OrgDb = org.Dm.eg.db,
+                         ont = "BP",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.05,
+                         qvalueCutoff = 0.2,
+                         readable = TRUE)
+      
+      if (!is.null(go_res) && nrow(go_res) > 0) {
+        p <- dotplot(go_res, showCategory = 10, title = paste("GO BP Enrichment -", region_name))
+        print(p)
+      } else {
+        cat("No significant GO terms found.\n")
+      }
+    }
+  }
+}
+```
+
+## Visualize Contact Areas in 3D
+```{r plot_contacts}
+# Create a separate 3D plot for each unique association
+plots_list <- list()
+
+for (c in unique(contact_pairs_df$cluster)) {
+  assoc_name <- paste0("Association_", c)
+  
+  # Start with a grey mesh
+  vertex_colors <- rep("rgb(220, 220, 220)", nrow(mesh_data$v_matrix))
+  
+  c_pairs <- contact_pairs_df %>% filter(cluster == c)
+  involved_idx <- unique(c(c_pairs$idx1, c_pairs$idx2))
+  
+  # Find vertices that map to these centerline points
+  v_involved <- mesh_data$vertex_centerline_idx %in% involved_idx
+  
+  # Highlight the two touching segments in orange
+  vertex_colors[v_involved] <- "rgb(255, 140, 0)"
+  
+  fig <- plot_ly(
+    x = mesh_data$v_matrix[, 1],
+    y = mesh_data$v_matrix[, 2],
+    z = mesh_data$v_matrix[, 3],
+    i = mesh_data$f_matrix[, 1],
+    j = mesh_data$f_matrix[, 2],
+    k = mesh_data$f_matrix[, 3],
+    type = "mesh3d",
+    vertexcolor = vertex_colors,
+    name = assoc_name
+  )
+  
+  fig <- fig %>% layout(
+    scene = list(aspectmode = "data")
+  )
+  
+  plots_list[[assoc_name]] <- fig
+  
+  fig_wrapper <- htmltools::tags$div(
+    style = "margin-top: 60px; margin-bottom: 30px; padding-top: 20px; border-top: 2px solid #ccc;",
+    htmltools::tags$h2(paste("Topological Contact:", assoc_name), style = "color: #333;"),
+    fig
+  )
+  all_plots_list[[paste0(assoc_name, "_0_3DMesh")]] <- fig_wrapper
+}
+
+# Sort all plots so 3D mesh comes first for each association, followed by its linear plots
+sorted_plots <- all_plots_list[sort(names(all_plots_list))]
+
+# Generate combined HTML report for ALL plots (Linear + 3D) without knitting
+html_path <- "../Random data/Topological_Associations_SC_Report.html"
+
+full_html <- htmltools::tags$div(
+  style = "font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px;",
+  htmltools::tags$h1("Single-Cell Topological Associations Report", style = "text-align: center; color: #2c3e50; border-bottom: 2px solid #2c3e50; padding-bottom: 10px;"),
+  htmltools::tagList(sorted_plots)
+)
+
+htmltools::save_html(full_html, file = html_path)
+cat(paste("\n\n>>> Successfully saved fast, perfectly formatted HTML report to:", html_path, "\n"))
+```

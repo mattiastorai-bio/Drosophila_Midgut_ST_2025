@@ -1,0 +1,292 @@
+---
+title: "Unk Sub-Cluster Analysis & Similarity Mapping"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(htmlwidgets)
+library(pheatmap)
+```
+
+## 1. Load Data
+```{r load_data}
+path_sc <- "../Random data/sc_with_spatial_scores.rds"
+if(!file.exists(path_sc)) stop("Cannot locate single-cell object at ", path_sc)
+
+cat("Loading Single Cell Object...\n")
+sc_obj <- readRDS(path_sc)
+
+# Verify spatial data is present
+if (!"Smoothed_Pseudotime" %in% colnames(sc_obj@meta.data)) {
+  warning("Smoothed_Pseudotime not found in metadata. Defaulting to Transferred_Pseudotime if available.")
+  if ("Transferred_Pseudotime" %in% colnames(sc_obj@meta.data)) {
+    sc_obj$Smoothed_Pseudotime <- sc_obj$Transferred_Pseudotime
+  } else {
+    stop("No spatial pseudotime found in the Seurat object.")
+  }
+}
+
+# Subset for Unk purely based on prior cell classifications
+if ("unk" %in% sc_obj$celltype) {
+  unk_cells <- subset(sc_obj, subset = celltype == "unk")
+} else if ("celltype_granular" %in% colnames(sc_obj@meta.data) && "unk" %in% sc_obj$celltype_granular) {
+  unk_cells <- subset(sc_obj, subset = celltype_granular == "unk")
+} else {
+  unk_cells <- subset(sc_obj, subset = grepl("unk", celltype, ignore.case=TRUE))
+}
+cat("Isolated", ncol(unk_cells), "Unk cells out of", ncol(sc_obj), "total cells.\n")
+```
+
+## 2. Re-Clustering & 3D UMAP Generation
+We uniquely isolate the Unk subset, but cluster it using the global PCA space to retain contextual boundaries.
+
+```{r clustering_3d}
+# Instead of re-running PCA and UMAP, we retain the global transcription space
+# inherited from the full single-cell dataset. This ensures clustering uses the global context.
+
+# Cluster directly on the global PCA space. 
+# Decrease k.param to make boundaries sharper.
+unk_cells <- FindNeighbors(unk_cells, reduction = "pca", dims = 1:20, k.param = 10)
+
+# Aggressive resolution to capture the split
+unk_cells <- FindClusters(unk_cells, resolution = 2.0)
+
+# Extract rendering coordinates and inject Space as the 3rd Dimension
+umap_coords <- as.data.frame(Embeddings(unk_cells, "umap"))
+umap_coords$Space <- unk_cells$Smoothed_Pseudotime
+umap_coords$Cluster <- as.character(unk_cells$seurat_clusters)
+
+# Define global output directory constraints
+dir.create("../figures/Unk_Analysis", recursive=TRUE, showWarnings=FALSE)
+
+cat("✓ Re-clustering complete. Defined", length(unique(unk_cells$seurat_clusters)), "clusters natively.\n")
+
+# 3D Plot for Cluster Imputation (2 Genetic + 1 Spatial Phase)
+p_3d_cluster <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Cluster, colors = c("#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B4", "#91D1C2"),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "Unk Sub-Clusters (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_cluster, file = "../figures/Unk_Analysis/3D_UMAP_Unk_Clusters.html")
+p_3d_cluster
+```
+
+```{r analysis}
+## 3. 3D UMAP Feature Projections
+# Visualizing top driving phenotypic parameters (such as structural layout spatiality) directly across the 3D space.
+
+p_3d_feature <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Space, colors = colorRamp(c("navy", "yellow", "firebrick3")),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "Unk Spatial Topography (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_feature, file = "../figures/Unk_Analysis/3D_Hybrid_Unk_Pseudotime.html")
+p_3d_feature
+```
+
+## 4. Differential Gene Expression (DGE) 
+Identifying the unique transcription boundaries pushing the limits of the detected pools.
+
+```{r dge_analysis}
+Idents(unk_cells) <- "seurat_clusters"
+cat("Running FindAllMarkers to isolate distinct expression limits...\n")
+
+unk_markers <- FindAllMarkers(unk_cells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top_unk <- unk_markers %>% group_by(cluster) %>% slice_max(n = 15, order_by = avg_log2FC)
+
+write.csv(unk_markers, "../figures/Unk_Analysis/Unk_Cluster_DGE.csv", row.names=FALSE)
+
+cat("\n--- TOP DIFFERENTIAL MARKERS ---\n")
+library(knitr)
+# Safely handle potential empty marker results
+if(nrow(top_unk) > 0) {
+    print(kable(top_unk %>% dplyr::select(cluster, gene, avg_log2FC, p_val_adj), format="pipe"))
+} else {
+    cat("No significant markers found for the current clusters.\n")
+}
+```
+
+## 5. Global Celltype Similarity Matrix
+Computing average expression profiles seamlessly across all functional cell classes inside the original dataset to trace where the specific isolated Unk clusters map.
+
+```{r similarity_matrix, fig.width=10, fig.height=8}
+# Re-integrate the newly modeled Unk identities into the master dataset structurally
+# Determine the column to replace based on where 'unk' was found
+if ("unk" %in% sc_obj$celltype) {
+    target_col <- "celltype"
+} else if ("celltype_granular" %in% colnames(sc_obj@meta.data) && "unk" %in% sc_obj$celltype_granular) {
+    target_col <- "celltype_granular"
+} else {
+    target_col <- "celltype"
+}
+
+sc_obj$Unk_Split_Identity <- as.character(sc_obj[[target_col]][[1]])
+
+# Safely swap purely the Unk cells for their new structurally defined IDs
+new_ids <- paste0("Unk_Subcluster_", unk_cells$seurat_clusters)
+sc_obj$Unk_Split_Identity[Cells(unk_cells)] <- new_ids
+
+Idents(sc_obj) <- "Unk_Split_Identity"
+
+cat("Computing holistic AverageExpression arrays across all structural lineages...\n")
+# Get current default assay to be safe
+def_assay <- DefaultAssay(sc_obj)
+avg_exp <- AverageExpression(sc_obj, assays = def_assay)
+
+# Extract the matrix from the list (Seurat V4/V5 returns a list of matrices)
+if (is.list(avg_exp)) {
+    exp_matrix <- as.matrix(avg_exp[[1]])
+} else {
+    exp_matrix <- as.matrix(avg_exp)
+}
+
+# Ensure there are no NA/Inf values which break correlation
+exp_matrix[is.na(exp_matrix)] <- 0
+
+cat("Calculating Pearson correlation matrix on assay:", names(avg_exp)[1], "\n")
+sim_matrix <- cor(exp_matrix, method = "pearson")
+
+# Trim generic uninformative or ambiguous arrays before plotting
+valid_cols <- !grepl("ambiguous|unknown", colnames(sim_matrix), ignore.case=TRUE)
+clean_matrix <- sim_matrix[valid_cols, valid_cols]
+
+png("../figures/Unk_Analysis/Unk_Similarity_Heatmap.png", width=3200, height=2600, res=300)
+pheatmap(clean_matrix, 
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         display_numbers = FALSE,
+         fontsize_row = 12, fontsize_col = 12,
+         main = "Global Transcriptomic Similarity Matrix (Pearson)")
+dev.off()
+
+# Print inline for the RMarkdown
+pheatmap(clean_matrix, 
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         display_numbers = FALSE,
+         fontsize_row = 12, fontsize_col = 12,
+         main = "Global Transcriptomic Similarity Matrix (Pearson)")
+
+cat("✓ Execution completed. Matrices stored securely in figures directory.\n")
+```
+
+## 6. Gene Ontology (GO)
+We run GO Biological Process enrichment on the specific markers of each subcluster.
+```{r go_analysis, fig.width=10, fig.height=8}
+library(clusterProfiler)
+library(org.Dm.eg.db)
+
+# Run GO Enrichment using significant markers only
+unk_markers_sig <- unk_markers %>% filter(p_val_adj < 0.05)
+
+if (nrow(unk_markers_sig) > 0) {
+  go_results <- compareCluster(
+    gene ~ cluster, 
+    data = unk_markers_sig, 
+    fun = "enrichGO",
+    OrgDb = org.Dm.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+
+  if (!is.null(go_results) && nrow(as.data.frame(go_results)) > 0) {
+    # Simplify to reduce redundant terms
+    tryCatch({
+      go_results_simp <- clusterProfiler::simplify(go_results, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      
+      p_go <- dotplot(go_results_simp, showCategory = 10) + 
+        ggtitle("GO BP Enrichment: Unk Subclusters")
+      print(p_go)
+    }, error = function(e) {
+      message("Could not simplify GO terms. Plotting original results.")
+      p_go <- dotplot(go_results, showCategory = 10) + 
+        ggtitle("GO BP Enrichment: Unk Subclusters")
+      print(p_go)
+    })
+  } else {
+    message("No significant GO terms found for the subclusters.")
+  }
+} else {
+  message("Not enough significant markers for GO analysis.")
+}
+```
+
+## 7. Global DGE & GO: Unk vs All Other Cells
+In this section, we compare the entire `unk` population against all other cells in the dataset to define the global identity of the unknown cells.
+
+```{r global_unk_dge}
+# Ensure the active identity is the original celltype mapping
+Idents(sc_obj) <- target_col
+
+cat("Running Global DGE: 'unk' vs All Other Cells...\n")
+# If target_col is 'celltype_granular' and the label is 'unk', use that.
+global_unk_markers <- FindMarkers(sc_obj, ident.1 = "unk", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Add gene names as a column for easier manipulation
+global_unk_markers$gene <- rownames(global_unk_markers)
+
+# Filter for significance
+global_unk_sig <- global_unk_markers %>% filter(p_val_adj < 0.05)
+
+write.csv(global_unk_sig, "../figures/Unk_Analysis/Global_Unk_vs_All_Markers.csv", row.names=FALSE)
+
+cat("\n--- TOP GLOBAL MARKERS FOR 'UNK' ---\n")
+if(nrow(global_unk_sig) > 0) {
+    top_global <- global_unk_sig %>% top_n(n = 15, wt = avg_log2FC)
+    print(kable(top_global %>% dplyr::select(gene, avg_log2FC, p_val_adj), format="pipe"))
+} else {
+    cat("No globally significant markers found for 'unk' vs all other cells.\n")
+}
+```
+
+```{r global_unk_go, fig.width=10, fig.height=8}
+# Run standard enrichGO on the global markers
+if (nrow(global_unk_sig) > 0) {
+  cat("Running Global GO Enrichment for 'unk'...\n")
+  global_go <- enrichGO(
+    gene = global_unk_sig$gene,
+    OrgDb = org.Dm.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if (!is.null(global_go) && nrow(as.data.frame(global_go)) > 0) {
+    tryCatch({
+      global_go_simp <- clusterProfiler::simplify(global_go, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      
+      p_global_go <- dotplot(global_go_simp, showCategory = 15) + 
+        ggtitle("Global GO BP Enrichment: Unk vs All Other Cells")
+      print(p_global_go)
+    }, error = function(e) {
+      p_global_go <- dotplot(global_go, showCategory = 15) + 
+        ggtitle("Global GO BP Enrichment: Unk vs All Other Cells")
+      print(p_global_go)
+    })
+  } else {
+    message("No significant global GO terms found for 'unk'.")
+  }
+} else {
+  message("Not enough significant global markers for GO analysis.")
+}
+```

@@ -1,0 +1,359 @@
+---
+title: "Global Transcriptional Difference - 03Slide4 vs 111125ST_def"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(reshape2)
+library(gridExtra)
+library(patchwork)
+library(scales)
+library(zoo)
+
+# Ensure output directory exists
+if (!dir.exists("../figures/3D_glo")) dir.create("../figures/3D_glo", recursive = TRUE)
+```
+
+## 1. Load Data
+This script compares the transcriptional similarity maps of two experiments. It expects `merged_guts.rds` to be present in the `Random data` folders of both `03Slide4` and `111125ST_def`.
+
+```{r load_data}
+path_slide4 <- "../Random data/merged_guts.rds"
+path_slide6 <- "../../03Slide6/Random data/merged_guts.rds"
+path_111125 <- "../../111125ST_def/Random data/merged_guts.rds"
+
+if (!file.exists(path_slide4)) stop("Data for 03Slide4 not found at: ", path_slide4)
+if (!file.exists(path_slide6)) stop("Data for 03Slide6 not found at: ", path_slide6)
+if (!file.exists(path_111125)) stop("Data for 111125ST_def not found at: ", path_111125)
+
+message("Loading 03Slide4 data...")
+merged_slide4 <- readRDS(path_slide4)
+
+message("Loading 03Slide6 data...")
+merged_slide6 <- readRDS(path_slide6)
+
+message("Loading 111125ST_def data...")
+merged_111125 <- readRDS(path_111125)
+```
+
+## 2. Core Functions
+Defining the functions for similarity calculation and difference plotting.
+
+```{r functions}
+# Internal function to calculate interpolated similarity matrix with Optional Smoothing
+calculate_similarity_matrix <- function(seurat_obj, cells, n_bins = 100, var_features = NULL, smoothing_window = 1) {
+    if (length(cells) == 0) return(NULL)
+    
+    sub <- subset(seurat_obj, cells = cells)
+    
+    if (is.null(var_features)) {
+        sub <- FindVariableFeatures(sub, nfeatures = 2000, verbose = FALSE)
+        var_features <- VariableFeatures(sub)
+    }
+    
+    # Bin by Spatial_Pseudotime
+    sub$Bin <- factor(cut(sub$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    
+    # Calculate Mean Expression per Bin
+    exp_mat <- GetAssayData(sub, layer = "data")[var_features, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub$Bin, mean, na.rm = TRUE)))
+    
+    # 1. Interpolate missing bins (handle gaps in data)
+    bin_means <- t(apply(bin_means, 1, function(x) {
+        if (all(is.na(x))) return(x)
+        na.approx(x, na.rm = FALSE, rule = 2)
+    }))
+    
+    # 2. Optional Smoothing across spatial bins (Moving Average)
+    if (smoothing_window > 1) {
+        bin_means <- t(apply(bin_means, 1, function(x) {
+            # use rollmean from zoo
+            as.numeric(rollmean(x, k = smoothing_window, fill = "extend"))
+        }))
+    }
+    
+    # Pairwise Spearman Correlation
+    cor_mat <- cor(bin_means, method = "spearman", use = "pairwise.complete.obs")
+    return(cor_mat)
+}
+
+# Function to plot the difference with Thresholding and Contrast control
+plot_similarity_difference <- function(cor_mat1, cor_mat2, title = "Difference Map (Slide4 - 111125)", 
+                                       n_bins = 100, diff_threshold = 0, contrast_limit = 0.5) {
+    
+    # Subtract matrices
+    diff_mat <- cor_mat1 - cor_mat2
+    
+    # Transform to Diamonds
+    n <- nrow(diff_mat)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>%
+        filter(j >= i) %>%
+        rowwise() %>%
+        mutate(Difference = diff_mat[i, j]) %>%
+        filter(!is.na(Difference))
+    
+    # Apply Threshold: Only keep differences above a certain level
+    # Small differences are set to 0 (white)
+    tri_data$Difference[abs(tri_data$Difference) < diff_threshold] <- 0
+    
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2
+        cy <- (row$j - row$i) / 2
+        data.frame(
+            x = c(cx, cx + 0.5, cx, cx - 0.5),
+            y = c(cy + 0.5, cy, cy - 0.5, cy),
+            Difference = row$Difference,
+            ID = idx
+        )
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    # Ensure limits are symmetric
+    contrast_limit <- abs(contrast_limit)
+    
+    # Plot with divergent palette
+    p <- ggplot(poly_df, aes(x = x, y = y, fill = Difference, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradient2(
+            high = "#B2182B", mid = "#F7F7F7", low = "#2166AC", 
+            midpoint = 0, 
+            limits = c(-contrast_limit, contrast_limit),
+            oob = squish, # Rescale values outside limits to min/max
+            name = "Diff\n(Mutant-WT)"
+        ) +
+        theme_minimal() +
+        coord_fixed(ratio = 1) +
+        scale_x_continuous(expand = c(0,0), limits = c(0.5, n + 0.5), breaks = seq(0, n, by = 20)) +
+        scale_y_continuous(expand = c(0,0)) +
+        labs(title = title, 
+             subtitle = paste0("Difference Plot | Threshold: ", diff_threshold, 
+                               " | Contrast Limit: ", contrast_limit),
+             x = "Anatomical Position (Gut Bins)", 
+             y = "Relative Distance") +
+        theme(
+            panel.grid = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.title = element_text(face = "bold", size = 14)
+        )
+    
+    # Add Region Labels
+    region_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+    region_mid <- (region_breaks[-1] + region_breaks[-length(region_breaks)]) / 2
+    p <- p + annotate("text", x = region_mid, y = -2, label = c("R1", "R2", "R3", "R4", "R5"), fontface = "bold", size = 3.5) +
+        annotate("segment", x = region_breaks, xend = region_breaks, y = -4, yend = 0, color = "grey20", linetype = "dotted")
+        
+    return(p)
+}
+```
+
+## 3. Run Comparison
+Adjust the parameters below to make differences more "striking".
+
+```{r run_comparison, fig.width=10, fig.height=6}
+# === ADJUSTABLE PARAMETERS ===
+SMOOTHING_WINDOW <- 5      # Higher = smoother regional trends
+DIFF_THRESHOLD   <- 0.05   # Ignore differences smaller than this
+CONTRAST_LIMIT   <- 0.3   # Saturate color early (striking contrast)
+# =============================
+
+# Define common Variable Features for fair comparison
+common_genes <- intersect(VariableFeatures(merged_slide4), VariableFeatures(merged_111125))
+if (length(common_genes) < 500) {
+    message("Few common variable features. Finding union...")
+    common_genes <- union(VariableFeatures(merged_slide4), VariableFeatures(merged_111125))
+}
+common_genes <- common_genes[common_genes %in% rownames(merged_slide4) & common_genes %in% rownames(merged_111125)]
+
+message(paste("Comparing using", length(common_genes), "genes..."))
+
+# Filter Cells (Subset to specific guts and exclude Ambiguous)
+message("Subsetting 03Slide4 to Gut 1...")
+gut1_cells_slide4 <- grep("^Gut1_", Cells(merged_slide4), value = TRUE)
+obj_slide4_gut1 <- subset(merged_slide4, cells = gut1_cells_slide4)
+cells_slide4 <- Cells(obj_slide4_gut1)[!grepl("ambiguous", obj_slide4_gut1$Predicted_CellType, ignore.case = TRUE)]
+
+message("Subsetting 03Slide6 to Gut 1 (WT+Cas9/GFP)...")
+gut1_cells_slide6 <- grep("^Gut1_", Cells(merged_slide6), value = TRUE)
+obj_slide6_gut1 <- subset(merged_slide6, cells = gut1_cells_slide6)
+cells_slide6 <- Cells(obj_slide6_gut1)[!grepl("ambiguous", obj_slide6_gut1$Predicted_CellType, ignore.case = TRUE)]
+
+message("Subsetting 111125ST_def to Gut 3...")
+gut3_cells_111125 <- grep("^Gut3_", Cells(merged_111125), value = TRUE)
+obj_111125_gut3 <- subset(merged_111125, cells = gut3_cells_111125)
+cells_111125 <- Cells(obj_111125_gut3)[!grepl("ambiguous", obj_111125_gut3$Predicted_CellType, ignore.case = TRUE)]
+
+# Calculate Matrices
+message("Calculating similarity matrix for 03Slide4 (Gut 1)...")
+sim_slide4 <- calculate_similarity_matrix(obj_slide4_gut1, cells_slide4, n_bins = 100, 
+                                          var_features = common_genes, 
+                                          smoothing_window = SMOOTHING_WINDOW)
+
+message("Calculating similarity matrix for 111125ST_def (Gut 3)...")
+sim_111125 <- calculate_similarity_matrix(obj_111125_gut3, cells_111125, n_bins = 100, 
+                                          var_features = common_genes,
+                                          smoothing_window = SMOOTHING_WINDOW)
+
+# Plot Difference
+p_diff <- plot_similarity_difference(sim_slide4, sim_111125, 
+                                     title = "Difference Map (Mutant Gut 1 - WT Gut 3)",
+                                     n_bins = 100,
+                                     diff_threshold = DIFF_THRESHOLD,
+                                     contrast_limit = CONTRAST_LIMIT)
+
+# Save and Display
+ggsave("../figures/3D_glo/Global_Difference_Map_Striking.png", p_diff, width = 10, height = 6)
+p_diff
+```
+
+## 4. Gene Expression Across Gut Length
+This section allows for the visualization of a specific gene's expression profile across the anterior-posterior axis, comparing the Mutant (Gut 1) and WT (Gut 3) directly.
+
+```{r gene_expression_spatial, fig.width=10, fig.height=5}
+# Define the target gene
+target_gene <- "nkd" # Change this to the gene of interest (e.g., "wg", "dpp", "Dl")
+
+# Function to extract and bin expression (Robust to missing genes)
+get_binned_expression <- function(seurat_obj, cells_to_use, gene, label, n_bins = 100, smoothing = 3) {
+    
+    # Handle Missing Genes by returning a 0-expression profile
+    if (!(gene %in% rownames(seurat_obj))) {
+        message(paste("! Note: Gene", gene, "not found in", label, "- plotting 0."))
+        return(data.frame(
+            Bin = 1:n_bins,
+            Expression = 0,
+            Condition = label
+        ))
+    }
+
+    sub <- subset(seurat_obj, cells = cells_to_use)
+    
+    # Bin by Spatial_Pseudotime
+    sub$Bin <- factor(cut(sub$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    
+    # Extract expression (ensure we use the data layer for normalized values)
+    assay_to_use <- DefaultAssay(sub)
+    expr <- GetAssayData(sub, assay = assay_to_use, layer = "data")[gene, ]
+    bin_means <- tapply(expr, sub$Bin, mean, na.rm = TRUE)
+    
+    # Interpolate missing
+    if (any(is.na(bin_means))) {
+        bin_means <- as.numeric(na.approx(bin_means, na.rm = FALSE, rule = 2))
+    }
+    
+    # Smooth
+    if (smoothing > 1) {
+         bin_means <- as.numeric(rollmean(bin_means, k = smoothing, fill = "extend"))
+    }
+    
+    data.frame(
+        Bin = 1:n_bins,
+        Expression = bin_means,
+        Condition = label
+    )
+}
+
+# Check if gene exists in AT LEAST one dataset to avoid empty plotting
+any_present <- target_gene %in% rownames(merged_slide4) || 
+               target_gene %in% rownames(merged_slide6) || 
+               target_gene %in% rownames(merged_111125)
+
+if (any_present) {
+    # Get data for all three conditions
+    df_mutant   <- get_binned_expression(obj_slide4_gut1, cells_slide4, target_gene, "Mutant (03Slide4, Gut 1)", smoothing = SMOOTHING_WINDOW)
+    df_wt_cas9  <- get_binned_expression(obj_slide6_gut1, cells_slide6, target_gene, "WT+Cas9/GFP (03Slide6, Gut 1)", smoothing = SMOOTHING_WINDOW)
+    df_wt       <- get_binned_expression(obj_111125_gut3, cells_111125, target_gene, "WT (111125ST, Gut 3)", smoothing = SMOOTHING_WINDOW)
+    
+    plot_data <- rbind(df_mutant, df_wt_cas9, df_wt)
+    
+    # Plot
+    p_gene <- ggplot(plot_data, aes(x = Bin, y = Expression, color = Condition)) +
+        geom_line(size = 1.2) +
+        scale_color_manual(values = c(
+            "Mutant (03Slide4, Gut 1)" = "#E41A1C", 
+            "WT+Cas9/GFP (03Slide6, Gut 1)" = "#4DAF4A",
+            "WT (111125ST, Gut 3)" = "#377EB8"
+        )) +
+        theme_minimal() +
+        labs(title = paste("Spatial Expression Profile:", target_gene),
+             subtitle = "Comparison across Anterior-Posterior Axis",
+             x = "Anatomical Position (Gut Bins, 1=Anterior, 100=Posterior)",
+             y = "Mean Normalized Expression (Smoothed)") +
+        theme(
+            plot.title = element_text(face = "bold", size = 14),
+            legend.position = "top",
+            legend.title = element_blank(),
+            panel.grid.minor = element_blank()
+        ) +
+         geom_vline(xintercept = c(15, 40, 55, 85), color = "grey50", linetype = "dashed", alpha = 0.5)
+    
+    print(p_gene)
+    
+    # Save the plot
+    ggsave(paste0("../figures/3D_glo/Gene_Spatial_", target_gene, ".png"), p_gene, width = 10, height = 5)
+    
+} else {
+    message(paste("Warning: Gene", target_gene, "not found in ANY of the datasets."))
+}
+```
+## 5. Collapsed-Gut Comparison (Experiment Averages)
+This section averages all individual guts for each specimen to show spatial trends at the experiment level.
+
+```{r collapsed_gut_profiles, fig.width=10, fig.height=5}
+if (any_present) {
+    message("Calculating Collapsed-Gut profiles...")
+    
+    # 1. Prepare Cell Lists for Collapsed Guts (Exclude Ambiguous)
+    get_collapsed_cells <- function(obj) {
+        Cells(obj)[!grepl("ambiguous", obj$Predicted_CellType, ignore.case = TRUE)]
+    }
+    
+    cells_coll_s4 <- get_collapsed_cells(merged_slide4)
+    cells_coll_s6 <- get_collapsed_cells(merged_slide6)
+    cells_coll_11 <- get_collapsed_cells(merged_111125)
+    
+    # 2. Extract Profiles
+    df_coll_mutant <- get_binned_expression(merged_slide4, cells_coll_s4, target_gene, "Mutant (Collapsed)", smoothing = SMOOTHING_WINDOW)
+    df_coll_cas9   <- get_binned_expression(merged_slide6, cells_coll_s6, target_gene, "WT+Cas9/GFP (Collapsed)", smoothing = SMOOTHING_WINDOW)
+    df_coll_wt     <- get_binned_expression(merged_111125, cells_coll_11, target_gene, "WT (Collapsed)", smoothing = SMOOTHING_WINDOW)
+    
+    plot_data_coll <- rbind(df_coll_mutant, df_coll_cas9, df_coll_wt)
+    
+    # 3. Plot
+    p_coll <- ggplot(plot_data_coll, aes(x = Bin, y = Expression, color = Condition)) +
+        geom_line(size = 1.2) +
+        scale_color_manual(values = c(
+            "Mutant (Collapsed)" = "#E41A1C", 
+            "WT+Cas9/GFP (Collapsed)" = "#4DAF4A",
+            "WT (Collapsed)" = "#377EB8"
+        )) +
+        theme_minimal() +
+        labs(title = paste("Spatial Expression Profile (Collapsed Guts):", target_gene),
+             subtitle = "Averaged across all guts per experiment",
+             x = "Anatomical Position (Gut Bins, 1=Anterior, 100=Posterior)",
+             y = "Mean Normalized Expression (Smoothed)") +
+        theme(
+            plot.title = element_text(face = "bold", size = 14),
+            legend.position = "top",
+            legend.title = element_blank(),
+            panel.grid.minor = element_blank()
+        ) +
+         geom_vline(xintercept = c(15, 40, 55, 85), color = "grey50", linetype = "dashed", alpha = 0.5)
+    
+    print(p_coll)
+    
+    # Save the plot
+    ggsave(paste0("../figures/3D_glo/Gene_Spatial_Collapsed_", target_gene, ".png"), p_coll, width = 10, height = 5)
+    
+} else {
+    message("Gene not present for collapsed comparison.")
+}
+```

@@ -1,0 +1,255 @@
+---
+title: "Global Transcriptional Comparison - Single Cell Spatial Similarity Heatmaps"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(reshape2)
+library(gridExtra)
+```
+
+## 1. Load Data
+```{r load_data}
+path_sc <- "../Random data/sc_with_spatial_scores.rds"
+if(!file.exists(path_sc)) stop("Cannot locate single-cell object at ", path_sc)
+
+cat("Loading Single Cell Object...\n")
+sc_obj <- readRDS(path_sc)
+
+# Define groupings using the authoritative 'celltype' column
+groups <- list("All_Cells" = Cells(sc_obj))
+
+# Add celltype specific groups
+unique_types <- unique(sc_obj$celltype)
+# Filter out any ambiguous/unknown types just in case
+unique_types <- unique_types[!grepl("ambiguous|unknown", unique_types, ignore.case = TRUE)]
+
+for(ct in unique_types) {
+    groups[[as.character(ct)]] <- Cells(sc_obj)[sc_obj$celltype == ct]
+}
+
+cat("✓ Data standardization and clean group definition complete.\n")
+```
+
+## 2. Triangular Heatmap Function
+This function transforms a standard correlation matrix into a triangular "mountain" coordinate system.
+
+```{r similarity_function}
+plot_triangular_similarity <- function(seurat_obj, cells, title = "Similarity Map", n_bins = 100) {
+    
+    # 1. Subset and Bin
+    if (length(cells) == 0) {
+        message(paste("! Skipping", title, "- No cells found in group."))
+        return(NULL)
+    }
+    sub <- subset(seurat_obj, cells = cells)
+    
+    # Extract variable genes for comparison
+    var_genes <- VariableFeatures(seurat_obj)
+    if(length(var_genes) == 0) {
+        sub <- FindVariableFeatures(sub, nfeatures = 2000, verbose = FALSE)
+        var_genes <- VariableFeatures(sub)
+    }
+    
+    # Bin by Smoothed_Pseudotime (0-100 mapped space)
+    sub$Bin <- factor(cut(sub$Smoothed_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    
+    # 2. Calculate Mean Expression per Bin
+    exp_mat <- GetAssayData(sub, layer = "data")[var_genes, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub$Bin, mean, na.rm = TRUE)))
+    
+    # 3. Pairwise Spearman Correlation
+    cor_mat <- cor(bin_means, method = "spearman", use = "pairwise.complete.obs")
+    
+    # 4. Transform to Diamonds (Polygon approach to fill gaps)
+    n <- nrow(cor_mat)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>%
+        filter(j >= i) %>%
+        rowwise() %>%
+        mutate(Similarity = cor_mat[i, j]) %>%
+        filter(!is.na(Similarity)) 
+    
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2
+        cy <- (row$j - row$i) / 2
+        data.frame(
+            x = c(cx, cx + 0.5, cx, cx - 0.5),
+            y = c(cy + 0.5, cy, cy - 0.5, cy),
+            Similarity = row$Similarity,
+            ID = idx
+        )
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    # 5. Plot
+    vivid_palette <- c("#0D0887", "#5302A3", "#8B0AA5", "#B83289", "#D8576B", "#ED7953", "#FBA238", "#F0F921")
+
+    p <- ggplot(poly_df, aes(x = x, y = y, fill = Similarity, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradientn(colors = vivid_palette, name = "Spearman\nCorrelation", limits = c(0, 1)) +
+        theme_minimal() +
+        coord_fixed(ratio = 1) + 
+        scale_x_continuous(expand = c(0,0), limits = c(0.5, n + 0.5), breaks = seq(0, n, by = 20)) +
+        scale_y_continuous(expand = c(0,0)) +
+        labs(title = title, 
+             subtitle = paste("Resolution:", n_bins, "Bins | Gap-Free Plot"),
+             x = "Anatomical Position (Mapped Gut Bins)", 
+             y = "Relative Distance") +
+        theme(
+            panel.grid = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.title = element_text(face = "bold", size = 14),
+            legend.position = "right"
+        )
+    
+    # Add Region Labels
+    region_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+    region_mid <- (region_breaks[-1] + region_breaks[-length(region_breaks)]) / 2
+    region_labs <- c("R1", "R2", "R3", "R4", "R5")
+    
+    p <- p + annotate("text", x = region_mid, y = -2, label = region_labs, fontface = "bold", size = 3.5) +
+        annotate("segment", x = region_breaks, xend = region_breaks, y = -4, yend = 0, color = "grey20", linetype = "dotted")
+        
+    return(p)
+}
+
+# --- Refined Function (Z-scaled + Smoothed) ---
+plot_triangular_similarity_refined <- function(seurat_obj, cells, title = "Refined Similarity Map", n_bins = 100, smoothing_window = 3) {
+    if (length(cells) == 0) {
+        message(paste("! Skipping", title, "- No cells found in group."))
+        return(NULL)
+    }
+    sub <- subset(seurat_obj, cells = cells)
+    var_genes <- VariableFeatures(seurat_obj)
+    if(length(var_genes) == 0) {
+        sub <- FindVariableFeatures(sub, nfeatures = 2000, verbose = FALSE)
+        var_genes <- VariableFeatures(sub)
+    }
+    sub$Bin <- factor(cut(sub$Smoothed_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    exp_mat <- GetAssayData(sub, layer = "data")[var_genes, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub$Bin, mean, na.rm = TRUE)))
+    
+    # 1. Scaling (Z-score per gene across bins)
+    bin_scaled <- t(apply(bin_means, 1, function(x) {
+        if(all(is.na(x)) || sd(x, na.rm=T) == 0) return(rep(0, length(x)))
+        (x - mean(x, na.rm=T)) / sd(x, na.rm=T)
+    }))
+    
+    # 2. Gaussian-like Smoothing (3-bin Moving Average)
+    bin_smoothed <- t(apply(bin_scaled, 1, function(x) {
+        if(all(x == 0)) return(x)
+        res <- as.numeric(stats::filter(x, rep(1/smoothing_window, smoothing_window), sides = 2))
+        res[is.na(res)] <- 0 # Handle edge effects of filter
+        return(res)
+    }))
+    
+    # 3. Pairwise Pearson Correlation
+    cor_mat <- cor(bin_smoothed, method = "pearson", use = "pairwise.complete.obs")
+    
+    # 4. Background Adjustment (Optional: Center around 0)
+    diag(cor_mat) <- NA
+    global_mean <- mean(cor_mat, na.rm = TRUE)
+    cor_mat_adj <- cor_mat - global_mean
+    diag(cor_mat_adj) <- 1 # Keep diagonal for completeness
+    
+    # 5. Polygon Transform
+    n <- nrow(cor_mat_adj)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>%
+        filter(j >= i) %>%
+        rowwise() %>%
+        mutate(Similarity = cor_mat_adj[i, j]) %>%
+        filter(!is.na(Similarity))
+        
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2
+        cy <- (row$j - row$i) / 2
+        data.frame(
+            x = c(cx, cx + 0.5, cx, cx - 0.5),
+            y = c(cy + 0.5, cy, cy - 0.5, cy),
+            Similarity = row$Similarity,
+            ID = idx
+        )
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    # 6. Plot with Divergent Palette (Blue -> White -> Red)
+    p <- ggplot(poly_df, aes(x = x, y = y, fill = Similarity, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradient2(
+            high = "#B2182B", mid = "#F7F7F7", low = "#2166AC", 
+            midpoint = 0, name = "Relative\nSimilarity"
+        ) +
+        theme_minimal() +
+        coord_fixed(ratio = 1) +
+        scale_x_continuous(expand = c(0,0), limits = c(0.5, n + 0.5), breaks = seq(0, n, by = 20)) +
+        scale_y_continuous(expand = c(0,0)) +
+        labs(title = title, 
+             subtitle = "Refined Analysis (Z-scaled + Smoothed + Background Adj.)",
+             x = "Anatomical Position (Mapped Gut Bins)", 
+             y = "Relative Distance") +
+        theme(
+            panel.grid = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.title = element_text(face = "bold", size = 14)
+        )
+    
+    # Add Region Labels
+    region_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+    region_mid <- (region_breaks[-1] + region_breaks[-length(region_breaks)]) / 2
+    p <- p + annotate("text", x = region_mid, y = -2, label = c("R1", "R2", "R3", "R4", "R5"), fontface = "bold", size = 3.5) +
+        annotate("segment", x = region_breaks, xend = region_breaks, y = -4, yend = 0, color = "grey20", linetype = "dotted")
+        
+    return(p)
+}
+```
+
+## 3. Generate Maps
+```{r run_analysis, fig.width=10, fig.height=8}
+dir.create("../figures/sc_similarity_maps", recursive = TRUE, showWarnings = FALSE)
+
+for (group_name in names(groups)) {
+    message(paste("Calculating similarity for:", group_name))
+    p <- plot_triangular_similarity(
+        sc_obj, 
+        groups[[group_name]], 
+        title = paste("Transcriptional Similarity Map:", group_name),
+        n_bins = 100
+    )
+    
+    if (!is.null(p)) {
+        # Print individually so each gets its own output window
+        print(p)
+        
+        out_path <- paste0("../figures/sc_similarity_maps/Similarity_Map_", group_name, ".png")
+        ggsave(out_path, p, width = 10, height = 6)
+    }
+}
+```
+
+## 4. Refined Global Comparison (Z-Scored)
+```{r refined_global, fig.width=10, fig.height=8}
+for (group_name in names(groups)) {
+    message(paste("Refining similarity for:", group_name))
+    p_ref <- plot_triangular_similarity_refined(sc_obj, groups[[group_name]], 
+                                               title = paste("Refined Similarity:", group_name), n_bins = 100)
+    if (!is.null(p_ref)) {
+        # Print individually
+        print(p_ref)
+        
+        out_path <- paste0("../figures/sc_similarity_maps/Refined_Similarity_Map_", group_name, ".png")
+        ggsave(out_path, p_ref, width = 10, height = 6)
+    }
+}
+```
+

@@ -1,0 +1,305 @@
+---
+title: "Directional Signaling 3D Mapping"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(dplyr)
+library(readxl)
+library(jsonlite)
+
+base_dir <- "/home/mattia/Thesis/111125ST_def"
+
+# Output directories
+out_sc <- file.path(base_dir, "figures", "3D_signaling_modules")
+out_sp <- file.path(base_dir, "figures", "3D_spatial_signaling_modules")
+dir.create(out_sc, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_sp, showWarnings = FALSE, recursive = TRUE)
+
+# --- ADJUSTABLE PARAMETERS ---
+# Threshold for top X% most active regions (e.g. 0.90 = Top 10%)
+overlap_threshold <- 0.90
+
+# Spatial pseudotime distance to consider as "overlapping" or paracrine gap
+# (e.g. 3 units means a Ligand and Receptor within 3 units of each other are considered overlapping)
+overlap_tolerance_pt <- 3.0
+# ----------------------------
+```
+
+## 1. Load Single-Cell Data & Mesh
+
+```{r load_data}
+cat("Loading Single Cell object...\n")
+sc_obj <- readRDS(file.path(base_dir, "Random data", "sc_with_spatial_scores.rds"))
+
+cat("Loading 3D Mesh...\n")
+mesh_data <- readRDS(file.path(base_dir, "figures", "3D_mesh_plots_starvation", "tube_mesh_cache.rds"))
+
+cat("Loading Signaling Components...\n")
+sig_data <- read_excel(file.path(base_dir, "Excels", "list_of_signalling_components.xlsx"))
+```
+
+## 2. Process Genes (Single-Cell)
+
+```{r process_genes}
+# Filter for ligands and receptors (case insensitive)
+sig_data <- sig_data %>%
+  filter(toupper(Group) %in% c("LIGAND", "RECEPTOR"))
+
+# Format gene names to match Seurat
+sig_data$Formatted_Gene <- gsub("[[:space:]]", "", toupper(gsub("\\..*$", "", sig_data$Symbol)))
+
+# Check presence in Seurat
+available_genes <- rownames(sc_obj)
+sig_data$In_Seurat <- sig_data$Formatted_Gene %in% available_genes
+
+cat("\nSummary of valid genes mapped to SC Seurat:\n")
+print(table(sig_data$In_Seurat))
+```
+
+## 3. Add Module Scores (Single-Cell)
+
+```{r add_scores}
+pathways <- unique(sig_data$Pathway)
+roles <- unique(toupper(sig_data$Group))
+module_names <- c()
+
+for (p in pathways) {
+  for (r in roles) {
+    genes <- sig_data %>% filter(Pathway == p & toupper(Group) == r & In_Seurat == TRUE) %>% pull(Formatted_Gene)
+    if (length(genes) > 0) {
+      safe_p <- gsub("[^A-Za-z0-9]", "_", p)
+      module_name <- paste0(safe_p, "_", r)
+      sc_obj <- AddModuleScore(sc_obj, features = list(genes), name = module_name)
+      actual_col <- paste0(module_name, "1")
+      sc_obj[[module_name]] <- sc_obj[[actual_col]]
+      sc_obj[[actual_col]] <- NULL
+      module_names <- c(module_names, module_name)
+    }
+  }
+}
+```
+
+## 4. Single-Cell: Map to Mesh and Export
+
+```{r export_continuous}
+# Extract coordinates from mesh
+x <- mesh_data$v_matrix[, 1]
+y <- mesh_data$v_matrix[, 2]
+z <- mesh_data$v_matrix[, 3]
+i <- mesh_data$f_matrix[, 1]
+j <- mesh_data$f_matrix[, 2]
+k <- mesh_data$f_matrix[, 3]
+v_pt <- mesh_data$vertex_pseudotime
+
+sc_valid <- subset(sc_obj, subset = !is.na(Smoothed_Pseudotime))
+cell_pt <- sc_valid$Smoothed_Pseudotime
+
+for (mod in module_names) {
+  expr <- sc_valid[[mod]][,1]
+  loess_model <- loess(expr ~ cell_pt, span = 0.3)
+  predicted_expr <- predict(loess_model, v_pt)
+  
+  valid_expr <- predicted_expr[!is.na(predicted_expr)]
+  if(length(valid_expr) > 0) {
+    q_low <- quantile(valid_expr, 0.05, na.rm=TRUE)
+    q_high <- quantile(valid_expr, 0.95, na.rm=TRUE)
+    predicted_expr[predicted_expr < q_low] <- q_low
+    predicted_expr[predicted_expr > q_high] <- q_high
+  }
+  
+  trace <- list(
+    type = 'mesh3d',
+    x = x, y = y, z = z, i = i, j = j, k = k,
+    intensity = predicted_expr,
+    colorscale = 'Viridis', opacity = 1.0, showscale = TRUE,
+    colorbar = list(title = "Score", tickformat = ".4f", exponentformat = "none")
+  )
+  trace_json <- toJSON(list(trace), auto_unbox = TRUE)
+  title_text <- paste("SC Directional Signaling:", mod)
+  
+  html_template <- paste0('<!DOCTYPE html><html><head><title>', title_text, '</title><script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script></head><body style="margin: 0; padding: 0;"><div id="plotly-div" style="width:100vw; height:100vh;"></div><script>var data = ', trace_json, '; var layout = {title: "', title_text, '", scene: { aspectmode: "data" }}; Plotly.newPlot("plotly-div", data, layout);</script></body></html>')
+  
+  out_path <- file.path(out_sc, paste0(mod, "_3D.html"))
+  writeLines(html_template, out_path)
+}
+```
+
+## 5. Single-Cell: Composite Overlap Plots
+
+```{r export_composite}
+base_pathways <- unique(gsub("_LIGAND$|_RECEPTOR$", "", module_names))
+for (bp in base_pathways) {
+  lig_mod <- paste0(bp, "_LIGAND")
+  rec_mod <- paste0(bp, "_RECEPTOR")
+  
+  if (lig_mod %in% module_names && rec_mod %in% module_names) {
+    lig_expr <- sc_valid[[lig_mod]][,1]
+    lig_loess <- loess(lig_expr ~ cell_pt, span = 0.3)
+    pred_lig <- predict(lig_loess, v_pt)
+    
+    rec_expr <- sc_valid[[rec_mod]][,1]
+    rec_loess <- loess(rec_expr ~ cell_pt, span = 0.3)
+    pred_rec <- predict(rec_loess, v_pt)
+    
+    lig_thresh <- quantile(pred_lig, overlap_threshold, na.rm=TRUE)
+    rec_thresh <- quantile(pred_rec, overlap_threshold, na.rm=TRUE)
+    
+    is_lig_raw <- !is.na(pred_lig) & pred_lig >= lig_thresh
+    is_rec_raw <- !is.na(pred_rec) & pred_rec >= rec_thresh
+    
+    # Expand active zones by tolerance distance
+    is_lig_exp <- rep(FALSE, length(v_pt))
+    for (p_val in v_pt[is_lig_raw]) { is_lig_exp[abs(v_pt - p_val) <= overlap_tolerance_pt] <- TRUE }
+    
+    is_rec_exp <- rep(FALSE, length(v_pt))
+    for (p_val in v_pt[is_rec_raw]) { is_rec_exp[abs(v_pt - p_val) <= overlap_tolerance_pt] <- TRUE }
+    
+    category <- rep(0, length(v_pt))
+    category[is_lig_raw] <- 1
+    category[is_rec_raw] <- 2
+    
+    # Bridge gaps and overlaps with Purple
+    category[is_lig_exp & is_rec_exp] <- 3
+    
+    trace <- list(
+      type = 'mesh3d',
+      x = x, y = y, z = z, i = i, j = j, k = k,
+      intensity = category,
+      colorscale = list(
+        c(0, "#E2E2E2"), c(0.2, "#E2E2E2"),
+        c(0.2, "#E41A1C"), c(0.5, "#E41A1C"),
+        c(0.5, "#377EB8"), c(0.8, "#377EB8"),
+        c(0.8, "#984EA3"), c(1.0, "#984EA3")
+      ),
+      cmin = 0, cmax = 3, opacity = 1.0, showscale = FALSE 
+    )
+    
+    trace_json <- toJSON(list(trace), auto_unbox = TRUE)
+    title_text <- paste0("SC Composite Overlap: ", bp, "<br><span style='font-size:14px; color:#666;'>(Top ", (1-overlap_threshold)*100, "%, Tolerance ", overlap_tolerance_pt, " pt) | </span><span style='font-size:14px; color:#E2E2E2; background:#333; padding:2px;'>Grey: Neither</span> <span style='font-size:14px; color:#E41A1C;'>Red: Ligand</span> <span style='font-size:14px; color:#377EB8;'>Blue: Receptor</span> <span style='font-size:14px; color:#984EA3;'>Purple: Both/Close</span>")
+    
+    html_template <- paste0('<!DOCTYPE html><html><head><title>', title_text, '</title><script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script></head><body style="margin: 0; padding: 0;"><div id="plotly-div" style="width:100vw; height:100vh;"></div><script>var data = ', trace_json, '; var layout = {title: "', title_text, '", scene: { aspectmode: "data" }}; Plotly.newPlot("plotly-div", data, layout);</script></body></html>')
+    
+    out_path <- file.path(out_sc, paste0(bp, "_Composite_Overlap_3D.html"))
+    writeLines(html_template, out_path)
+  }
+}
+```
+
+## 6. Spatial Transcriptomics Pipeline
+
+```{r spatial_pipeline}
+cat("\n--- Running Spatial Data Pipeline ---\n")
+sp_obj <- readRDS(file.path(base_dir, "Random data", "merged_guts_spatial.rds"))
+
+# Format gene names to match Spatial (standard casing, just remove spaces)
+sig_data$Spatial_Gene <- gsub("[[:space:]]", "", gsub("\\..*$", "", sig_data$Symbol))
+available_sp_genes <- rownames(sp_obj)
+sig_data$In_Spatial <- sig_data$Spatial_Gene %in% available_sp_genes
+
+cat("Summary of valid genes mapped to Spatial Seurat:\n")
+print(table(sig_data$In_Spatial))
+
+sp_module_names <- c()
+for (p in pathways) {
+  for (r in roles) {
+    genes <- sig_data %>% filter(Pathway == p & toupper(Group) == r & In_Spatial == TRUE) %>% pull(Spatial_Gene)
+    if (length(genes) > 0) {
+      safe_p <- gsub("[^A-Za-z0-9]", "_", p)
+      module_name <- paste0(safe_p, "_", r)
+      sp_obj <- AddModuleScore(sp_obj, features = list(genes), name = module_name)
+      actual_col <- paste0(module_name, "1")
+      sp_obj[[module_name]] <- sp_obj[[actual_col]]
+      sp_obj[[actual_col]] <- NULL
+      sp_module_names <- c(sp_module_names, module_name)
+    }
+  }
+}
+
+# Map to Mesh
+sp_valid <- subset(sp_obj, subset = !is.na(Spatial_Pseudotime))
+cell_pt_sp <- sp_valid$Spatial_Pseudotime
+
+for (mod in sp_module_names) {
+  expr <- sp_valid[[mod]][,1]
+  loess_model <- loess(expr ~ cell_pt_sp, span = 0.3)
+  predicted_expr <- predict(loess_model, v_pt)
+  
+  valid_expr <- predicted_expr[!is.na(predicted_expr)]
+  if(length(valid_expr) > 0) {
+    q_low <- quantile(valid_expr, 0.05, na.rm=TRUE)
+    q_high <- quantile(valid_expr, 0.95, na.rm=TRUE)
+    predicted_expr[predicted_expr < q_low] <- q_low
+    predicted_expr[predicted_expr > q_high] <- q_high
+  }
+  
+  trace <- list(
+    type = 'mesh3d', x = x, y = y, z = z, i = i, j = j, k = k,
+    intensity = predicted_expr, colorscale = 'Viridis', opacity = 1.0, showscale = TRUE,
+    colorbar = list(title = "Score", tickformat = ".4f", exponentformat = "none")
+  )
+  trace_json <- toJSON(list(trace), auto_unbox = TRUE)
+  title_text <- paste("Spatial Directional Signaling:", mod)
+  
+  html_template <- paste0('<!DOCTYPE html><html><head><title>', title_text, '</title><script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script></head><body style="margin: 0; padding: 0;"><div id="plotly-div" style="width:100vw; height:100vh;"></div><script>var data = ', trace_json, '; var layout = {title: "', title_text, '", scene: { aspectmode: "data" }}; Plotly.newPlot("plotly-div", data, layout);</script></body></html>')
+  
+  out_path <- file.path(out_sp, paste0(mod, "_Spatial_3D.html"))
+  writeLines(html_template, out_path)
+}
+
+# Composite Overlap for Spatial
+base_pathways_sp <- unique(gsub("_LIGAND$|_RECEPTOR$", "", sp_module_names))
+for (bp in base_pathways_sp) {
+  lig_mod <- paste0(bp, "_LIGAND")
+  rec_mod <- paste0(bp, "_RECEPTOR")
+  
+  if (lig_mod %in% sp_module_names && rec_mod %in% sp_module_names) {
+    lig_expr <- sp_valid[[lig_mod]][,1]
+    lig_loess <- loess(lig_expr ~ cell_pt_sp, span = 0.3)
+    pred_lig <- predict(lig_loess, v_pt)
+    
+    rec_expr <- sp_valid[[rec_mod]][,1]
+    rec_loess <- loess(rec_expr ~ cell_pt_sp, span = 0.3)
+    pred_rec <- predict(rec_loess, v_pt)
+    
+    lig_thresh <- quantile(pred_lig, overlap_threshold, na.rm=TRUE)
+    rec_thresh <- quantile(pred_rec, overlap_threshold, na.rm=TRUE)
+    
+    is_lig_raw <- !is.na(pred_lig) & pred_lig >= lig_thresh
+    is_rec_raw <- !is.na(pred_rec) & pred_rec >= rec_thresh
+    
+    is_lig_exp <- rep(FALSE, length(v_pt))
+    for (p_val in v_pt[is_lig_raw]) { is_lig_exp[abs(v_pt - p_val) <= overlap_tolerance_pt] <- TRUE }
+    is_rec_exp <- rep(FALSE, length(v_pt))
+    for (p_val in v_pt[is_rec_raw]) { is_rec_exp[abs(v_pt - p_val) <= overlap_tolerance_pt] <- TRUE }
+    
+    category <- rep(0, length(v_pt))
+    category[is_lig_raw] <- 1
+    category[is_rec_raw] <- 2
+    category[is_lig_exp & is_rec_exp] <- 3
+    
+    trace <- list(
+      type = 'mesh3d', x = x, y = y, z = z, i = i, j = j, k = k,
+      intensity = category,
+      colorscale = list(
+        c(0, "#E2E2E2"), c(0.2, "#E2E2E2"),
+        c(0.2, "#E41A1C"), c(0.5, "#E41A1C"),
+        c(0.5, "#377EB8"), c(0.8, "#377EB8"),
+        c(0.8, "#984EA3"), c(1.0, "#984EA3")
+      ),
+      cmin = 0, cmax = 3, opacity = 1.0, showscale = FALSE 
+    )
+    
+    trace_json <- toJSON(list(trace), auto_unbox = TRUE)
+    title_text <- paste0("Spatial Composite Overlap: ", bp, "<br><span style='font-size:14px; color:#666;'>(Top ", (1-overlap_threshold)*100, "%, Tolerance ", overlap_tolerance_pt, " pt) | </span><span style='font-size:14px; color:#E2E2E2; background:#333; padding:2px;'>Grey: Neither</span> <span style='font-size:14px; color:#E41A1C;'>Red: Ligand</span> <span style='font-size:14px; color:#377EB8;'>Blue: Receptor</span> <span style='font-size:14px; color:#984EA3;'>Purple: Both/Close</span>")
+    
+    html_template <- paste0('<!DOCTYPE html><html><head><title>', title_text, '</title><script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script></head><body style="margin: 0; padding: 0;"><div id="plotly-div" style="width:100vw; height:100vh;"></div><script>var data = ', trace_json, '; var layout = {title: "', title_text, '", scene: { aspectmode: "data" }}; Plotly.newPlot("plotly-div", data, layout);</script></body></html>')
+    
+    out_path <- file.path(out_sp, paste0(bp, "_Spatial_Composite_Overlap_3D.html"))
+    writeLines(html_template, out_path)
+  }
+}
+
+cat("\nPipeline Completed. Check both output folders!\n")
+```

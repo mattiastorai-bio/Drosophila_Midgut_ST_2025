@@ -1,0 +1,1257 @@
+---
+title: "Single-Cell Spatial Deconvolution (sc_spatial_dec)"
+output: html_document
+date: "2026-02-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(spacexr)
+library(ggplot2)
+library(dplyr)
+library(Matrix)
+library(Matrix.utils)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(plotly)
+library(writexl)
+```
+
+## 1. Data Loading
+
+We load the Single-Cell reference and the Merged Spatial dataset produced by `3D_UMAP_Analysis.Rmd`.
+
+```{r load_data}
+# 1. Load Single-Cell Reference
+sc_path <- "/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds"
+if (!file.exists(sc_path)) stop("Single-cell reference not found.")
+seurat_sc <- readRDS(sc_path)
+
+# 2. Load Merged Spatial Data
+spatial_path <- "/home/mattia/Thesis/111125ST_def/Random data/merged_guts_spatial.rds"
+if (!file.exists(spatial_path)) stop("Merged spatial data not found. Please run 3D_UMAP_Analysis.Rmd first.")
+seurat_spatial <- readRDS(spatial_path)
+
+message("Datasets loaded successfully.")
+```
+
+## 2. Gene Name Harmonization
+
+Single-cell and Spatial data often have different gene naming conventions. We clean and match them.
+
+```{r gene_matching}
+# Function to clean and aggregate matrices
+harmonize_matrix <- function(mat) {
+  # Clean names: Uppercase, remove periods, remove ALL whitespace
+  genes <- gsub("[[:space:]]", "", toupper(gsub("\\..*$", "", rownames(mat))))
+  rownames(mat) <- genes
+  
+  # Aggregate duplicates
+  mat_agg <- aggregate.Matrix(mat, group = rownames(mat), fun = "sum")
+  return(mat_agg)
+}
+
+# Process both
+sc_counts <- harmonize_matrix(GetAssayData(seurat_sc, assay = "RNA", layer = "counts"))
+spatial_counts <- harmonize_matrix(GetAssayData(seurat_spatial, assay = "Segmented", layer = "counts"))
+
+# Intersect
+common_genes <- intersect(rownames(sc_counts), rownames(spatial_counts))
+sc_counts <- sc_counts[common_genes, ]
+spatial_counts <- spatial_counts[common_genes, ]
+
+message(paste("Harmonization complete. Common genes:", length(common_genes)))
+
+# Create filtered objects with matched counts
+seurat_sc <- CreateSeuratObject(counts = sc_counts, meta.data = seurat_sc@meta.data)
+seurat_spatial <- CreateSeuratObject(counts = spatial_counts, meta.data = seurat_spatial@meta.data)
+
+# Normalize
+seurat_sc <- SCTransform(seurat_sc, verbose = FALSE)
+seurat_spatial <- SCTransform(seurat_spatial, verbose = FALSE)
+```
+
+## 3. Approach A: Cell-by-cell Label Transfer (Spatial -> SC)
+
+We treat the Spatial dataset as the **Reference** because it contains the spatial scores (Pseudotime, PC coordinates) we want to transfer.
+
+```{r label_transfer}
+# 1. Run PCA on Spatial to use as reference
+seurat_spatial <- RunPCA(seurat_spatial, verbose = FALSE)
+
+# 2. Find Transfer Anchors
+message("--- Diagnostics: Spatial Reference ---")
+print(colnames(seurat_spatial@meta.data))
+print(summary(seurat_spatial$Spatial_Pseudotime))
+
+# Robustness check: Remove cells with NA pseudotime if any exist
+n_init <- ncol(seurat_spatial)
+seurat_spatial <- subset(seurat_spatial, subset = !is.na(Spatial_Pseudotime))
+if (ncol(seurat_spatial) < n_init) {
+  message(paste("Removed", n_init - ncol(seurat_spatial), "cells with NA pseudotime."))
+}
+
+# Ensure PCA exists
+if (!"pca" %in% names(seurat_spatial@reductions)) {
+  message("Running PCA on Reference...")
+  seurat_spatial <- RunPCA(seurat_spatial, verbose = FALSE)
+}
+
+# 2. Find Anchors
+message("Finding Transfer Anchors...")
+
+# Ensure Query has PCA and UMAP for visualization
+if (!"pca" %in% names(seurat_sc@reductions)) {
+  message("Running PCA on Query (Single-Cell)...")
+  seurat_sc <- RunPCA(seurat_sc, verbose = FALSE)
+}
+if (!"umap" %in% names(seurat_sc@reductions)) {
+  message("Running UMAP on Query (Single-Cell)...")
+  seurat_sc <- RunUMAP(seurat_sc, dims = 1:30, verbose = FALSE)
+}
+
+transfer_anchors <- FindTransferAnchors(
+  reference = seurat_spatial,
+  query = seurat_sc,
+  normalization.method = "SCT",
+  reference.assay = "SCT",
+  query.assay = "SCT",
+  dims = 1:30,
+  reference.reduction = "pca" 
+)
+
+# 4. Transfer Data
+# Transfer Pseudotime
+message("Transferring Pseudotime...")
+pt_predictions <- TransferData(
+  anchorset = transfer_anchors,
+  refdata = "Spatial_Pseudotime",
+  reference = seurat_spatial,
+  weight.reduction = seurat_sc[["pca"]],
+  dims = 1:30
+)
+
+# For numeric transfer, Seurat stores the result in predicted.id
+# We also capture the prediction score (confidence)
+seurat_sc$Transferred_Pseudotime <- as.numeric(as.character(pt_predictions$predicted.id))
+seurat_sc$Transfer_Confidence <- pt_predictions$prediction.score.max
+
+# 5. Noise Reduction: KNN Smoothing
+# If a cell is surrounded by neighbors with very different pseudotimes, 
+# it might be an anchor artifact. We smooth the scores using the SC UMAP/PCA neighborhood.
+message("Refining scores with KNN smoothing...")
+
+# Build or retrieve nearest neighbor graph
+if (!"SCT_nn" %in% names(seurat_sc@graphs)) {
+  message("Building nearest neighbor graph...")
+  seurat_sc <- FindNeighbors(seurat_sc, reduction = "pca", dims = 1:30, graph.name = "SCT_nn")
+}
+
+neighbors <- seurat_sc@graphs$SCT_nn
+# Simple smoothing: average of self + neighbors
+pt_vec <- seurat_sc$Transferred_Pseudotime
+# Convert graph to adjacency matrix
+adj <- as.matrix(neighbors)
+# Weight the neighbors (row-normalize)
+adj_norm <- adj / rowSums(adj)
+seurat_sc$Smoothed_Pseudotime <- as.numeric(adj_norm %*% pt_vec)
+
+# 6. Visualization: UMAP Projections
+p1 <- DimPlot(seurat_sc, reduction = "umap", group.by = "celltype", label = TRUE) + 
+  NoLegend() + ggtitle("Cell Types (UMAP)")
+
+p2 <- FeaturePlot(seurat_sc, features = "Transferred_Pseudotime") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle("Inferred spatial position")
+
+p3 <- FeaturePlot(seurat_sc, features = "Smoothed_Pseudotime") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle("Pseudotime (Smoothed)")
+
+p4 <- FeaturePlot(seurat_sc, features = "Transfer_Confidence") + 
+  scale_color_viridis_c(option = "mako") + 
+  ggtitle("Transfer Confidence")
+
+library(patchwork)
+(p1 + p2) / (p3 + p4)
+
+# 7. Visualization: PCA Projections (Reversed X-Axis)
+p5 <- DimPlot(seurat_sc, reduction = "pca", group.by = "celltype", label = TRUE) + 
+  NoLegend() + ggtitle("Cell Types (PCA)") + scale_x_reverse()
+
+p6 <- FeaturePlot(seurat_sc, features = "Smoothed_Pseudotime", reduction = "pca") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle("Smoothed Pseudotime (PCA)") + scale_x_reverse()
+
+print(p5 + p6)
+
+# 8. 3D Visualization: UMAP + Smoothed Pseudotime
+# Prepare simplified plotting dataframe
+plot_3d_df <- data.frame(
+  UMAP1 = Embeddings(seurat_sc, "umap")[,1],
+  UMAP2 = Embeddings(seurat_sc, "umap")[,2],
+  Pseudotime = seurat_sc$Smoothed_Pseudotime,
+  CellType = seurat_sc$celltype,
+  Confidence = seurat_sc$Transfer_Confidence
+)
+
+plot_ly(plot_3d_df, x = ~UMAP1, y = ~UMAP2, z = ~Pseudotime, 
+        color = ~CellType, colors = "Set3", type = "scatter3d", mode = "markers",
+        marker = list(size = 2),
+        text = ~paste("Type:", CellType, "<br>Conf:", round(Confidence, 2))) %>%
+  layout(title = "3D Smoothed Spatial Map",
+         scene = list(xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      zaxis = list(title = 'Inferred spatial position')))
+```
+
+
+## 4. Approach B: RCTD Deconvolution (SC as Pixels)
+
+We treat each Single Cell as a "pixel" and ask which Spatial "cluster" it belongs to.
+
+```{r rctd_deconvolution}
+# 1. Define Spatial Pseudotime Bins as "Clusters"
+# We divide the 0-100 pseudotime scale into bins (e.g., bins of 5)
+bin_width <- 5
+seurat_spatial$Pseudotime_Bin <- floor(seurat_spatial$Spatial_Pseudotime / bin_width) * bin_width
+seurat_spatial$Pseudotime_Bin_Label <- paste0("Bin_", seurat_spatial$Pseudotime_Bin)
+
+# 2. Filter out bins with < 25 cells (RCTD Requirement)
+bin_counts <- table(seurat_spatial$Pseudotime_Bin_Label)
+valid_bins <- names(bin_counts)[bin_counts >= 25]
+message(paste("Filtering bins. Keeping", length(valid_bins), "bins with >= 25 cells."))
+seurat_spatial <- subset(seurat_spatial, subset = Pseudotime_Bin_Label %in% valid_bins)
+seurat_spatial$Pseudotime_Bin_Label <- factor(seurat_spatial$Pseudotime_Bin_Label)
+
+# 3. Create Reference Object (Binned Pseudotime)
+spatial_counts_mat <- GetAssayData(seurat_spatial, assay = "SCT", layer = "counts")
+spatial_labels <- seurat_spatial$Pseudotime_Bin_Label
+names(spatial_labels) <- colnames(seurat_spatial)
+
+# RCTD Reference setup (Using SummarizedExperiment for compatibility)
+sc_ref_for_rctd <- SummarizedExperiment(
+  assays = list(counts = spatial_counts_mat),
+  colData = data.frame(cell_type = spatial_labels, row.names = names(spatial_labels))
+)
+
+# 3. Create Target Object (Single Cells as Pixels)
+# Since RCTD expects coordinates, we give them "zero" coordinates or random ones
+# as we don't have spatial positions for SC, but the algorithm needs the slot.
+sc_counts_mat <- GetAssayData(seurat_sc, assay = "SCT", layer = "counts")
+sc_coords <- data.frame(x = rep(0, ncol(seurat_sc)), y = rep(0, ncol(seurat_sc)), row.names = colnames(seurat_sc))
+
+spatial_target_for_rctd <- SpatialExperiment(
+  assays = list(counts = sc_counts_mat),
+  spatialCoords = as.matrix(sc_coords)
+)
+
+# 4. Run RCTD (with Caching)
+rctd_save_path <- "../Random data/myRCTD_spatial_bins_results.rds"
+
+if (file.exists(rctd_save_path)) {
+  message("Loading existing RCTD results from disk...")
+  myRCTD <- readRDS(rctd_save_path)
+} else {
+  message("No existing results found. Computing RCTD deconvolution...")
+  myRCTD <- createRctd(
+    spatial_experiment = spatial_target_for_rctd,
+    reference_experiment = sc_ref_for_rctd,
+    cell_type_col = "cell_type"
+  )
+  myRCTD <- runRctd(myRCTD)
+  
+  message("Saving RCTD results for future use...")
+  saveRDS(myRCTD, rctd_save_path)
+}
+
+# 5. Extract Results
+# RCTD weights are Bins x Pixels (Cells). We transpose to get Cells x Bins for Seurat metadata.
+weights_mat <- as.matrix(assay(myRCTD, "weights"))
+weights <- as.data.frame(t(weights_mat))
+
+# Diagnostic Check
+message(paste("Weights dimensions:", nrow(weights), "x", ncol(weights)))
+message(paste("Seurat cells:", ncol(seurat_sc)))
+if (!all(rownames(weights) %in% colnames(seurat_sc))) {
+  warning("Metadata rownames do not perfectly match Seurat colnames!")
+}
+
+# Add weights to Seurat SC object
+seurat_sc <- AddMetaData(seurat_sc, metadata = weights)
+
+# 6. Visualization: UMAP Level Comparison
+# Plot weights for a specific pseudotime bin (e.g., Bin 0 or Bin 50)
+available_bins <- colnames(weights)
+target_bin <- available_bins[round(length(available_bins)/2)] # Pick center bin for demo
+
+p1_u <- DimPlot(seurat_sc, reduction = "umap", group.by = "celltype", label = TRUE) + 
+  NoLegend() + ggtitle("Cell Types (UMAP)")
+p2_u <- FeaturePlot(seurat_sc, features = target_bin) + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle(paste("RCTD:", target_bin, "(UMAP)"))
+p3_u <- FeaturePlot(seurat_sc, features = "Transferred_Pseudotime") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle("Pseudotime (UMAP)")
+
+library(patchwork)
+print(p1_u + p3_u) # + p2_u
+
+# 7. Visualization: PCA Level Comparison (Reversed X-Axis)
+p1_p <- DimPlot(seurat_sc, reduction = "pca", group.by = "celltype", label = TRUE) + 
+  NoLegend() + ggtitle("Cell Types (PCA)") + scale_x_reverse()
+p2_p <- FeaturePlot(seurat_sc, features = target_bin, reduction = "pca") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle(paste("RCTD:", target_bin, "(PCA)")) + scale_x_reverse()
+p3_p <- FeaturePlot(seurat_sc, features = "Transferred_Pseudotime", reduction = "pca") + 
+  scale_color_viridis_c(option = "magma") + 
+  ggtitle("Pseudotime (PCA)") + scale_x_reverse()
+
+print(p1_p + p3_p) #+ p2_p
+
+# 7. 3D Visualization: UMAP + Pseudotime (Colored by Cell Type)
+plot_3d_rctd_df <- data.frame(
+  UMAP1 = Embeddings(seurat_sc, "umap")[,1],
+  UMAP2 = Embeddings(seurat_sc, "umap")[,2],
+  Pseudotime = seurat_sc$Transferred_Pseudotime,
+  CellType = seurat_sc$celltype
+)
+
+plot_ly(plot_3d_rctd_df, x = ~UMAP1, y = ~UMAP2, z = ~Pseudotime, 
+        color = ~CellType, colors = "Set3", type = "scatter3d", mode = "markers",
+        marker = list(size = 2)) %>%
+  layout(title = "Approach B 3D: Cell Type Distribution",
+         scene = list(xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      zaxis = list(title = 'Transferred Pseudotime')))
+```
+
+## 6. Differential Gene Expression Analysis
+
+We perform DGE analysis using pseudotime as a continuous covariate to identify genes that vary along the spatial axis within each cell type.
+
+### Approach A: Smoothed Pseudotime DGE
+
+```{r dge_approach_a}
+library(presto)
+
+# Function to perform correlation-based DGE for a cell type
+run_pseudotime_dge <- function(seurat_obj, celltype_name, pseudotime_col = "Smoothed_Pseudotime") {
+  # Subset to specific cell type
+  cells_subset <- subset(seurat_obj, subset = celltype == celltype_name)
+  
+  if (ncol(cells_subset) < 50) {
+    message(paste("Skipping", celltype_name, "- too few cells:", ncol(cells_subset)))
+    return(NULL)
+  }
+  
+  message(paste("Analyzing", celltype_name, "with", ncol(cells_subset), "cells..."))
+  
+  # Get expression matrix and pseudotime
+  expr_mat <- GetAssayData(cells_subset, assay = "SCT", layer = "data")
+  pt_values <- cells_subset@meta.data[[pseudotime_col]]
+  
+  # Calculate correlation for each gene
+  correlations <- apply(expr_mat, 1, function(gene_expr) {
+    if (sd(gene_expr) == 0) return(c(cor = 0, pval = 1))
+    test <- cor.test(gene_expr, pt_values, method = "spearman")
+    c(cor = test$estimate, pval = test$p.value)
+  })
+  
+  # Create results dataframe
+  results <- data.frame(
+    gene = rownames(expr_mat),
+    correlation = correlations[1, ],
+    pvalue = correlations[2, ],
+    celltype = celltype_name,
+    n_cells = ncol(cells_subset)
+  )
+  
+  # Adjust p-values
+  results$padj <- p.adjust(results$pvalue, method = "BH")
+  
+  # Add mean expression
+  results$mean_expr <- rowMeans(expr_mat)
+  
+  # Sort by absolute correlation
+  results <- results[order(-abs(results$correlation)), ]
+  
+  return(results)
+}
+
+# Check if results already exist
+dge_smoothed_path <- "../Random data/dge_smoothed_pseudotime.csv"
+
+if (file.exists(dge_smoothed_path)) {
+  message("Loading existing smoothed pseudotime DGE results...")
+  dge_all_smoothed <- read.csv(dge_smoothed_path)
+  
+  # Reconstruct list format for downstream analysis
+  celltypes <- unique(seurat_sc$celltype)
+  dge_results_smoothed <- lapply(celltypes, function(ct) {
+    subset(dge_all_smoothed, celltype == ct)
+  })
+  names(dge_results_smoothed) <- celltypes
+  dge_results_smoothed <- dge_results_smoothed[sapply(dge_results_smoothed, nrow) > 0]
+  
+} else {
+  message("Computing smoothed pseudotime DGE...")
+  
+  # Run for all cell types with Smoothed Pseudotime
+  celltypes <- unique(seurat_sc$celltype)
+  dge_results_smoothed <- lapply(celltypes, function(ct) {
+    run_pseudotime_dge(seurat_sc, ct, "Smoothed_Pseudotime")
+  })
+  names(dge_results_smoothed) <- celltypes
+  
+  # Remove NULL results (cell types with too few cells)
+  dge_results_smoothed <- dge_results_smoothed[!sapply(dge_results_smoothed, is.null)]
+  
+  # Combine all results
+  dge_all_smoothed <- do.call(rbind, dge_results_smoothed)
+  
+  # Save results
+  write.csv(dge_all_smoothed, dge_smoothed_path, row.names = FALSE)
+  message("Saved smoothed pseudotime DGE results")
+}
+```
+
+### Approach B: Raw Pseudotime DGE (RCTD-based)
+
+```{r dge_approach_b}
+# Check if results already exist
+dge_raw_path <- "../Random data/dge_raw_pseudotime.csv"
+
+if (file.exists(dge_raw_path)) {
+  message("Loading existing raw pseudotime DGE results...")
+  dge_all_raw <- read.csv(dge_raw_path)
+  
+  # Reconstruct list format for downstream analysis
+  celltypes <- unique(seurat_sc$celltype)
+  dge_results_raw <- lapply(celltypes, function(ct) {
+    subset(dge_all_raw, celltype == ct)
+  })
+  names(dge_results_raw) <- celltypes
+  dge_results_raw <- dge_results_raw[sapply(dge_results_raw, nrow) > 0]
+  
+} else {
+  message("Computing raw pseudotime DGE...")
+  
+  # Run for all cell types with Raw Transferred Pseudotime
+  celltypes <- unique(seurat_sc$celltype)
+  dge_results_raw <- lapply(celltypes, function(ct) {
+    run_pseudotime_dge(seurat_sc, ct, "Transferred_Pseudotime")
+  })
+  names(dge_results_raw) <- celltypes
+  
+  # Remove NULL results
+  dge_results_raw <- dge_results_raw[!sapply(dge_results_raw, is.null)]
+  
+  # Combine all results
+  dge_all_raw <- do.call(rbind, dge_results_raw)
+  
+  # Save results
+  write.csv(dge_all_raw, dge_raw_path, row.names = FALSE)
+  message("Saved raw pseudotime DGE results")
+}
+```
+
+### Visualization: Top Pseudotime-Dependent Genes
+
+```{r dge_visualization}
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Select a cell type for detailed visualization (e.g., EC - Enterocytes)
+target_celltype <- "ISC"
+
+if (target_celltype %in% names(dge_results_smoothed)) {
+  ct_results <- dge_results_smoothed[[target_celltype]]
+  
+  # 1. Volcano Plot
+  ct_results$significant <- ct_results$padj < 0.05 & abs(ct_results$correlation) > 0.3
+  
+  p_volcano <- ggplot(ct_results, aes(x = correlation, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("grey70", "red3")) +
+    geom_vline(xintercept = c(-0.3, 0.3), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    labs(title = paste("Volcano Plot:", target_celltype),
+         x = "Spearman Correlation with Pseudotime",
+         y = "-log10(p-value)") +
+    theme_minimal()
+  
+  print(p_volcano)
+  
+  # 2. Heatmap of Top Genes
+  # Get top positively and negatively correlated genes
+  top_pos <- ct_results %>% filter(correlation > 0, padj < 0.05) %>% head(20)
+  top_neg <- ct_results %>% filter(correlation < 0, padj < 0.05) %>% head(20)
+  top_genes <- c(top_pos$gene, top_neg$gene)
+  
+  if (length(top_genes) > 0) {
+    # Subset cells
+    cells_subset <- subset(seurat_sc, subset = celltype == target_celltype)
+    
+    # Order cells by pseudotime
+    cells_ordered <- cells_subset@meta.data %>%
+      arrange(Smoothed_Pseudotime) %>%
+      rownames()
+    
+    # Get expression matrix
+    expr_mat <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[top_genes, cells_ordered]
+    
+    # Scale for visualization
+    expr_scaled <- t(scale(t(as.matrix(expr_mat))))
+    
+    # Create annotation for pseudotime
+    pt_anno <- cells_subset@meta.data[cells_ordered, "Smoothed_Pseudotime", drop = FALSE]
+    
+    library(pheatmap)
+    pheatmap(expr_scaled,
+             cluster_cols = FALSE,
+             cluster_rows = TRUE,
+             show_colnames = FALSE,
+             annotation_col = pt_anno,
+             color = colorRampPalette(c("blue", "white", "red"))(100),
+             main = paste("Top Pseudotime Genes:", target_celltype),
+             fontsize_row = 8)
+  }
+  
+  # 3. Pseudotime-Ordered Heatmap (Genes ordered by peak expression position)
+  # Get significant genes
+  sig_genes <- ct_results %>% filter(padj < 0.05, abs(correlation) > 0.3)
+  
+  if (nrow(sig_genes) > 0) {
+    # Limit to top genes if too many
+    if (nrow(sig_genes) > 50) {
+      sig_genes <- sig_genes %>% arrange(desc(abs(correlation))) %>% head(50)
+    }
+    
+    cells_subset <- subset(seurat_sc, subset = celltype == target_celltype)
+    
+    # Get expression matrix for significant genes
+    expr_mat <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[sig_genes$gene, ]
+    pt_values <- cells_subset$Smoothed_Pseudotime
+    
+    # Find peak expression position for each gene
+    gene_peak_positions <- apply(expr_mat, 1, function(gene_expr) {
+      # Bin pseudotime and find bin with highest mean expression
+      pt_bins <- cut(pt_values, breaks = 20, labels = FALSE)
+      bin_means <- tapply(gene_expr, pt_bins, mean, na.rm = TRUE)
+      which.max(bin_means)
+    })
+    
+    # Order genes by peak position
+    gene_order <- names(sort(gene_peak_positions))
+    
+    # Create binned pseudotime for visualization
+    pt_bins <- cut(pt_values, breaks = 50, labels = FALSE)
+    bin_centers <- tapply(pt_values, pt_bins, mean)
+    
+    # Average expression per bin
+    expr_binned <- t(apply(expr_mat[gene_order, ], 1, function(gene_expr) {
+      tapply(gene_expr, pt_bins, mean, na.rm = TRUE)
+    }))
+    
+    # Scale for visualization
+    expr_scaled <- t(scale(t(expr_binned)))
+    
+    # Create annotation
+    pt_anno <- data.frame(
+      Pseudotime = bin_centers,
+      row.names = colnames(expr_binned)
+    )
+    
+    library(pheatmap)
+    pheatmap(expr_scaled,
+             cluster_cols = FALSE,
+             cluster_rows = FALSE,  # Already ordered by peak
+             show_colnames = FALSE,
+             annotation_col = pt_anno,
+             color = colorRampPalette(c("blue", "white", "red"))(100),
+             main = paste("Pseudotime-Ordered Expression:", target_celltype),
+             fontsize_row = 6,
+             border_color = NA)
+  }
+  
+  # 4. Expression Curves for Top Genes
+  # Plot both increasing and decreasing genes
+  if (nrow(top_pos) > 0) {
+    # Select top 6 increasing genes
+    genes_to_plot_pos <- head(top_pos$gene, 6)
+    cells_subset <- subset(seurat_sc, subset = celltype == target_celltype)
+    
+    # Prepare data for plotting
+    plot_data <- data.frame(
+      Pseudotime = cells_subset$Smoothed_Pseudotime,
+      cell = colnames(cells_subset)
+    )
+    
+    for (gene in genes_to_plot_pos) {
+      plot_data[[gene]] <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[gene, ]
+    }
+    
+    # Reshape for ggplot
+    plot_data_long <- tidyr::pivot_longer(plot_data, 
+                                          cols = all_of(genes_to_plot_pos),
+                                          names_to = "Gene",
+                                          values_to = "Expression")
+    
+    p_curves_pos <- ggplot(plot_data_long, aes(x = Pseudotime, y = Expression)) +
+      geom_point(alpha = 0.3, size = 0.5, color = "grey60") +
+      geom_smooth(method = "loess", color = "red3", se = TRUE) +
+      facet_wrap(~Gene, scales = "free_y", ncol = 3) +
+      labs(title = paste("Top Increasing Genes:", target_celltype),
+           x = "Smoothed Pseudotime",
+           y = "Normalized Expression") +
+      theme_minimal()
+    
+    print(p_curves_pos)
+  }
+  
+  # Plot top decreasing genes
+  if (nrow(top_neg) > 0) {
+    genes_to_plot_neg <- head(top_neg$gene, 6)
+    cells_subset <- subset(seurat_sc, subset = celltype == target_celltype)
+    
+    plot_data_neg <- data.frame(
+      Pseudotime = cells_subset$Smoothed_Pseudotime,
+      cell = colnames(cells_subset)
+    )
+    
+    for (gene in genes_to_plot_neg) {
+      plot_data_neg[[gene]] <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[gene, ]
+    }
+    
+    plot_data_neg_long <- tidyr::pivot_longer(plot_data_neg, 
+                                              cols = all_of(genes_to_plot_neg),
+                                              names_to = "Gene",
+                                              values_to = "Expression")
+    
+    p_curves_neg <- ggplot(plot_data_neg_long, aes(x = Pseudotime, y = Expression)) +
+      geom_point(alpha = 0.3, size = 0.5, color = "grey60") +
+      geom_smooth(method = "loess", color = "blue3", se = TRUE) +
+      facet_wrap(~Gene, scales = "free_y", ncol = 3) +
+      labs(title = paste("Top Decreasing Genes:", target_celltype),
+           x = "Smoothed Pseudotime",
+           y = "Normalized Expression") +
+      theme_minimal()
+    
+    print(p_curves_neg)
+  }
+}
+```
+
+### Cell-Type-Specific Spatial Genes
+
+```{r celltype_specific_genes}
+# Identify genes that are both spatially regulated AND cell-type-specific
+# This helps find regional specialization markers unique to each cell type
+
+if (target_celltype %in% names(dge_results_smoothed)) {
+  
+  # 1. Calculate cell-type specificity for each gene
+  # Use a simple approach: ratio of expression in target vs other cell types
+  
+  message(paste("Identifying cell-type-specific spatial genes for", target_celltype))
+  
+  cells_target <- subset(seurat_sc, subset = celltype == target_celltype)
+  cells_other <- subset(seurat_sc, subset = celltype != target_celltype)
+  
+  # Get mean expression in each group
+  expr_target <- rowMeans(GetAssayData(cells_target, assay = "SCT", layer = "data"))
+  expr_other <- rowMeans(GetAssayData(cells_other, assay = "SCT", layer = "data"))
+  
+  # Calculate specificity score (log2 fold change)
+  specificity_score <- log2((expr_target + 0.01) / (expr_other + 0.01))
+  
+  # Get DGE results for this cell type
+  ct_results <- dge_results_smoothed[[target_celltype]]
+  
+  # Add specificity scores
+  ct_results$specificity <- specificity_score[ct_results$gene]
+  
+  # Filter for genes that are:
+  # 1. Spatially regulated (padj < 0.05, |cor| > 0.3)
+  # 2. Cell-type-specific (specificity > 1, i.e., 2-fold enriched)
+  specific_spatial_genes <- ct_results %>%
+    filter(padj < 0.05, abs(correlation) > 0.3, specificity > 1) %>%
+    arrange(desc(specificity))
+  
+  message(paste("Found", nrow(specific_spatial_genes), "cell-type-specific spatial genes"))
+  
+  if (nrow(specific_spatial_genes) > 0) {
+    # 2. Volcano plot highlighting cell-type-specific genes
+    ct_results$category <- "Other"
+    ct_results$category[ct_results$padj < 0.05 & abs(ct_results$correlation) > 0.3] <- "Spatial"
+    ct_results$category[ct_results$gene %in% specific_spatial_genes$gene] <- "Specific + Spatial"
+    
+    p_specific_volcano <- ggplot(ct_results, aes(x = correlation, y = -log10(pvalue), color = category)) +
+      geom_point(alpha = 0.6, size = 1.5) +
+      scale_color_manual(values = c("Other" = "grey70", 
+                                     "Spatial" = "orange", 
+                                     "Specific + Spatial" = "darkred")) +
+      geom_vline(xintercept = c(-0.3, 0.3), linetype = "dashed", color = "grey40") +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+      labs(title = paste("Cell-Type-Specific Spatial Genes:", target_celltype),
+           x = "Expression Correlation with Position",
+           y = "-log10(p-value)",
+           color = "Gene Category") +
+      theme_minimal()
+    
+    print(p_specific_volcano)
+    
+    # 3. Expression curves for ALL cell-type-specific spatial genes
+    # Plot in batches of 6 genes per plot
+    if (nrow(specific_spatial_genes) > 0) {
+      n_genes <- nrow(specific_spatial_genes)
+      genes_per_plot <- 6
+      n_plots <- ceiling(n_genes / genes_per_plot)
+      
+      message(paste("Creating", n_plots, "plots for", n_genes, "cell-type-specific spatial genes"))
+      
+      for (i in 1:n_plots) {
+        # Get genes for this batch
+        start_idx <- (i - 1) * genes_per_plot + 1
+        end_idx <- min(i * genes_per_plot, n_genes)
+        genes_batch <- specific_spatial_genes$gene[start_idx:end_idx]
+        
+        # Prepare data
+        plot_data_specific <- data.frame(
+          Pseudotime = cells_target$Smoothed_Pseudotime,
+          cell = colnames(cells_target)
+        )
+        
+        for (gene in genes_batch) {
+          plot_data_specific[[gene]] <- GetAssayData(cells_target, assay = "SCT", layer = "data")[gene, ]
+        }
+        
+        # Reshape for ggplot
+        plot_data_specific_long <- tidyr::pivot_longer(plot_data_specific, 
+                                                       cols = all_of(genes_batch),
+                                                       names_to = "Gene",
+                                                       values_to = "Expression")
+        
+        # Create plot
+        p_specific_curves <- ggplot(plot_data_specific_long, aes(x = Pseudotime, y = Expression)) +
+          geom_point(alpha = 0.3, size = 0.5, color = "grey60") +
+          geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+          facet_wrap(~Gene, scales = "free_y", ncol = 3) +
+          labs(title = paste("Cell-Type-Specific Spatial Markers:", target_celltype, 
+                            paste0("(", start_idx, "-", end_idx, " of ", n_genes, ")")),
+               x = "Smoothed Pseudotime",
+               y = "Normalized Expression",
+               subtitle = paste("Genes enriched >2-fold in", target_celltype, "vs other cell types")) +
+          theme_minimal()
+        
+        print(p_specific_curves)
+      }
+    }
+    
+    # 4. Save cell-type-specific results
+    write.csv(specific_spatial_genes, 
+              paste0("../Random data/celltype_specific_spatial_", target_celltype, ".csv"),
+              row.names = FALSE)
+    message(paste("Saved cell-type-specific spatial genes for", target_celltype))
+  }
+}
+
+```
+
+### Comparison: Smoothed vs Raw Results
+
+```{r dge_comparison}
+# Compare results between smoothed and raw for the same cell type
+if (target_celltype %in% names(dge_results_smoothed) && 
+    target_celltype %in% names(dge_results_raw)) {
+  
+  smoothed_res <- dge_results_smoothed[[target_celltype]]
+  raw_res <- dge_results_raw[[target_celltype]]
+  
+  # Merge results
+  comparison <- merge(smoothed_res[, c("gene", "correlation", "padj")],
+                      raw_res[, c("gene", "correlation", "padj")],
+                      by = "gene",
+                      suffixes = c("_smoothed", "_raw"))
+  
+  # Plot correlation comparison
+  p_compare <- ggplot(comparison, aes(x = correlation_raw, y = correlation_smoothed)) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(title = paste("Smoothed vs Raw Pseudotime Correlations:", target_celltype),
+         x = "Correlation (Raw Pseudotime)",
+         y = "Correlation (Smoothed Pseudotime)") +
+    theme_minimal()
+  
+  print(p_compare)
+  
+  # Identify genes with large differences
+  comparison$diff <- abs(comparison$correlation_smoothed - comparison$correlation_raw)
+  top_diff <- comparison %>% arrange(desc(diff)) %>% head(10)
+  
+  message("Top genes with largest difference between smoothed and raw:")
+  print(top_diff[, c("gene", "correlation_smoothed", "correlation_raw", "diff")])
+}
+```
+
+## 6b. Collapsed Cell-Type DGE Analysis
+This section performs DGE analysis on higher-level cell type categories to identify broader lineage-level spatial patterns.
+
+```{r collapsed_celltype_dge}
+library(ggplot2)
+library(dplyr)
+# 1. Create collapsed cell type labels
+seurat_sc$celltype_collapsed <- seurat_sc$celltype
+# Define mapping
+ec_types <- c("aEC", "pEC", "mEC")
+dc_types <- c("ISC", "EB", "dEC")
+# Apply mapping
+seurat_sc$celltype_collapsed[seurat_sc$celltype %in% ec_types] <- "EC"
+seurat_sc$celltype_collapsed[seurat_sc$celltype %in% dc_types] <- "DC"
+# 2. Filter to keep only EC and DC
+seurat_collapsed <- subset(seurat_sc, subset = celltype_collapsed %in% c("EC", "DC"))
+message(paste("Filtered to", ncol(seurat_collapsed), "cells"))
+message(paste("EC cells:", sum(seurat_collapsed$celltype_collapsed == "EC")))
+message(paste("DC cells:", sum(seurat_collapsed$celltype_collapsed == "DC")))
+# 3. Run DGE analysis - with caching
+dge_collapsed_path <- "../Random data/dge_collapsed_pseudotime.csv"
+if (file.exists(dge_collapsed_path)) {
+  message("Loading existing collapsed DGE results...")
+  dge_all_collapsed <- read.csv(dge_collapsed_path)
+  collapsed_types <- c("EC", "DC")
+  dge_results_collapsed <- lapply(collapsed_types, function(ct) subset(dge_all_collapsed, celltype == ct))
+  names(dge_results_collapsed) <- collapsed_types
+  dge_results_collapsed <- dge_results_collapsed[sapply(dge_results_collapsed, nrow) > 0]
+} else {
+  message("Computing collapsed DGE...")
+  
+  # Modified DGE function for collapsed types
+  run_pseudotime_dge_collapsed <- function(seurat_obj, celltype_name, pseudotime_col = "Smoothed_Pseudotime") {
+    # Subset using celltype_collapsed instead of celltype
+    cells_subset <- subset(seurat_obj, subset = celltype_collapsed == celltype_name)
+    
+    if (ncol(cells_subset) < 50) {
+      message(paste("Skipping", celltype_name, "- too few cells:", ncol(cells_subset)))
+      return(NULL)
+    }
+    
+    message(paste("Analyzing", celltype_name, "with", ncol(cells_subset), "cells..."))
+    
+    expr_mat <- GetAssayData(cells_subset, assay = "SCT", layer = "data")
+    pt_values <- cells_subset@meta.data[[pseudotime_col]]
+    
+    correlations <- apply(expr_mat, 1, function(gene_expr) {
+      if (sd(gene_expr) == 0) return(c(cor = 0, pval = 1))
+      test <- cor.test(gene_expr, pt_values, method = "spearman")
+      c(cor = test$estimate, pval = test$p.value)
+    })
+    
+    results <- data.frame(
+      gene = rownames(expr_mat),
+      correlation = correlations[1, ],
+      pvalue = correlations[2, ],
+      celltype = celltype_name,
+      n_cells = ncol(cells_subset)
+    )
+    
+    results$padj <- p.adjust(results$pvalue, method = "BH")
+    results$mean_expr <- rowMeans(expr_mat)
+    results <- results[order(-abs(results$correlation)), ]
+    
+    return(results)
+  }
+  
+  collapsed_types <- c("EC", "DC")
+  dge_results_collapsed <- lapply(collapsed_types, function(ct) {
+    run_pseudotime_dge_collapsed(seurat_collapsed, ct, "Smoothed_Pseudotime")
+  })
+  names(dge_results_collapsed) <- collapsed_types
+  dge_results_collapsed <- dge_results_collapsed[!sapply(dge_results_collapsed, is.null)]
+  dge_all_collapsed <- do.call(rbind, dge_results_collapsed)
+  write.csv(dge_all_collapsed, dge_collapsed_path, row.names = FALSE)
+}
+# 4. Visualizations for each collapsed type
+for (ct in names(dge_results_collapsed)) {
+  ct_results <- dge_results_collapsed[[ct]]
+  ct_results$significant <- ct_results$padj < 0.05 & abs(ct_results$correlation) > 0.3
+  
+  # Volcano plot
+  p_volcano <- ggplot(ct_results, aes(x = correlation, y = -log10(pvalue), color = significant)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    scale_color_manual(values = c("grey70", "red3")) +
+    geom_vline(xintercept = c(-0.3, 0.3), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    labs(title = paste("Collapsed:", ct), subtitle = "EC=aEC+pEC+mEC, DC=ISC+EB+dEC") +
+    theme_minimal()
+  print(p_volcano)
+  
+  # Get top genes and create heatmap (same logic as before)
+  sig_genes <- ct_results %>% filter(padj < 0.05, abs(correlation) > 0.3)
+  if (nrow(sig_genes) > 50) sig_genes <- sig_genes %>% arrange(desc(abs(correlation))) %>% head(50)
+  
+  if (nrow(sig_genes) > 0) {
+    cells_subset <- subset(seurat_collapsed, subset = celltype_collapsed == ct)
+    expr_mat <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[sig_genes$gene, ]
+    pt_values <- cells_subset$Smoothed_Pseudotime
+    
+    gene_peak_positions <- apply(expr_mat, 1, function(x) {
+      bins <- cut(pt_values, breaks = 20, labels = FALSE)
+      which.max(tapply(x, bins, mean, na.rm = TRUE))
+    })
+    gene_order <- names(sort(gene_peak_positions))
+    
+    pt_bins <- cut(pt_values, breaks = 50, labels = FALSE)
+    expr_binned <- t(apply(expr_mat[gene_order, ], 1, function(x) tapply(x, pt_bins, mean, na.rm = TRUE)))
+    expr_scaled <- t(scale(t(expr_binned)))
+    
+    pheatmap(expr_scaled, cluster_cols = FALSE, cluster_rows = FALSE, show_colnames = FALSE,
+             color = colorRampPalette(c("blue", "white", "red"))(100),
+             main = paste(ct, "(Collapsed)"), fontsize_row = 6, border_color = NA)
+  }
+  
+  # Expression curves for top increasing/decreasing
+  top_pos <- ct_results %>% filter(correlation > 0, padj < 0.05) %>% head(6)
+  top_neg <- ct_results %>% filter(correlation < 0, padj < 0.05) %>% head(6)
+  
+  for (direction in c("pos", "neg")) {
+    genes_list <- if (direction == "pos") top_pos else top_neg
+    if (nrow(genes_list) == 0) next
+    
+    cells_subset <- subset(seurat_collapsed, subset = celltype_collapsed == ct)
+    plot_data <- data.frame(Pseudotime = cells_subset$Smoothed_Pseudotime)
+    for (g in genes_list$gene) plot_data[[g]] <- GetAssayData(cells_subset, assay = "SCT", layer = "data")[g, ]
+    
+    plot_long <- tidyr::pivot_longer(plot_data, cols = -Pseudotime, names_to = "Gene", values_to = "Expression")
+    color_val <- if (direction == "pos") "red3" else "blue3"
+    title_text <- if (direction == "pos") "Increasing" else "Decreasing"
+    
+    p <- ggplot(plot_long, aes(x = Pseudotime, y = Expression)) +
+      geom_point(alpha = 0.3, size = 0.5, color = "grey60") +
+      geom_smooth(method = "loess", color = color_val, se = TRUE) +
+      facet_wrap(~Gene, scales = "free_y", ncol = 3) +
+      labs(title = paste(title_text, "Genes:", ct, "(Collapsed)")) +
+      theme_minimal()
+    print(p)
+  }
+}
+```
+
+### Cell-Type-Specific Spatial Genes (Collapsed Groups)
+```{r collapsed_celltype_specific_genes}
+# Identify genes that are both spatially regulated AND specific to EC or DC
+for (target_ct in c("EC", "DC")) {
+  if (target_ct %in% names(dge_results_collapsed)) {
+    
+    message(paste("Identifying cell-type-specific spatial genes for", target_ct))
+    
+    # Calculate specificity: EC vs DC or DC vs EC
+    cells_target <- subset(seurat_collapsed, subset = celltype_collapsed == target_ct)
+    cells_other <- subset(seurat_collapsed, subset = celltype_collapsed != target_ct)
+    
+    # Get mean expression
+    expr_target <- rowMeans(GetAssayData(cells_target, assay = "SCT", layer = "data"))
+    expr_other <- rowMeans(GetAssayData(cells_other, assay = "SCT", layer = "data"))
+    
+    # Specificity score
+    specificity_score <- log2((expr_target + 0.01) / (expr_other + 0.01))
+    
+    ct_results <- dge_results_collapsed[[target_ct]]
+    ct_results$specificity <- specificity_score[ct_results$gene]
+    
+    # Filter for specific + spatial genes
+    specific_spatial_genes <- ct_results %>%
+      filter(padj < 0.05, abs(correlation) > 0.3, specificity > 1) %>%
+      arrange(desc(specificity))
+    
+    message(paste("Found", nrow(specific_spatial_genes), "genes for", target_ct))
+    
+    if (nrow(specific_spatial_genes) > 0) {
+      # Volcano plot
+      ct_results$category <- "Other"
+      ct_results$category[ct_results$padj < 0.05 & abs(ct_results$correlation) > 0.3] <- "Spatial"
+      ct_results$category[ct_results$gene %in% specific_spatial_genes$gene] <- "Specific + Spatial"
+      
+      p_volcano <- ggplot(ct_results, aes(x = correlation, y = -log10(pvalue), color = category)) +
+        geom_point(alpha = 0.6, size = 1.5) +
+        scale_color_manual(values = c("Other" = "grey70", "Spatial" = "orange", "Specific + Spatial" = "darkred")) +
+        geom_vline(xintercept = c(-0.3, 0.3), linetype = "dashed") +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        labs(title = paste(target_ct, "Specific Spatial Genes (Collapsed)"),
+             subtitle = paste(target_ct, "vs", ifelse(target_ct == "EC", "DC", "EC"))) +
+        theme_minimal()
+      print(p_volcano)
+      
+      # Expression curves - all genes in batches of 6
+      n_genes <- nrow(specific_spatial_genes)
+      for (i in 1:ceiling(n_genes / 6)) {
+        start_idx <- (i - 1) * 6 + 1
+        end_idx <- min(i * 6, n_genes)
+        genes_batch <- specific_spatial_genes$gene[start_idx:end_idx]
+        
+        plot_data <- data.frame(Pseudotime = cells_target$Smoothed_Pseudotime)
+        for (g in genes_batch) plot_data[[g]] <- GetAssayData(cells_target, assay = "SCT", layer = "data")[g, ]
+        
+        plot_long <- tidyr::pivot_longer(plot_data, cols = -Pseudotime, names_to = "Gene", values_to = "Expression")
+        
+        p <- ggplot(plot_long, aes(x = Pseudotime, y = Expression)) +
+          geom_point(alpha = 0.3, size = 0.5, color = "grey60") +
+          geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+          facet_wrap(~Gene, scales = "free_y", ncol = 3) +
+          labs(title = paste(target_ct, "Specific Markers (", start_idx, "-", end_idx, "of", n_genes, ")")) +
+          theme_minimal()
+        print(p)
+      }
+      
+      # Save results
+      write.csv(specific_spatial_genes, 
+                paste0("../Random data/celltype_specific_spatial_collapsed_", target_ct, ".csv"),
+                row.names = FALSE)
+    }
+  }
+}
+```
+
+## 7. Save Results
+
+```{r save_results}
+saveRDS(seurat_sc, "../Random data/sc_with_spatial_scores.rds")
+message("Saved single-cell object with transferred spatial content.")
+
+# 1. Set the identity to your cell type column
+Idents(seurat_sc) <- "celltype"
+
+# 2. Now subset using the identity you just set
+subset_obj <- subset(seurat_sc, idents = "EE")
+
+saveRDS(subset_obj, "../Random data/EE_with_spatial_scores.rds")
+message("Saved single-cell object with transferred spatial content.")
+```
+
+## 8. Export for Research (Excel)
+
+This section consolidates spatially cell-type specific genes for EE, ISC, EB, EC, and DC with specificity scores and direction of expression.
+
+```{r research_export}
+# 1. Define helper function for specificity
+calculate_specificity <- function(seurat_obj, ct_name, is_collapsed = FALSE) {
+  col_name <- if (is_collapsed) "celltype_collapsed" else "celltype"
+  
+  cells_target <- subset(seurat_obj, cells = colnames(seurat_obj)[seurat_obj[[col_name]] == ct_name])
+  cells_other <- subset(seurat_obj, cells = colnames(seurat_obj)[seurat_obj[[col_name]] != ct_name])
+  
+  expr_target <- rowMeans(GetAssayData(cells_target, assay = "SCT", layer = "data"))
+  expr_other <- rowMeans(GetAssayData(cells_other, assay = "SCT", layer = "data"))
+  
+  spec <- log2((expr_target + 0.01) / (expr_other + 0.01))
+  return(spec)
+}
+
+# 2. Collect results for each requested type
+target_types <- list(
+  EE = list(obj = seurat_sc, results = dge_results_smoothed, collapsed = FALSE),
+  ISC = list(obj = seurat_sc, results = dge_results_smoothed, collapsed = FALSE),
+  EB = list(obj = seurat_sc, results = dge_results_smoothed, collapsed = FALSE),
+  EC = list(obj = seurat_collapsed, results = dge_results_collapsed, collapsed = TRUE),
+  DC = list(obj = seurat_collapsed, results = dge_results_collapsed, collapsed = TRUE)
+)
+
+all_research_genes <- list()
+
+for (ct_name in names(target_types)) {
+  info <- target_types[[ct_name]]
+  
+  if (ct_name %in% names(info$results)) {
+    message(paste("Processing", ct_name, "for export..."))
+    
+    # Get DGE results
+    ct_dge <- info$results[[ct_name]]
+    
+    # Calculate specificity
+    ct_spec <- calculate_specificity(info$obj, ct_name, info$collapsed)
+    ct_dge$specificity <- ct_spec[ct_dge$gene]
+    
+    # Filter for significant spatial genes
+    # Criteria: padj < 0.05, |correlation| > 0.3, specificity > 1
+    sig_spatial <- ct_dge %>% 
+      dplyr::filter(padj < 0.05, abs(correlation) > 0.3, specificity > 1) %>%
+      dplyr::arrange(desc(specificity)) %>%
+      dplyr::mutate(
+        Direction = ifelse(correlation > 0, "Increasing", "Decreasing"),
+        Expression_Status = "Specific Marker"
+      ) %>%
+      dplyr::select(gene, celltype, correlation, Direction, pvalue, padj, mean_expr, specificity, Expression_Status)
+    
+    all_research_genes[[ct_name]] <- sig_spatial
+  } else {
+    message(paste("Warning: No DGE results found for", ct_name, "- skipping."))
+  }
+}
+
+# 3. Consolidate and Save
+if (length(all_research_genes) > 0) {
+  final_df <- do.call(rbind, all_research_genes)
+  
+  # Export to Excel
+  output_path <- "../Excels/sc_spatial_dec_markers.xlsx"
+  write_xlsx(final_df, output_path)
+  
+  message(paste("Successfully exported spatial markers to", output_path))
+  print(head(final_df))
+} else {
+  message("No significant spatial markers found for any requested cell type.")
+}
+```
+
+## 9. Automated HTML Report Generation (Spatial Markers)
+
+This chunk generates a standalone HTML report of spatial markers for the requested cell types (ISC, EE, EB, DC, EC).
+
+```{r html_report_generation}
+library(patchwork)
+library(rmarkdown)
+
+# 1. Configuration & Path Fix
+report_types <- c("ISC", "EE", "EB", "DC", "EC")
+project_root <- normalizePath("..")
+output_dir <- file.path(project_root, "figures")
+output_file <- file.path(output_dir, "spatial_markers_report.html")
+
+# Automated Check
+if (file.exists(output_file)) {
+  message("--- INFO: HTML Report already exists at: ", output_file)
+  message("--- To regenerate it, delete the file or set force_render <- TRUE")
+  force_render <- FALSE 
+} else {
+  force_render <- TRUE
+}
+
+if (force_render) {
+  message("Generating HTML report for:", paste(report_types, collapse = ", "))
+  temp_rmd <- tempfile(fileext = ".Rmd")
+  
+  cat("---
+title: 'Spatial Markers Report (Seurat Spatial Dec)'
+date: '`r Sys.Date()`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    self_contained: true
+---
+
+", file = temp_rmd)
+
+  for (ct in report_types) {
+    if (ct %in% names(target_types)) {
+      data_entry <- target_types[[ct]]
+      res <- data_entry$results[[ct]]
+      
+      # Calculate specificity for report filtering
+      ct_spec <- calculate_specificity(data_entry$obj, ct, data_entry$collapsed)
+      res$specificity <- ct_spec[res$gene]
+      
+      sig_markers <- res %>% 
+        filter(padj < 0.05, abs(correlation) > 0.3, specificity > 1)
+      sig_markers$gene <- gsub("[[:space:]]", "", as.character(sig_markers$gene))
+      sig_markers <- sig_markers %>% arrange(desc(specificity))
+      
+      message(paste("---", ct, ": Found", nrow(sig_markers), "significant markers for report."))
+      
+      if (nrow(sig_markers) > 0) {
+        cat(paste0("\n# ", ct, " {.tabset}\n\n"), file = temp_rmd, append = TRUE)
+        n_markers <- nrow(sig_markers)
+        batch_size <- 6
+        n_batches <- ceiling(n_markers / batch_size)
+        
+        for (i in 1:n_batches) {
+          start_idx <- (i - 1) * batch_size + 1
+          end_idx <- min(i * batch_size, n_markers)
+          markers_batch <- gsub("[[:space:]]", "", sig_markers$gene[start_idx:end_idx])
+          
+          cat(paste0("## Batch ", i, " (", start_idx, "-", end_idx, ")\n"), 
+              file = temp_rmd, append = TRUE)
+          chunk_header <- paste0("```{r plot_", ct, "_batch_", i, ", echo=FALSE, fig.width=12, fig.height=8, warning=FALSE, message=FALSE}\n")
+          cat(chunk_header, file = temp_rmd, append = TRUE)
+          cat(paste0("target_ct <- '", ct, "'\n"), file = temp_rmd, append = TRUE)
+          cat(paste0("is_collapsed <- ", ifelse(data_entry$collapsed, "TRUE", "FALSE"), "\n"), file = temp_rmd, append = TRUE)
+          
+          cat("if (is_collapsed) {
+            target_ids <- which(seurat_collapsed$celltype_collapsed == target_ct)
+            cells_target <- if(length(target_ids) > 0) seurat_collapsed[, target_ids] else NULL
+          } else {
+            target_ids <- which(seurat_sc$celltype == target_ct)
+            cells_target <- if(length(target_ids) > 0) seurat_sc[, target_ids] else NULL
+          }\n", file = temp_rmd, append = TRUE)
+          
+          cat("if (!is.null(cells_target)) {
+            plot_data <- data.frame(Pseudotime = cells_target$Smoothed_Pseudotime, row.names = colnames(cells_target))
+            valid_markers <- c()\n", file = temp_rmd, append = TRUE)
+          for (g in markers_batch) {
+            cat(paste0("if ('", g, "' %in% rownames(GetAssayData(cells_target, assay = 'SCT'))) {
+              plot_data[['", g, "']] <- GetAssayData(cells_target, assay = 'SCT', layer = 'data')['", g, "', ]
+              valid_markers <- c(valid_markers, '", g, "')
+            }\n"), file = temp_rmd, append = TRUE)
+          }
+          cat("if (length(valid_markers) > 0) {
+            plot_list <- lapply(valid_markers, function(g) {
+              ggplot(plot_data, aes(x = Pseudotime, y = .data[[g]])) +
+                geom_point(alpha = 0.2, size = 0.5, color = 'grey70') +
+                geom_smooth(method = 'loess', color = 'darkred', se = TRUE) +
+                theme_minimal() + labs(title = g, y = 'Expr', x = 'Pseudotime')
+            })
+            patchwork::wrap_plots(plot_list, ncol = 3, nrow = 2)
+          } else { print('No valid markers found.') }
+        } else { print('No cells found.') }\n", file = temp_rmd, append = TRUE)
+          cat("```\n\n", file = temp_rmd, append = TRUE)
+        }
+      }
+    }
+  }
+  render(temp_rmd, output_file = output_file, quiet = FALSE, envir = globalenv())
+}
+```
+
+## 10. Focused Granular EE Analysis (3D Spatial Mapping)
+
+This section focuses specifically on the granular labels: **AstC-EE, EEP, classIII-EE, and Tk-EE**.
+
+```{r granular_ee_3d_viz}
+# 1. Temporarily Switch to Granular Identities
+if ("celltype_granular" %in% colnames(seurat_sc@meta.data)) {
+  message("Setting identities to celltype_granular for focused visualization...")
+  temp_celltype <- seurat_sc$celltype
+  seurat_sc$celltype <- seurat_sc$celltype_granular
+  Idents(seurat_sc) <- "celltype"
+}
+
+target_granular_types <- c("AstC-EE", "EEP", "classIII-EE", "Tk-EE")
+message(paste("Visualizing granular types:", paste(target_granular_types, collapse = ", ")))
+
+# 3D Visualization
+plot_3d_granular_df <- data.frame(
+  UMAP1 = Embeddings(seurat_sc, "umap")[,1],
+  UMAP2 = Embeddings(seurat_sc, "umap")[,2],
+  Pseudotime = seurat_sc$Smoothed_Pseudotime,
+  CellType = seurat_sc$celltype
+)
+plot_3d_granular_df_subset <- plot_3d_granular_df[plot_3d_granular_df$CellType %in% target_granular_types, ]
+
+plot_ly(plot_3d_granular_df_subset, x = ~UMAP1, y = ~UMAP2, z = ~Pseudotime, 
+        color = ~CellType, colors = "Set1", type = "scatter3d", mode = "markers",
+        marker = list(size = 3, opacity = 0.8),
+        text = ~paste("Type:", CellType, "<br>PT:", round(Pseudotime, 2))) %>%
+  layout(title = "3D Granular EE & Progenitor Spatial Map",
+         scene = list(xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      zaxis = list(title = 'Inferred position')))
+
+# Restore original identity column
+if (exists("temp_celltype")) {
+  seurat_sc$celltype <- temp_celltype
+  Idents(seurat_sc) <- "celltype"
+}
+```

@@ -1,0 +1,969 @@
+---
+title: "Global Transcriptional Comparison - Spatial Similarity Heatmaps"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(reshape2)
+library(gridExtra)
+library(patchwork)
+library(scales)
+library(plotly)
+library(zoo)
+
+# Set global control for overwriting results
+FORCE_OVERWRITE <- FALSE
+```
+
+## 1. Load Data
+```{r load_data}
+# Control for overwriting results
+FORCE_OVERWRITE <- FALSE
+
+# Ensure output directories exist
+if (!dir.exists("../figures/3D_glo")) dir.create("../figures/3D_glo", recursive = TRUE)
+if (!dir.exists("../Excels")) dir.create("../Excels", recursive = TRUE)
+
+# Clean up Windows :Zone.Identifier metadata files
+message("Cleaning up Windows :Zone.Identifier metadata files...")
+zone_files <- list.files(path = "..", pattern = "Zone.Identifier$", recursive = TRUE, full.names = TRUE)
+if (length(zone_files) > 0) {
+  unlink(zone_files)
+}
+
+# Attempt to load from Random data if object isn't in environment
+if (!exists("merged_guts")) {
+  rds_path <- "../Random data/merged_guts.rds"
+  if (file.exists(rds_path)) {
+    message("Loading merged_guts from RDS...")
+    merged_guts <- readRDS(rds_path)
+  } else {
+    stop("merged_guts not found in environment or Random data folder! Please run 3D_UMAP_Analysis.Rmd first.")
+  }
+}
+
+# Create a local copy to ensure the script is idempotent and doesn't modify the global object
+merged_guts_local <- merged_guts
+
+# Re-establish Dutta Regions for reference (idempotent on the local copy)
+if (!"Gut_Region" %in% colnames(merged_guts_local@meta.data) || FORCE_OVERWRITE) {
+  merged_guts_local$Gut_Region <- cut(
+    merged_guts_local$Spatial_Pseudotime, 
+    breaks = c(-Inf, 15, 40, 55, 85, Inf),
+    labels = c("R1", "R2", "R3", "R4", "R5")
+  )
+}
+
+# Standardize metadata naming (match Advanced Analysis logic)
+if (!"Predicted_CellType" %in% colnames(merged_guts_local@meta.data)) {
+    if ("Predicted_Type" %in% colnames(merged_guts_local@meta.data)) {
+        merged_guts_local$Predicted_CellType <- merged_guts_local$Predicted_Type
+    }
+}
+
+# Define groupings - Filtering out "Ambiguous" cells at the source
+is_ambiguous <- grepl("ambiguous", merged_guts_local$Predicted_CellType, ignore.case = TRUE)
+clean_cells <- Cells(merged_guts_local)[!is_ambiguous]
+
+groups <- list(
+    "All_Cells" = clean_cells,
+    "Progenitors" = if("Collapsed_Type" %in% colnames(merged_guts_local@meta.data)) {
+        intersect(clean_cells, Cells(merged_guts_local)[merged_guts_local$Collapsed_Type == "Progenitor"])
+    } else {
+        intersect(clean_cells, Cells(merged_guts_local)[merged_guts_local$Predicted_CellType %in% c("ISC", "EB")])
+    },
+    "Enterocytes" = if("Collapsed_Type" %in% colnames(merged_guts_local@meta.data)) {
+        intersect(clean_cells, Cells(merged_guts_local)[merged_guts_local$Collapsed_Type == "Enterocyte"])
+    } else {
+        intersect(clean_cells, Cells(merged_guts_local)[merged_guts_local$Predicted_CellType %in% c("EC", "Enterocyte")])
+    }
+)
+
+cat("✓ Data standardization and clean group definition complete (Ambiguous cells removed).\n")
+```
+
+## 2. Triangular Heatmap Function
+This function transforms a standard correlation matrix into a triangular "mountain" coordinate system (Hi-C style).
+
+```{r similarity_function}
+plot_triangular_similarity <- function(seurat_obj, cells, title = "Similarity Map", n_bins = 100) {
+    
+    # 1. Subset and Bin
+    if (length(cells) == 0) {
+        message(paste("! Skipping", title, "- No cells found in group."))
+        return(NULL)
+    }
+    sub <- subset(seurat_obj, cells = cells)
+    
+    # Extract variable genes for comparison
+    var_genes <- VariableFeatures(seurat_obj)
+    if(length(var_genes) == 0) {
+        sub <- FindVariableFeatures(sub, nfeatures = 2000, verbose = FALSE)
+        var_genes <- VariableFeatures(sub)
+    }
+    
+    # Bin by Spatial_Pseudotime (0-100)
+    sub$Bin <- factor(cut(sub$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    
+    # 2. Calculate Mean Expression per Bin
+    exp_mat <- GetAssayData(sub, layer = "data")[var_genes, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub$Bin, mean, na.rm = TRUE)))
+    
+    # Interpolate missing bins (handle gaps in data)
+    bin_means <- t(apply(bin_means, 1, function(x) {
+        if (all(is.na(x))) return(x)
+        na.approx(x, na.rm = FALSE, rule = 2)
+    }))
+    
+    # 3. Pairwise Spearman Correlation
+    cor_mat <- cor(bin_means, method = "spearman", use = "pairwise.complete.obs")
+    
+    # 4. Transform to Diamonds (Polygon approach to fill gaps)
+    # We define 4 vertices for each (i, j) pair in the rotated space
+    n <- nrow(cor_mat)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>%
+        filter(j >= i) %>%
+        rowwise() %>%
+        mutate(Similarity = cor_mat[i, j]) %>%
+        filter(!is.na(Similarity)) # Remove NA if we want strictly blank for no data
+    
+    # Generate polygon coordinates for diamonds
+    # Each diamond centered at x=(i+j)/2, y=(j-i)/2
+    # Vertices: (x, y+0.5), (x+0.5, y), (x, y-0.5), (x-0.5, y)
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2
+        cy <- (row$j - row$i) / 2
+        data.frame(
+            x = c(cx, cx + 0.5, cx, cx - 0.5),
+            y = c(cy + 0.5, cy, cy - 0.5, cy),
+            Similarity = row$Similarity,
+            ID = idx
+        )
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    # 5. Plot
+    # Custom palette: Deep purple -> Magenta -> Yellow (Vivid)
+    vivid_palette <- c("#0D0887", "#5302A3", "#8B0AA5", "#B83289", "#D8576B", "#ED7953", "#FBA238", "#F0F921")
+
+    p <- ggplot(poly_df, aes(x = x, y = y, fill = Similarity, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradientn(colors = vivid_palette, name = "Spearman\nCorrelation", limits = c(0, 1)) +
+        theme_minimal() +
+        coord_fixed(ratio = 1) + # Critical for diamond shapes to look correct
+        scale_x_continuous(expand = c(0,0), limits = c(0.5, n + 0.5), breaks = seq(0, n, by = 20)) +
+        scale_y_continuous(expand = c(0,0)) +
+        labs(title = title, 
+             subtitle = paste("Resolution:", n_bins, "Bins | Gap-Free Plot"),
+             x = "Anatomical Position (Gut Bins)", 
+             y = "Relative Distance") +
+        theme(
+            panel.grid = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.title = element_text(face = "bold", size = 14),
+            legend.position = "right"
+        )
+    
+    # Add Region Labels
+    region_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+    region_mid <- (region_breaks[-1] + region_breaks[-length(region_breaks)]) / 2
+    region_labs <- c("R1", "R2", "R3", "R4", "R5")
+    
+    p <- p + annotate("text", x = region_mid, y = -2, label = region_labs, fontface = "bold", size = 3.5) +
+        annotate("segment", x = region_breaks, xend = region_breaks, y = -4, yend = 0, color = "grey20", linetype = "dotted")
+        
+    return(p)
+}
+
+# --- Refined Function (Z-scaled + Smoothed) ---
+plot_triangular_similarity_refined <- function(seurat_obj, cells, title = "Refined Similarity Map", n_bins = 100, smoothing_window = 3) {
+    if (length(cells) == 0) {
+        message(paste("! Skipping", title, "- No cells found in group."))
+        return(NULL)
+    }
+    sub <- subset(seurat_obj, cells = cells)
+    var_genes <- VariableFeatures(seurat_obj)
+    if(length(var_genes) == 0) {
+        sub <- FindVariableFeatures(sub, nfeatures = 2000, verbose = FALSE)
+        var_genes <- VariableFeatures(sub)
+    }
+    sub$Bin <- factor(cut(sub$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    exp_mat <- GetAssayData(sub, layer = "data")[var_genes, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub$Bin, mean, na.rm = TRUE)))
+    
+    # Interpolate missing bins (handle gaps in data)
+    bin_means <- t(apply(bin_means, 1, function(x) {
+        if (all(is.na(x))) return(x)
+        na.approx(x, na.rm = FALSE, rule = 2)
+    }))
+    
+    # 1. Scaling (Z-score per gene across bins)
+    # This highlights where a gene is high Relative to itself across the gut
+    bin_scaled <- t(apply(bin_means, 1, function(x) {
+        if(all(is.na(x)) || sd(x, na.rm=T) == 0) return(rep(0, length(x)))
+        (x - mean(x, na.rm=T)) / sd(x, na.rm=T)
+    }))
+    
+    # 2. Gaussian-like Smoothing (3-bin Moving Average)
+    # Reduces bin-to-bin variance to show regional trends
+    bin_smoothed <- t(apply(bin_scaled, 1, function(x) {
+        if(all(x == 0)) return(x)
+        res <- as.numeric(stats::filter(x, rep(1/smoothing_window, smoothing_window), sides = 2))
+        res[is.na(res)] <- 0 # Handle edge effects of filter
+        return(res)
+    }))
+    
+    # 3. Pairwise Pearson Correlation
+    # Pearson on Z-scaled data effectively measures the similarity of the *spatial profile*
+    cor_mat <- cor(bin_smoothed, method = "pearson", use = "pairwise.complete.obs")
+    
+    # 4. Background Adjustment (Optional: Center around 0)
+    # Subtracting global mean correlation to highlight regions of Unique similarity
+    # We only compute mean for non-diagonal elements
+    diag(cor_mat) <- NA
+    global_mean <- mean(cor_mat, na.rm = TRUE)
+    cor_mat_adj <- cor_mat - global_mean
+    diag(cor_mat_adj) <- 1 # Keep diagonal for completeness
+    
+    # 5. Polygon Transform
+    n <- nrow(cor_mat_adj)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>%
+        filter(j >= i) %>%
+        rowwise() %>%
+        mutate(Similarity = cor_mat_adj[i, j]) %>%
+        filter(!is.na(Similarity))
+        
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2
+        cy <- (row$j - row$i) / 2
+        data.frame(
+            x = c(cx, cx + 0.5, cx, cx - 0.5),
+            y = c(cy + 0.5, cy, cy - 0.5, cy),
+            Similarity = row$Similarity,
+            ID = idx
+        )
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    # 6. Plot with Divergent Palette (Blue -> White -> Red)
+    p <- ggplot(poly_df, aes(x = x, y = y, fill = Similarity, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradient2(
+            high = "#B2182B", mid = "#F7F7F7", low = "#2166AC", 
+            midpoint = 0, name = "Relative\nSimilarity"
+        ) +
+        theme_minimal() +
+        coord_fixed(ratio = 1) +
+        scale_x_continuous(expand = c(0,0), limits = c(0.5, n + 0.5), breaks = seq(0, n, by = 20)) +
+        scale_y_continuous(expand = c(0,0)) +
+        labs(title = title, 
+             subtitle = "Refined Analysis (Z-scaled + Smoothed + Background Adj.)",
+             x = "Anatomical Position (Gut Bins)", 
+             y = "Relative Distance") +
+        theme(
+            panel.grid = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank(),
+            plot.title = element_text(face = "bold", size = 14)
+        )
+    
+    # Add Region Labels
+    region_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+    region_mid <- (region_breaks[-1] + region_breaks[-length(region_breaks)]) / 2
+    p <- p + annotate("text", x = region_mid, y = -2, label = c("R1", "R2", "R3", "R4", "R5"), fontface = "bold", size = 3.5) +
+        annotate("segment", x = region_breaks, xend = region_breaks, y = -4, yend = 0, color = "grey20", linetype = "dotted")
+        
+    return(p)
+}
+```
+
+## 3. Generate Maps
+```{r run_analysis, fig.width=10, fig.height=12}
+plots <- list()
+
+for (group_name in names(groups)) {
+    message(paste("Calculating similarity for:", group_name))
+    p <- plot_triangular_similarity(
+        merged_guts_local, 
+        groups[[group_name]], 
+        title = paste("Transcriptional Similarity Map:", group_name),
+        n_bins = 100
+    )
+    
+    if (!is.null(p)) {
+        plots[[group_name]] <- p
+        # Save individual plots (idempotent)
+        out_path <- paste0("../figures/3D_glo/Similarity_Map_", group_name, ".png")
+        if (FORCE_OVERWRITE || !file.exists(out_path)) {
+            ggsave(out_path, p, width = 10, height = 6)
+        }
+    }
+}
+
+# Display all
+grid.arrange(grobs = plots, ncol = 1)
+```
+
+## 4. Refined Global Comparison
+```{r refined_global, fig.width=10, fig.height=12}
+refined_plots <- list()
+for (group_name in names(groups)) {
+    message(paste("Refining similarity for:", group_name))
+    p_ref <- plot_triangular_similarity_refined(merged_guts_local, groups[[group_name]], 
+                                               title = paste("Refined Similarity:", group_name), n_bins = 100)
+    if (!is.null(p_ref)) {
+        refined_plots[[group_name]] <- p_ref
+        out_path <- paste0("../figures/3D_glo/Refined_Similarity_Map_", group_name, ".png")
+        if (FORCE_OVERWRITE || !file.exists(out_path)) {
+            ggsave(out_path, p_ref, width = 10, height = 6)
+        }
+    }
+}
+grid.arrange(grobs = refined_plots, ncol = 1)
+```
+
+## 4b. Combined Similarity and Cell Type Proportion
+This visualization aligns the refined global similarity heatmap with the cell type composition along the gut length.
+
+```{r combined_plot, fig.width=10, fig.height=12}
+# 1. Get the top plot (Refined All Cells)
+p_top <- refined_plots[["All_Cells"]]
+
+# 2. Generate the bottom plot (Celltype Proportion - Smoothed)
+library(tidyr)
+library(zoo)
+
+# Extract and process data
+df_prop <- merged_guts_local@meta.data %>%
+    mutate(Bin = cut(Spatial_Pseudotime, breaks = 100, labels = FALSE)) %>%
+    filter(!is.na(Predicted_CellType), 
+           !grepl("ambiguous", Predicted_CellType, ignore.case = TRUE)) %>%
+    group_by(Bin, Predicted_CellType) %>%
+    tally() %>%
+    # Ensure every bin has an entry for EVERY cell type (fill with 0)
+    ungroup() %>%
+    complete(Bin = 1:100, Predicted_CellType, fill = list(n = 0)) %>%
+    group_by(Predicted_CellType) %>%
+    # Apply smoothing to the raw counts or proportions
+    arrange(Bin) %>%
+    mutate(smoothed_n = rollapply(n, width = 5, FUN = mean, fill = "extend")) %>%
+    group_by(Bin) %>%
+    # Final normalization to ensure exactly 100% height at every point
+    mutate(Proportion = smoothed_n / sum(smoothed_n)) %>%
+    # Handle cases where a bin might become NaN due to zero cells
+    mutate(Proportion = ifelse(is.nan(Proportion), 0, Proportion))
+
+# Color palette for cell types
+all_types <- sort(unique(df_prop$Predicted_CellType))
+type_colors <- setNames(colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(length(all_types)), all_types)
+
+p_bottom <- ggplot(df_prop, aes(x = Bin, y = Proportion, fill = Predicted_CellType)) +
+    geom_area(alpha = 0.9, size = 0.1, color = "white") +
+    scale_fill_manual(values = type_colors, name = "Cell Type") +
+    scale_y_continuous(labels = percent_format(), expand = c(0,0), limits = c(0,1)) +
+    scale_x_continuous(expand = c(0,0), limits = c(1, 100), breaks = seq(0, 100, by = 20)) +
+    labs(x = "Anatomical Position (Gut Bins)", y = "Proportion (%)") +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        axis.line.x = element_line(color = "black"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        legend.box = "horizontal"
+    ) +
+    guides(fill = guide_legend(ncol = 6))
+
+# 3. Combine and Align
+# Remove labels from top plot X-axis to avoid redundancy
+p_top_clean <- p_top + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+combined_final <- p_top_clean / p_bottom + plot_layout(heights = c(2, 1))
+
+# Save (idempotent)
+out_combined <- "../figures/3D_glo/Refined_Similarity_Proportion_Combined.png"
+if (FORCE_OVERWRITE || !file.exists(out_combined)) {
+    ggsave(out_combined, combined_final, width = 12, height = 10)
+}
+
+# Display
+combined_final
+```
+
+## 5. Signaling Pathway Spatial Logic (REFINED SCRATCH-BUILD)
+We analyze the spatial similarity based on curated gene lists for 5 major signaling pathways using the refined mathematical engine.
+
+```{r refined_signaling_analysis, fig.width=12, fig.height=15}
+# --- Define Curated Signaling Gene Lists (Drosophila) ---
+signaling_pathways <- list(
+    "Wnt_Wingless" = c("wg", "arm", "dsh", "pan", "fz", "fz2", "sgg", "pygo", "arr", "nkd", "lgs", "gro", "Axn"), 
+    "Notch" = c("N", "Dl", "Ser", "Su(H)", "mam", "neur", "H", "e(spl)", "dx", "gro", "h", "bib"),
+    "EGFR_MAPK" = c("egfr", "spi", "vn", "aos", "rho", "sty", "Ras85D", "raf", "Dsor1", "rl", "pnt", "yan", "ed", "Gap1"),
+    "JAK_STAT" = c("upd1", "upd2", "upd3", "domeless", "hop", "stat92E", "socs36E", "ken", "et", "ptp61F"),
+    "BMP_Dpp" = c("dpp", "gbb", "tkv", "sax", "put", "mad", "med", "brk", "dad", "shn", "pnt", "bam")
+)
+
+# Loop through each pathway
+for (p_name in names(signaling_pathways)) {
+    cat(paste("\n--- Processing Pathway:", p_name, "(Refined) ---\n"))
+    
+    # Filter genes present in the dataset
+    p_genes <- signaling_pathways[[p_name]]
+    p_genes <- p_genes[p_genes %in% rownames(merged_guts_local)]
+    
+    if (length(p_genes) < 3) {
+        message(paste("! Skipping", p_name, "- Too few genes found in dataset."))
+        next
+    }
+    
+    # Temporarily override VariableFeatures for the refined function
+    orig_var <- VariableFeatures(merged_guts_local)
+    VariableFeatures(merged_guts_local) <- p_genes
+    
+    p_pathway_list <- list()
+    for (group_name in names(groups)) {
+        message(paste("  Calculating group:", group_name))
+        plot_obj <- plot_triangular_similarity_refined(
+            merged_guts_local, 
+            groups[[group_name]], 
+            title = paste(p_name, "-", group_name, "(Refined)"),
+            n_bins = 100
+        )
+        
+        if (!is.null(plot_obj)) {
+            p_pathway_list[[group_name]] <- plot_obj
+            out_signaling <- paste0("../figures/3D_glo/Refined_Signaling_", p_name, "_", group_name, ".png")
+            if (FORCE_OVERWRITE || !file.exists(out_signaling)) {
+                ggsave(out_signaling, plot_obj, width = 10, height = 6)
+            }
+        }
+    }
+    
+    # Display combined plot for the pathway
+    if (length(p_pathway_list) > 0) {
+        grid.arrange(grobs = p_pathway_list, ncol = 1, top = paste(p_name, "Refined Spatial Logic"))
+    }
+    
+    # Restore original VariableFeatures
+    VariableFeatures(merged_guts_local) <- orig_var
+}
+```
+
+
+
+## 7. Boundary Detection Logic (Neighbor Scoring)
+
+This section implements a boundary detection algorithm by comparing gene expression profiles between consecutive bins along the gut axis.
+
+```{r boundary_detection, fig.width=12, fig.height=6}
+# 1. Prepare Binned Expression Matrix
+# We use the top variable genes for a robust signal
+var_genes <- VariableFeatures(merged_guts_local)
+if (length(var_genes) == 0) {
+    merged_guts_local <- FindVariableFeatures(merged_guts_local, nfeatures = 2000, verbose = FALSE)
+    var_genes <- VariableFeatures(merged_guts_local)
+}
+
+# Define bins (0-100)
+n_bins <- 100
+merged_guts_local$Bin <- cut(merged_guts_local$Spatial_Pseudotime, breaks = n_bins, labels = FALSE)
+
+# Filter out NA bins and cells
+valid_cells <- which(!is.na(merged_guts_local$Bin))
+exp_mat <- GetAssayData(merged_guts_local, layer = "data")[var_genes, valid_cells]
+bins <- merged_guts_local$Bin[valid_cells]
+
+# Calculate mean expression per bin
+# We handle cases where some bins might be empty by creating a full 1-100 matrix
+bin_means_list <- lapply(sort(unique(bins)), function(b) {
+    rowMeans(exp_mat[, bins == b, drop = FALSE])
+})
+names(bin_means_list) <- sort(unique(bins))
+
+full_bin_profiles <- matrix(NA, nrow = length(var_genes), ncol = n_bins, dimnames = list(var_genes, 1:n_bins))
+for (b in names(bin_means_list)) {
+    full_bin_profiles[, as.numeric(b)] <- bin_means_list[[b]]
+}
+
+# Handle missing bins by interpolation (safety check)
+if (any(is.na(full_bin_profiles))) {
+    message("Filling missing bins in profile matrix using interpolation...")
+    for (i in 1:nrow(full_bin_profiles)) {
+        if (all(is.na(full_bin_profiles[i, ]))) next
+        full_bin_profiles[i, ] <- zoo::na.approx(full_bin_profiles[i, ], na.rm = FALSE, rule = 2)
+    }
+}
+
+# 2. Calculate Neighbor Similarity Score
+# Compare Bin i with Bin i+1 using Spearman Correlation
+neighbor_sim <- sapply(1:(n_bins - 1), function(i) {
+    cor(full_bin_profiles[, i], full_bin_profiles[, i+1], method = "spearman", use = "pairwise.complete.obs")
+})
+
+# Calculate specific "Boundary Score" (1 - Correlation)
+boundary_df <- data.frame(
+    Bin = 1:(n_bins - 1),
+    Center = (1:(n_bins - 1)) + 0.5,
+    Similarity = neighbor_sim,
+    Boundary_Score = 1 - neighbor_sim
+)
+
+# 3. Visualization: Linear Heatmap of Differences (Consecutive Bins)
+p_boundary <- ggplot(boundary_df, aes(x = Center, y = 1, fill = Boundary_Score)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "magma", name = "Transcriptional\nShift (1-Cor)") +
+    scale_x_continuous(expand = c(0,0), limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+    theme_minimal() +
+    labs(title = "Local Transcriptional Boundary Detection",
+         subtitle = "Difference (1 - Spearman Correlation) between consecutive 1% bins",
+         x = "Anatomical Position (Gut Bins)",
+         y = "") +
+    theme(
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "bottom"
+    )
+
+# Save and Display
+ggsave("../figures/3D_glo/Boundary_Detection_Heatmap.png", p_boundary, width = 12, height = 4)
+p_boundary
+
+# 4. Neighborhood Scoring (Window-based Heatmap)
+# Compare window [i-w, i] with [i+1, i+1+w]
+w <- 4 # Window size (3-5 bins)
+smooth_boundary_score <- sapply((w + 1):(n_bins - w - 1), function(i) {
+    prof_left <- rowMeans(full_bin_profiles[, (i-w):i], na.rm = TRUE)
+    prof_right <- rowMeans(full_bin_profiles[, (i+1):(i+1+w)], na.rm = TRUE)
+    # Use Pearson for profile comparison as it's standard for windowed shifts
+    1 - cor(prof_left, prof_right, method = "pearson")
+})
+
+smooth_df <- data.frame(
+    Bin = (w + 1):(n_bins - w - 1),
+    Score = smooth_boundary_score
+)
+
+# Visualize as a second linear heatmap
+p_smooth_heatmap <- ggplot(smooth_df, aes(x = Bin, y = 1, fill = Score)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "inferno", name = "Neighbourhood\nShift (1-Cor)") +
+    scale_x_continuous(expand = c(0,0), limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+    theme_minimal() +
+    labs(title = "Neighbourhood Boundary Detection (Averaged)",
+         subtitle = paste0("Comparison of sliding windows (left vs right ", w, " bins)"),
+         x = "Anatomical Position (Gut Bins)",
+         y = "") +
+    theme(
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "bottom"
+    )
+
+ggsave("../figures/3D_glo/Boundary_Detection_Neighbourhood_Heatmap.png", p_smooth_heatmap, width = 12, height = 4)
+p_smooth_heatmap
+```
+
+## 8. Focused Boundary Detection: Gut 1 (PC-based)
+
+This section performs the boundary analysis specifically on Gut 1, utilizing Principal Components (PCs) for noise reduction. It loads the specific Gut 1 object for maximum accuracy.
+
+```{r gut1_boundary_detection, fig.width=12, fig.height=8}
+# 1. Load specific Gut 1 object
+gut1_path <- "../Random data/gut1_processed_for_analysis.rds"
+if (file.exists(gut1_path)) {
+    message("Loading specific Gut 1 object from RDS...")
+    gut1_sub <- readRDS(gut1_path)
+} else {
+    message("Specific Gut 1 RDS not found. Subsetting merged guts...")
+    gut1_cells <- Cells(merged_guts_local)[merged_guts_local$Gut == "Gut 1"]
+    if (length(gut1_cells) < 100) {
+        stop("Insufficient cells found for Gut 1 analysis.")
+    }
+    gut1_sub <- subset(merged_guts_local, cells = gut1_cells)
+}
+
+# 2. Methodological Improvement: PCA-based Profiling
+# We re-run PCA on the subset to capture Gut 1 specific spatial variation
+gut1_sub <- NormalizeData(gut1_sub, verbose = FALSE)
+gut1_sub <- FindVariableFeatures(gut1_sub, nfeatures = 2000, verbose = FALSE)
+gut1_sub <- ScaleData(gut1_sub, verbose = FALSE)
+gut1_sub <- RunPCA(gut1_sub, features = VariableFeatures(gut1_sub), verbose = FALSE)
+
+# Use the top 10 PCs to represent the transcriptional state
+pcs_to_use <- 1:10
+pc_embeddings <- Embeddings(gut1_sub, "pca")[, pcs_to_use]
+
+# Define bins (0-100)
+n_bins <- 100
+gut1_sub$Bin <- cut(gut1_sub$Spatial_Pseudotime, breaks = n_bins, labels = FALSE)
+
+# Filter out NA bins
+valid_cells_gut1 <- which(!is.na(gut1_sub$Bin))
+pc_mat <- pc_embeddings[valid_cells_gut1, ]
+bins_gut1 <- gut1_sub$Bin[valid_cells_gut1]
+
+# Calculate mean PC profile per bin
+# Handle empty bins via interpolation
+bin_pc_list <- lapply(1:n_bins, function(b) {
+    cells_in_bin <- which(bins_gut1 == b)
+    if (length(cells_in_bin) == 0) return(rep(NA, length(pcs_to_use)))
+    if (length(cells_in_bin) == 1) return(pc_mat[cells_in_bin, ])
+    colMeans(pc_mat[cells_in_bin, ])
+})
+bin_pc_profiles <- do.call(rbind, bin_pc_list) # Matrix: 100 bins x 10 PCs
+
+# Interpolate missing bins
+for (j in 1:ncol(bin_pc_profiles)) {
+    bin_pc_profiles[, j] <- zoo::na.approx(bin_pc_profiles[, j], na.rm = FALSE, rule = 2)
+}
+# 3. Calculate Scores
+# Local Shift (Consecutive)
+gut1_local_sim <- sapply(1:(n_bins - 1), function(i) {
+    cor(bin_pc_profiles[i, ], bin_pc_profiles[i+1, ], method = "pearson")
+})
+
+# Neighbourhood Shift (Windowed)
+w_gut1 <- 4
+gut1_smooth_sim <- sapply((w_gut1 + 1):(n_bins - w_gut1 - 1), function(i) {
+    prof_left <- colMeans(bin_pc_profiles[(i-w_gut1):i, , drop = FALSE])
+    prof_right <- colMeans(bin_pc_profiles[(i+1):(i+1+w_gut1), , drop = FALSE])
+    cor(prof_left, prof_right, method = "pearson")
+})
+
+# 4. Visualization
+gut1_local_df <- data.frame(Bin = 1.5:99.5, Score = 1 - gut1_local_sim)
+gut1_smooth_df <- data.frame(Bin = (w_gut1 + 1):(n_bins - w_gut1 - 1), Score = 1 - gut1_smooth_sim)
+
+# Plot 1: Gut 1 Local Shift Heatmap
+p_gut1_local <- ggplot(gut1_local_df, aes(x = Bin, y = 1, fill = Score)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "magma", name = "Local Shift\n(1-Cor)") +
+    scale_x_continuous(expand = c(0,0), limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+    theme_minimal() +
+    labs(title = "Gut 1 Focused: Local Boundary Detection (PC-based)",
+         subtitle = "Difference between consecutive 1% bins in PC space",
+         x = "Anatomical Position (Gut Bins)", y = "") +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+          panel.grid = element_blank(), legend.position = "bottom")
+
+# Plot 2: Gut 1 Neighbourhood Shift Heatmap
+p_gut1_smooth <- ggplot(gut1_smooth_df, aes(x = Bin, y = 1, fill = Score)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "inferno", name = "Neighbourhood\nShift (1-Cor)") +
+    scale_x_continuous(expand = c(0,0), limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
+    theme_minimal() +
+    labs(title = "Gut 1 Focused: Neighbourhood Boundary Detection (PC-based)",
+         subtitle = paste0("Windowed comparison (left vs right ", w_gut1, " bins) in PC space"),
+         x = "Anatomical Position (Gut Bins)", y = "") +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+          panel.grid = element_blank(), legend.position = "bottom")
+
+# Save and Display
+ggsave("../figures/3D_glo/Boundary_Detection_Gut1_Local_Heatmap.png", p_gut1_local, width = 12, height = 4)
+ggsave("../figures/3D_glo/Boundary_Detection_Gut1_Neighbourhood_Heatmap.png", p_gut1_smooth, width = 12, height = 4)
+
+grid.arrange(p_gut1_local, p_gut1_smooth, ncol = 1)
+```
+
+## 9. Automated Region Definition & Marker Discovery (Gut 1 Focused)
+
+This section uses Gut 1 boundary detection peaks with peak merging (merge distance = 3 bins) to define clean spatial regions and discovers their transcriptomic markers. All subregions are spatially ordered (Anterior → Posterior).
+
+```{r region_definition_gut1, fig.width=14, fig.height=14}
+# --- 1. Peak Detection with Merging ---
+find_peaks <- function(x, threshold = 0) {
+    pks <- which(diff(sign(diff(x))) == -2) + 1
+    pks[x[pks] > threshold]
+}
+
+# Merge peaks within a distance of 3 bins (keeping the strongest peak in each cluster)
+merge_peaks <- function(peak_bins, peak_scores, merge_dist = 3) {
+    if (length(peak_bins) <= 1) return(peak_bins)
+    
+    # Sort by bin position
+    ord <- order(peak_bins)
+    bins <- peak_bins[ord]
+    scores <- peak_scores[ord]
+    
+    merged <- c()
+    i <- 1
+    while (i <= length(bins)) {
+        # Find all peaks within merge_dist of the current peak
+        cluster <- which(abs(bins - bins[i]) <= merge_dist)
+        # Keep the one with the highest score
+        best <- cluster[which.max(scores[cluster])]
+        merged <- c(merged, bins[best])
+        # Jump past the cluster
+        i <- max(cluster) + 1
+    }
+    return(merged)
+}
+
+# Use gut1_local_df from previous section
+local_peaks_idx <- find_peaks(gut1_local_df$Score)
+raw_peak_bins <- gut1_local_df$Bin[local_peaks_idx]
+raw_peak_scores <- gut1_local_df$Score[local_peaks_idx]
+
+# === PASS 1: Major Regions (merge distance = 8) ===
+major_merged <- merge_peaks(raw_peak_bins, raw_peak_scores, merge_dist = 8)
+message(paste("Major merge (d=8):", length(raw_peak_bins), "raw ->", length(major_merged), "peaks"))
+message(paste("Major merged positions:", paste(major_merged, collapse = ", ")))
+
+# Select top 4 peaks for 5 regions
+major_scores <- sapply(major_merged, function(b) {
+    idx <- which.min(abs(gut1_local_df$Bin - b))
+    gut1_local_df$Score[idx]
+})
+
+valid_mask <- major_merged > 0 & major_merged < 100
+valid_bins <- major_merged[valid_mask]
+valid_scores <- major_scores[valid_mask]
+
+score_order <- order(valid_scores, decreasing = TRUE)
+major_peaks <- c()
+for (idx in score_order) {
+    candidate <- valid_bins[idx]
+    if (length(major_peaks) == 0 || all(abs(candidate - major_peaks) > 1)) {
+        major_peaks <- c(major_peaks, candidate)
+    }
+    if (length(major_peaks) >= 4) break
+}
+major_peaks <- sort(major_peaks)
+message(paste("Selected", length(major_peaks), "major boundary peaks:", paste(major_peaks, collapse = ", ")))
+
+region_cuts <- sort(unique(c(0, major_peaks, 100)))
+n_regions <- length(region_cuts) - 1
+gut1_sub$Custom_Major_Region <- cut(gut1_sub$Spatial_Pseudotime, 
+                                   breaks = region_cuts, 
+                                   labels = paste0("R", seq_len(n_regions)),
+                                   include.lowest = TRUE)
+
+# === PASS 2: Subregions (merge distance = 3, nested within major regions) ===
+sub_merged <- merge_peaks(raw_peak_bins, raw_peak_scores, merge_dist = 3)
+# Filter to valid range
+sub_merged <- sub_merged[sub_merged > 0 & sub_merged < 100]
+message(paste("Sub merge (d=3):", length(raw_peak_bins), "raw ->", length(sub_merged), "peaks"))
+
+# Combine major + sub peaks for subregion cuts (major boundaries always included)
+all_boundary_bins <- sort(unique(c(major_peaks, sub_merged)))
+sub_cuts <- sort(unique(c(0, all_boundary_bins, 100)))
+gut1_sub$Custom_Subregion <- cut(gut1_sub$Spatial_Pseudotime, 
+                                breaks = sub_cuts, 
+                                labels = FALSE,
+                                include.lowest = TRUE)
+
+# --- 4. Biological Annotation ---
+major_labels <- c("R1 (Anterior/A1)", "R2 (Anterior/A2-3)", "R3 (Middle/Copper)", 
+                  "R4 (Posterior/P1-2)", "R5 (Posterior/P3-4)")
+major_names <- setNames(major_labels[seq_len(n_regions)], paste0("R", seq_len(n_regions)))
+
+# Assign subregion names dynamically based on how many fall within each major region
+mapping_vector <- character(ncol(gut1_sub))
+names(mapping_vector) <- Cells(gut1_sub)
+
+# Build spatially ordered subregion label list
+all_sub_labels <- c()
+for (mr in paste0("R", seq_len(n_regions))) {
+    mr_cells <- which(as.character(gut1_sub$Custom_Major_Region) == mr)
+    if (length(mr_cells) == 0) next
+    sub_ids <- sort(unique(gut1_sub$Custom_Subregion[mr_cells]))
+    for (i in seq_along(sub_ids)) {
+        sub_label <- paste0(mr, letters[i])
+        all_sub_labels <- c(all_sub_labels, sub_label)
+        cell_names <- Cells(gut1_sub)[gut1_sub$Custom_Subregion == sub_ids[i]]
+        mapping_vector[cell_names] <- sub_label
+    }
+}
+
+# Apply metadata safely with unname()
+gut1_sub$Biological_Region <- factor(unname(major_names[as.character(gut1_sub$Custom_Major_Region)]), levels = major_names)
+gut1_sub$Detailed_Subregion <- factor(unname(mapping_vector), levels = all_sub_labels)
+
+message(paste("Subregions defined:", paste(all_sub_labels, collapse = ", ")))
+
+# --- 5. Spatially Order Cells for Heatmaps ---
+spatial_order <- order(gut1_sub$Spatial_Pseudotime)
+ordered_cells <- Cells(gut1_sub)[spatial_order]
+
+# --- 6. Marker Discovery ---
+Idents(gut1_sub) <- "Biological_Region"
+major_markers_gut1 <- FindAllMarkers(gut1_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+
+Idents(gut1_sub) <- "Detailed_Subregion"
+sub_markers_gut1 <- FindAllMarkers(gut1_sub, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.2, verbose = FALSE)
+
+# --- 7. Visualizations (Spatially Ordered) ---
+p_umap_gut1 <- DimPlot(gut1_sub, group.by = "Detailed_Subregion", label = TRUE, repel = TRUE) + 
+    labs(title = "Gut 1: Discrete Subregions (Merged Peaks, d=3)")
+
+top5_major_gut1 <- major_markers_gut1 %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+p_heat_major_gut1 <- DoHeatmap(gut1_sub, features = top5_major_gut1$gene, 
+                               group.by = "Biological_Region", cells = ordered_cells) +
+    scale_fill_viridis_c() + labs(title = "Gut 1: Major Region Markers (Spatially Ordered)")
+
+top3_sub_gut1 <- sub_markers_gut1 %>% group_by(cluster) %>% top_n(n = 3, wt = avg_log2FC)
+p_heat_sub_gut1 <- DoHeatmap(gut1_sub, features = top3_sub_gut1$gene, 
+                             group.by = "Detailed_Subregion", cells = ordered_cells) +
+    scale_fill_viridis_c() + labs(title = "Gut 1: Subregion Markers (Spatially Ordered)")
+
+# Save Results
+ggsave("../figures/3D_glo/Gut1_Subregions_UMAP.png", p_umap_gut1, width = 12, height = 8)
+ggsave("../figures/3D_glo/Gut1_Major_Markers_Heatmap.png", p_heat_major_gut1, width = 12, height = 10)
+ggsave("../figures/3D_glo/Gut1_Subregion_Markers_Heatmap.png", p_heat_sub_gut1, width = 15, height = 12)
+
+ggsave("../figures/Gut1_Defined_Subregions_UMAP.png", p_umap_gut1, width = 12, height = 8)
+ggsave("../figures/Gut1_Major_Region_Markers.png", p_heat_major_gut1, width = 12, height = 10)
+ggsave("../figures/Gut1_Detailed_Subregion_Markers.png", p_heat_sub_gut1, width = 15, height = 12)
+
+p_umap_gut1
+p_heat_major_gut1
+p_heat_sub_gut1
+
+# Export Markers
+write.csv(major_markers_gut1, "../Excels/Gut1_Major_Region_Markers.csv")
+write.csv(sub_markers_gut1, "../Excels/Gut1_Detailed_Subregion_Markers.csv")
+message("✓ Gut 1 region definition and marker discovery complete (merged peaks, spatially ordered).")
+```
+
+## 10. Alternative Regionalization (d=2 Merge) & Gene Check (Gut 1 Focused)
+
+This section provides an alternative regionalization using a lighter merge (d=2) for major regions and d=3 for subregions, plus a gene-check heatmap to validate any gene of interest against the regional markers.
+
+```{r alt_regionalization_gene_check, fig.width=14, fig.height=14}
+# ====================================================================
+# ALTERNATIVE REGIONALIZATION: d=2 merge, 4 major regions, d=3 subregions
+# ====================================================================
+
+# --- A. Major Regions (d=2 merge, 3 peaks = 4 regions) ---
+alt_merged <- merge_peaks(raw_peak_bins, raw_peak_scores, merge_dist = 2)
+alt_valid <- sort(alt_merged[alt_merged > 0 & alt_merged < 100])
+
+alt_scores_all <- sapply(alt_valid, function(b) {
+    idx <- which.min(abs(gut1_local_df$Bin - b))
+    gut1_local_df$Score[idx]
+})
+alt_order <- order(alt_scores_all, decreasing = TRUE)
+alt_selected <- c()
+for (idx in alt_order) {
+    candidate <- alt_valid[idx]
+    if (length(alt_selected) == 0 || all(abs(candidate - alt_selected) > 1)) {
+        alt_selected <- c(alt_selected, candidate)
+    }
+    if (length(alt_selected) >= 3) break
+}
+alt_peaks <- sort(alt_selected)
+message(paste("Alt major (d=2): selected", length(alt_peaks), "peaks:", paste(alt_peaks, collapse = ", ")))
+
+alt_region_cuts <- sort(unique(c(0, alt_peaks, 100)))
+n_alt_regions <- length(alt_region_cuts) - 1
+gut1_sub$Alt_Major_Region <- cut(gut1_sub$Spatial_Pseudotime,
+                                breaks = alt_region_cuts,
+                                labels = paste0("Region ", seq_len(n_alt_regions)),
+                                include.lowest = TRUE)
+
+# --- B. Subregions (d=3 merge, nested within alt major regions) ---
+alt_sub_merged <- merge_peaks(raw_peak_bins, raw_peak_scores, merge_dist = 3)
+alt_sub_merged <- alt_sub_merged[alt_sub_merged > 0 & alt_sub_merged < 100]
+
+alt_all_bins <- sort(unique(c(alt_peaks, alt_sub_merged)))
+alt_sub_cuts <- sort(unique(c(0, alt_all_bins, 100)))
+gut1_sub$Alt_Subregion_ID <- cut(gut1_sub$Spatial_Pseudotime,
+                                breaks = alt_sub_cuts,
+                                labels = FALSE,
+                                include.lowest = TRUE)
+
+# Assign subregion names (Region 1a, Region 1b, etc.)
+alt_map <- character(ncol(gut1_sub))
+names(alt_map) <- Cells(gut1_sub)
+alt_sub_labels <- c()
+for (mr in paste0("Region ", seq_len(n_alt_regions))) {
+    mr_cells <- which(as.character(gut1_sub$Alt_Major_Region) == mr)
+    if (length(mr_cells) == 0) next
+    sub_ids <- sort(unique(gut1_sub$Alt_Subregion_ID[mr_cells]))
+    mr_num <- gsub("Region ", "", mr)
+    for (i in seq_along(sub_ids)) {
+        sub_label <- paste0("Region ", mr_num, letters[i])
+        alt_sub_labels <- c(alt_sub_labels, sub_label)
+        cell_names <- Cells(gut1_sub)[gut1_sub$Alt_Subregion_ID == sub_ids[i]]
+        alt_map[cell_names] <- sub_label
+    }
+}
+gut1_sub$Alt_Subregion <- factor(unname(alt_map), levels = alt_sub_labels)
+message(paste("Alt subregions:", paste(alt_sub_labels, collapse = ", ")))
+
+# --- C. Marker Discovery ---
+Idents(gut1_sub) <- "Alt_Major_Region"
+alt_major_markers <- FindAllMarkers(gut1_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+
+Idents(gut1_sub) <- "Alt_Subregion"
+alt_sub_markers <- FindAllMarkers(gut1_sub, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.2, verbose = FALSE)
+
+# --- D. Heatmaps (Spatially Ordered) ---
+alt_order <- Cells(gut1_sub)[order(gut1_sub$Spatial_Pseudotime)]
+
+# Major regions heatmap
+top5_alt <- alt_major_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+p_heat_alt_major <- DoHeatmap(gut1_sub, features = top5_alt$gene,
+                              group.by = "Alt_Major_Region", cells = alt_order) +
+    scale_fill_viridis_c() + labs(title = "Gut 1: Alt Major Regions (d=2, 4 regions)")
+
+# Subregions heatmap
+top3_alt_sub <- alt_sub_markers %>% group_by(cluster) %>% top_n(n = 3, wt = avg_log2FC)
+p_heat_alt_sub <- DoHeatmap(gut1_sub, features = top3_alt_sub$gene,
+                            group.by = "Alt_Subregion", cells = alt_order) +
+    scale_fill_viridis_c() + labs(title = "Gut 1: Alt Subregion Markers (d=3)")
+
+# Save
+ggsave("../figures/Gut1_Alt_Major_Regions_Heatmap.png", p_heat_alt_major, width = 15, height = 12)
+ggsave("../figures/Gut1_Alt_Subregion_Markers_Heatmap.png", p_heat_alt_sub, width = 15, height = 12)
+p_heat_alt_major
+p_heat_alt_sub
+
+# Export
+write.csv(alt_major_markers, "../Excels/Gut1_Alt_Major_Region_Markers.csv")
+write.csv(alt_sub_markers, "../Excels/Gut1_Alt_Subregion_Markers.csv")
+```
+
+### Gene Check Heatmap
+
+Visualize any gene of interest alongside the top regional markers. Change `check_gene` to the gene you want to validate.
+
+```{r gene_check_heatmap, fig.width=14, fig.height=10}
+# === GENE CHECK HEATMAP ===
+# Set the gene you want to check here:
+check_gene <- "lab"   # <--- CHANGE THIS TO YOUR GENE OF INTEREST
+
+# Combine: check gene + top markers from both regionalization schemes
+all_check_genes <- unique(c(check_gene, top5_alt$gene, top3_alt_sub$gene))
+
+# Verify genes exist in the dataset
+valid_genes <- all_check_genes[all_check_genes %in% rownames(gut1_sub)]
+missing <- setdiff(all_check_genes, valid_genes)
+if (length(missing) > 0) message(paste("Genes not found (skipped):", paste(missing, collapse = ", ")))
+
+# Heatmap: check gene vs all markers, grouped by Alt Subregions
+check_order <- Cells(gut1_sub)[order(gut1_sub$Spatial_Pseudotime)]
+p_gene_check <- DoHeatmap(gut1_sub, features = valid_genes,
+                          group.by = "Alt_Subregion", cells = check_order) +
+    scale_fill_viridis_c() +
+    labs(title = paste0("Gene Check: '", check_gene, "' vs Alt Region Markers"))
+
+ggsave("../figures/Gut1_Gene_Check_Heatmap.png", p_gene_check, width = 16, height = 12)
+p_gene_check
+
+message(paste0("✓ Gene check complete for '", check_gene, "' across ", length(alt_sub_labels), " subregions."))
+```
+
+---
+Finished 3D Volumetric Signaling Morphospace Analysis & Automatic Regionalization (Gut 1).

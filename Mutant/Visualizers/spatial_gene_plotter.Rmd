@@ -1,0 +1,84 @@
+---
+title: "Spatial Gene Plotter (03Slide4)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(viridis)
+
+# ------------------------------------------------------------------------------
+# 1. Load Data
+# ------------------------------------------------------------------------------
+
+# Change this to the gene you want to plot
+target_gene <- "FZ3" 
+
+cat("Loading spatially mapped single-cell dataset...\n")
+seurat_sc <- readRDS("../Random data/sc_with_spatial_scores.rds")
+
+# Ensure defaults
+DefaultAssay(seurat_sc) <- "SCT"
+```
+
+## 1. Prepare Data for 3D Projection
+
+We extract the UMAP embeddings and the inferred spatial position (Smoothed Pseudotime).
+
+```{r prepare_data}
+if (!target_gene %in% rownames(seurat_sc)) {
+    stop(paste("Gene", target_gene, "not found in the dataset."))
+}
+
+# Extract embeddings and metadata
+plot_df <- data.frame(
+    UMAP_1 = Embeddings(seurat_sc, "umap")[,1],
+    UMAP_2 = Embeddings(seurat_sc, "umap")[,2],
+    Spatial_Z = seurat_sc$Smoothed_Pseudotime,
+    CellType = if ("celltype_granular" %in% colnames(seurat_sc@meta.data)) seurat_sc$celltype_granular else seurat_sc$celltype,
+    Expression = FetchData(seurat_sc, vars = target_gene)[[1]]
+)
+
+# Handle scaling for better visualization if needed
+# (Optional: use log1p or scale)
+plot_df$Expression_Log <- log1p(plot_df$Expression)
+```
+
+## 2. Spatial Gene Expression (3D)
+
+This plot shows the expression level of **`R target_gene`** across the 3D spatial map.
+
+```{r plot_expression, fig.width=10, fig.height=8}
+plot_ly(plot_df, x = ~UMAP_1, y = ~UMAP_2, z = ~Spatial_Z, 
+        color = ~Expression_Log, colors = viridis(100, option = "magma"),
+        type = "scatter3d", mode = "markers",
+        marker = list(size = 2, opacity = 0.8),
+        text = ~paste("Gene:", target_gene, "<br>Expr:", round(Expression, 2), "<br>Type:", CellType)) %>%
+  layout(title = paste("Spatial Expression:", target_gene),
+         scene = list(xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      zaxis = list(title = 'Inferred Gut Position')))
+```
+
+## 3. Gene Expression per Cell Type (Violin Plot)
+
+This plot shows the distribution of **`r target_gene`** expression across identified cell types.
+
+```{r plot_violin, fig.width=10, fig.height=6}
+p_vln <- ggplot(plot_df, aes(x = CellType, y = Expression, fill = CellType)) +
+    geom_violin(scale = "width", alpha = 0.7) +
+    labs(title = paste("Expression Distribution:", target_gene),
+         x = "Cell Type",
+         y = "SCT-Normalized Expression") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    NoLegend()
+
+print(p_vln)
+```

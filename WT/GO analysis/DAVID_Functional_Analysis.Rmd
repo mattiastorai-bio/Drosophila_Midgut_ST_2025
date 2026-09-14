@@ -1,0 +1,752 @@
+---
+title: "DAVID-Inspired Functional Annotation Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Dm.eg.db)
+library(stringr)
+library(enrichplot)
+
+# Load additional libraries
+library(ReactomePA)
+library(GOSemSim)
+
+# Ensure figures directory
+dir.create("../figures/DAVID", recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Data Loading & Cell Type Setup
+
+```{r load_data}
+cat("--- Loading Data ---\n")
+
+# --- Single Cell Data ---
+sc_obj <- readRDS("../Random data/sc_with_spatial_scores.rds")
+
+# Map cell types to detailed names
+sc_obj$Detailed_CellType <- as.character(sc_obj$celltype)
+sc_obj$Detailed_CellType[sc_obj$Detailed_CellType == "mEC"] <- "A3_aEC"
+
+# Split mEC into ItC (ZIP42C pos) and A3_aEC (ZIP42C neg) 
+mEC_idx <- which(sc_obj$celltype == "mEC")
+if (length(mEC_idx) > 0) {
+    expr_data <- GetAssayData(sc_obj, assay = DefaultAssay(sc_obj), layer = "data")
+    zip42_expr <- rep(0, length(mEC_idx))
+    if ("ZIP42C.1" %in% rownames(expr_data)) zip42_expr <- zip42_expr + expr_data["ZIP42C.1", mEC_idx]
+    if ("ZIP42C.2" %in% rownames(expr_data)) zip42_expr <- zip42_expr + expr_data["ZIP42C.2", mEC_idx]
+    if ("ZIP42C" %in% rownames(expr_data)) zip42_expr <- zip42_expr + expr_data["ZIP42C", mEC_idx]
+    
+    sc_obj$Detailed_CellType[mEC_idx[zip42_expr > 0]] <- "ItC"
+    sc_obj$Detailed_CellType[mEC_idx[zip42_expr == 0]] <- "A3_aEC"
+}
+
+# Split LFC into Iron (CG17571 pos) and LFC (CG17571 neg)
+lfc_idx <- which(sc_obj$Detailed_CellType == "LFC")
+if (length(lfc_idx) > 0) {
+    if (!exists("expr_data")) expr_data <- GetAssayData(sc_obj, assay = DefaultAssay(sc_obj), layer = "data")
+    cg17571_expr <- rep(0, length(lfc_idx))
+    if ("CG17571" %in% rownames(expr_data)) cg17571_expr <- expr_data["CG17571", lfc_idx]
+    sc_obj$Detailed_CellType[lfc_idx[cg17571_expr > 0]] <- "Iron"
+    sc_obj$Detailed_CellType[lfc_idx[cg17571_expr == 0]] <- "LFC"
+}
+
+# Define target cell types
+target_cts <- c("aEC", "A3_aEC", "ItC", "Copper", "LFC", "Iron", "pEC")
+sub_sc <- subset(sc_obj, cells = Cells(sc_obj)[sc_obj$Detailed_CellType %in% target_cts])
+Idents(sub_sc) <- factor(sub_sc$Detailed_CellType, levels = target_cts)
+
+cat("Cell counts per type:\n")
+print(table(sub_sc$Detailed_CellType))
+
+# --- Spatial Data ---
+if (file.exists("../Random data/merged_guts.rds")) {
+    sub_guts <- readRDS("../Random data/merged_guts.rds")
+    cat("\nSpatial data loaded:", ncol(sub_guts), "cells\n")
+} else {
+    cat("\nSpatial data not found, spatial validation will be skipped.\n")
+    sub_guts <- NULL
+}
+```
+
+```{r find_markers}
+cat("--- Finding Markers (500-gene pipeline) ---\n")
+
+# Find markers for all target cell types
+sc_markers <- FindAllMarkers(sub_sc, only.pos = TRUE, min.pct = 0.1, 
+                             logfc.threshold = 0.1, test.use = "wilcox")
+cat("Total markers found:", nrow(sc_markers), "\n")
+
+# Take top 500 per cell type
+sc_markers_top <- sc_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 500, wt = avg_log2FC) %>%
+    ungroup()
+
+cat("Markers per cell type:\n")
+print(table(sc_markers_top$cluster))
+
+# Build gene symbol -> Entrez ID mapping
+# Gene names in this object are UPPERCASE but org.Dm.eg.db expects original case
+# Build a case-insensitive lookup table
+all_db_symbols <- keys(org.Dm.eg.db, keytype = "SYMBOL")
+symbol_lookup <- setNames(all_db_symbols, toupper(all_db_symbols))
+
+# Function to convert uppercase gene names to Entrez IDs
+genes_to_entrez <- function(gene_vec) {
+    # Map uppercase back to original case
+    original_case <- symbol_lookup[gene_vec]
+    original_case <- original_case[!is.na(original_case)]
+    
+    if (length(original_case) == 0) return(character(0))
+    
+    entrez <- mapIds(org.Dm.eg.db, keys = original_case, 
+                     column = "ENTREZID", keytype = "SYMBOL", 
+                     multiVals = "first")
+    na.omit(entrez)
+}
+
+# Build per-celltype Entrez gene lists
+entrez_gene_list <- list()
+symbol_gene_list <- list()
+
+for (ct in target_cts) {
+    genes <- sc_markers_top %>% filter(cluster == ct) %>% pull(gene)
+    entrez_gene_list[[ct]] <- genes_to_entrez(genes)
+    # Also keep symbol lists (original case) for GO enrichment
+    original_case <- symbol_lookup[genes]
+    symbol_gene_list[[ct]] <- original_case[!is.na(original_case)]
+    cat(sprintf("  %s: %d genes -> %d Entrez IDs\n", ct, length(genes), length(entrez_gene_list[[ct]])))
+}
+```
+
+## 2. KEGG Pathway Analysis
+
+KEGG pathways provide a structured view of metabolic and signalling pathways that GO terms alone cannot capture — e.g., "Oxidative phosphorylation", "Lysosome", "Metabolic pathways".
+
+```{r kegg_compare, fig.width=10, fig.height=14}
+cat("\n--- KEGG Pathway Analysis (compareCluster) ---\n")
+kegg_compare <- tryCatch({
+    # Bypass R's internal downloader entirely and fetch names directly via bash curl
+    cat("Fetching KEGG pathway names via system curl...\n")
+    system("curl -s -m 30 https://rest.kegg.jp/list/pathway/dme > kegg_names.txt")
+    
+    if (file.info("kegg_names.txt")$size > 0) {
+        term2name <- read.table("kegg_names.txt", sep = "\t", quote = "", stringsAsFactors = FALSE)
+        colnames(term2name) <- c("path_id", "name")
+        
+        cat("Mapping Entrez IDs to KEGG pathways locally using org.Dm.eg.db...\n")
+        kegg_links <- AnnotationDbi::toTable(org.Dm.egPATH)
+        kegg_links$path_id <- paste0("dme", kegg_links$path_id)
+        term2gene <- kegg_links[, c("path_id", "gene_id")]
+        
+        cat("Running custom compareCluster enricher...\n")
+        compareCluster(geneCluster = entrez_gene_list,
+                       fun = "enricher",
+                       TERM2GENE = term2gene,
+                       TERM2NAME = term2name,
+                       pvalueCutoff = 0.05)
+    } else {
+        stop("Curl failed to download KEGG names.")
+    }
+}, error = function(e) {
+    cat("KEGG enrichment failed:\n", e$message, "\n")
+    cat("Skipping KEGG analysis.\n")
+    NULL
+})
+
+if (!is.null(kegg_compare)) {
+    kegg_all <- kegg_compare@compareClusterResult
+    kegg_sig <- kegg_all %>% filter(p.adjust < 0.05)
+    
+    cat("Total significant KEGG pathways:", nrow(kegg_sig), "\n")
+    cat("Pathways per cell type:\n")
+    print(kegg_sig %>% count(Cluster))
+} else {
+    kegg_all <- data.frame(Cluster = character(), Description = character(), p.adjust = numeric(), GeneRatio = character(), geneID = character())
+    kegg_sig <- data.frame(Cluster = character(), Description = character(), p.adjust = numeric(), GeneRatio = character(), geneID = character())
+    cat("KEGG analysis was skipped due to API issues.\n")
+}
+```
+
+```{r kegg_dotplot_all, fig.width=10, fig.height=14}
+# --- KEGG Dotplot: Top differentiating pathways per cell type ---
+if (nrow(kegg_sig) > 0) {
+    kegg_counts <- kegg_sig %>% group_by(Description) %>% summarise(n_cts = n())
+    
+    kegg_top <- kegg_sig %>%
+        left_join(kegg_counts, by = "Description") %>%
+        group_by(Cluster) %>%
+        arrange(n_cts, p.adjust) %>%
+        slice_head(n = 10) %>%
+        ungroup()
+    
+    selected_terms <- unique(kegg_top$Description)
+    kegg_plot_data <- kegg_sig %>% filter(Description %in% selected_terms)
+    
+    kegg_plot_data$GeneRatio_num <- sapply(kegg_plot_data$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    kegg_plot_data$Description <- str_wrap(kegg_plot_data$Description, width = 50)
+    kegg_plot_data$Cluster <- factor(kegg_plot_data$Cluster, levels = target_cts)
+    
+    kegg_order <- kegg_top %>% arrange(Cluster, n_cts, p.adjust) %>% 
+        pull(Description) %>% unique() %>% str_wrap(width = 50)
+    kegg_plot_data$Description <- factor(kegg_plot_data$Description, levels = rev(kegg_order))
+    
+    p_kegg <- ggplot(kegg_plot_data, aes(x = Cluster, y = Description, 
+                                          size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_x_discrete(drop = FALSE) +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(title = "KEGG Pathway Enrichment (All Cell Types)", 
+             subtitle = "Top differentiating pathways per cell type (p.adjust < 0.05)",
+             y = "", x = "", size = "Gene ratio") +
+        theme(axis.text.x = element_text(size = 12, face = "bold", angle = 45, hjust = 1),
+              axis.text.y = element_text(size = 9),
+              panel.border = element_rect(color = "black", fill = NA))
+    
+    ggsave("../figures/DAVID/KEGG_All_CellTypes_Dotplot.png", p_kegg, 
+           width = 10, height = 14, bg = "white")
+    print(p_kegg)
+}
+```
+
+```{r kegg_subgroups, fig.width=10, fig.height=10}
+# --- KEGG Subgroup Plots ---
+if (nrow(kegg_sig) > 0) {
+    # Group 1: A3_aEC, ItC, Copper
+    g1_cts <- c("A3_aEC", "ItC", "Copper")
+    g1 <- kegg_sig %>% filter(Cluster %in% g1_cts)
+    g1_counts <- g1 %>% group_by(Description) %>% summarise(n_cts = n())
+    g1_top <- g1 %>% left_join(g1_counts, by = "Description") %>%
+        group_by(Cluster) %>% arrange(n_cts, p.adjust) %>% slice_head(n = 10) %>% ungroup()
+    
+    if (nrow(g1_top) > 0) {
+        g1_terms <- unique(g1_top$Description)
+        g1_plot <- g1 %>% filter(Description %in% g1_terms)
+        g1_plot$GeneRatio_num <- sapply(g1_plot$GeneRatio, function(x) {
+            parts <- as.numeric(strsplit(x, "/")[[1]])
+            if(length(parts) == 2) parts[1] / parts[2] else 0
+        })
+        g1_plot$Description <- str_wrap(g1_plot$Description, width = 50)
+        g1_plot$Cluster <- factor(g1_plot$Cluster, levels = g1_cts)
+        g1_order <- g1_top %>% arrange(Cluster, n_cts, p.adjust) %>%
+            pull(Description) %>% unique() %>% str_wrap(width = 50)
+        g1_plot$Description <- factor(g1_plot$Description, levels = rev(g1_order))
+        
+        p_g1 <- ggplot(g1_plot, aes(x = Cluster, y = Description, 
+                                     size = GeneRatio_num, color = p.adjust)) +
+            geom_point() +
+            scale_x_discrete(drop = FALSE) +
+            scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+            theme_minimal() +
+            labs(title = "KEGG Pathways: A3_aEC, ItC, Copper", y = "", x = "", size = "Gene ratio") +
+            theme(axis.text.x = element_text(size = 12, face = "bold"),
+                  axis.text.y = element_text(size = 9),
+                  panel.border = element_rect(color = "black", fill = NA))
+        
+        ggsave("../figures/DAVID/KEGG_Subgroup1.png", p_g1, width = 9, height = 10, bg = "white")
+        print(p_g1)
+    }
+    
+    # Group 2: LFC, Iron, pEC
+    g2_cts <- c("LFC", "Iron", "pEC")
+    g2 <- kegg_sig %>% filter(Cluster %in% g2_cts)
+    g2_counts <- g2 %>% group_by(Description) %>% summarise(n_cts = n())
+    g2_top <- g2 %>% left_join(g2_counts, by = "Description") %>%
+        group_by(Cluster) %>% arrange(n_cts, p.adjust) %>% slice_head(n = 10) %>% ungroup()
+    
+    if (nrow(g2_top) > 0) {
+        g2_terms <- unique(g2_top$Description)
+        g2_plot <- g2 %>% filter(Description %in% g2_terms)
+        g2_plot$GeneRatio_num <- sapply(g2_plot$GeneRatio, function(x) {
+            parts <- as.numeric(strsplit(x, "/")[[1]])
+            if(length(parts) == 2) parts[1] / parts[2] else 0
+        })
+        g2_plot$Description <- str_wrap(g2_plot$Description, width = 50)
+        g2_plot$Cluster <- factor(g2_plot$Cluster, levels = g2_cts)
+        g2_order <- g2_top %>% arrange(Cluster, n_cts, p.adjust) %>%
+            pull(Description) %>% unique() %>% str_wrap(width = 50)
+        g2_plot$Description <- factor(g2_plot$Description, levels = rev(g2_order))
+        
+        p_g2 <- ggplot(g2_plot, aes(x = Cluster, y = Description, 
+                                     size = GeneRatio_num, color = p.adjust)) +
+            geom_point() +
+            scale_x_discrete(drop = FALSE) +
+            scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+            theme_minimal() +
+            labs(title = "KEGG Pathways: LFC, Iron, pEC", y = "", x = "", size = "Gene ratio") +
+            theme(axis.text.x = element_text(size = 12, face = "bold"),
+                  axis.text.y = element_text(size = 9),
+                  panel.border = element_rect(color = "black", fill = NA))
+        
+        ggsave("../figures/DAVID/KEGG_Subgroup2.png", p_g2, width = 9, height = 10, bg = "white")
+        print(p_g2)
+    }
+}
+```
+
+```{r kegg_cnetplot, fig.width=14, fig.height=12}
+# --- Gene-Pathway Network for Metal Trio (ItC, Copper, Iron) ---
+cat("\n--- KEGG cnetplot for ItC, Copper, Iron ---\n")
+
+metal_cts_kegg <- c("ItC", "Copper", "Iron")
+metal_kegg <- kegg_sig %>% filter(Cluster %in% metal_cts_kegg)
+
+if (nrow(metal_kegg) > 0) {
+    # Build a subset compareCluster for the metal trio
+    metal_entrez_list <- entrez_gene_list[metal_cts_kegg]
+    
+    kegg_metal_compare <- compareCluster(geneCluster = metal_entrez_list,
+                                         fun = "enrichKEGG",
+                                         organism = "dme",
+                                         pvalueCutoff = 0.05)
+    
+    if (!is.null(kegg_metal_compare) && nrow(kegg_metal_compare@compareClusterResult) > 0) {
+        p_cnet_kegg <- cnetplot(kegg_metal_compare, showCategory = 5, 
+                                cex.params = list(category_label = 0.8, gene_label = 0.6)) +
+            labs(title = "KEGG Gene-Pathway Network: ItC, Copper, Iron")
+        
+        ggsave("../figures/DAVID/KEGG_Metal_cnetplot.png", p_cnet_kegg, 
+               width = 14, height = 12, bg = "white")
+        print(p_cnet_kegg)
+    } else {
+        cat("No significant KEGG pathways for the metal trio.\n")
+    }
+}
+```
+
+## 3. Reactome Pathway Analysis
+
+Reactome provides curated, reaction-level biological pathways — complementary to both GO and KEGG.
+
+```{r reactome_analysis, fig.width=10, fig.height=14}
+cat("\n--- Reactome Pathway Analysis ---\n")
+
+reactome_compare <- compareCluster(geneCluster = entrez_gene_list,
+                                    fun = "enrichPathway",
+                                    organism = "fly",
+                                    pvalueCutoff = 0.5)
+
+if (!is.null(reactome_compare)) {
+    reactome_all <- reactome_compare@compareClusterResult
+    reactome_sig <- reactome_all %>% filter(p.adjust < 0.05)
+    
+    cat("Total significant Reactome pathways:", nrow(reactome_sig), "\n")
+    
+    if (nrow(reactome_sig) > 0) {
+        react_counts <- reactome_sig %>% group_by(Description) %>% summarise(n_cts = n())
+        
+        react_top <- reactome_sig %>%
+            left_join(react_counts, by = "Description") %>%
+            group_by(Cluster) %>%
+            arrange(n_cts, p.adjust) %>%
+            slice_head(n = 10) %>%
+            ungroup()
+        
+        selected_react <- unique(react_top$Description)
+        react_plot <- reactome_sig %>% filter(Description %in% selected_react)
+        
+        react_plot$GeneRatio_num <- sapply(react_plot$GeneRatio, function(x) {
+            parts <- as.numeric(strsplit(x, "/")[[1]])
+            if(length(parts) == 2) parts[1] / parts[2] else 0
+        })
+        
+        react_plot$Description <- str_wrap(react_plot$Description, width = 55)
+        react_plot$Cluster <- factor(react_plot$Cluster, levels = target_cts)
+        
+        react_order <- react_top %>% arrange(Cluster, n_cts, p.adjust) %>%
+            pull(Description) %>% unique() %>% str_wrap(width = 55)
+        react_plot$Description <- factor(react_plot$Description, levels = rev(react_order))
+        
+        p_react <- ggplot(react_plot, aes(x = Cluster, y = Description, 
+                                           size = GeneRatio_num, color = p.adjust)) +
+            geom_point() +
+            scale_x_discrete(drop = FALSE) +
+            scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+            theme_minimal() +
+            labs(title = "Reactome Pathway Enrichment (All Cell Types)",
+                 subtitle = "Top differentiating pathways (p.adjust < 0.05)",
+                 y = "", x = "", size = "Gene ratio") +
+            theme(axis.text.x = element_text(size = 12, face = "bold", angle = 45, hjust = 1),
+                  axis.text.y = element_text(size = 9),
+                  panel.border = element_rect(color = "black", fill = NA))
+        
+        ggsave("../figures/DAVID/Reactome_All_CellTypes_Dotplot.png", p_react, 
+               width = 10, height = 14, bg = "white")
+        print(p_react)
+    }
+} else {
+    reactome_all <- data.frame(Cluster = character(), Description = character(), p.adjust = numeric(), GeneRatio = character(), geneID = character())
+    reactome_sig <- data.frame(Cluster = character(), Description = character(), p.adjust = numeric(), GeneRatio = character(), geneID = character())
+    cat("No significant Reactome pathways found across all cell types.\n")
+}
+```
+
+```{r reactome_cnetplot, fig.width=14, fig.height=12}
+# --- Reactome cnetplot for Metal Trio ---
+if (nrow(reactome_sig) > 0) {
+    metal_react <- reactome_sig %>% filter(Cluster %in% c("ItC", "Copper", "Iron"))
+    
+    if (nrow(metal_react) > 0) {
+        react_metal_compare <- compareCluster(geneCluster = entrez_gene_list[c("ItC", "Copper", "Iron")],
+                                              fun = "enrichPathway",
+                                              organism = "fly",
+                                              pvalueCutoff = 0.05)
+        
+        if (!is.null(react_metal_compare) && nrow(react_metal_compare@compareClusterResult) > 0) {
+            p_cnet_react <- cnetplot(react_metal_compare, showCategory = 5,
+                                     cex.params = list(category_label = 0.8, gene_label = 0.6)) +
+                labs(title = "Reactome Gene-Pathway Network: ItC, Copper, Iron")
+            
+            ggsave("../figures/DAVID/Reactome_Metal_cnetplot.png", p_cnet_react, 
+                   width = 14, height = 12, bg = "white")
+            print(p_cnet_react)
+        }
+    }
+}
+```
+
+## 4. Functional Annotation Clustering (DAVID's Signature Feature)
+
+DAVID's most unique feature is Functional Annotation Clustering (FAC): it groups semantically related terms from multiple databases into higher-order "annotation clusters". We replicate this by running GO BP + GO MF + GO CC enrichment per cell type, then clustering the terms by gene overlap similarity.
+
+```{r fac_build, fig.width=12, fig.height=10}
+cat("\n--- Functional Annotation Clustering ---\n")
+
+# Run multi-ontology enrichment for each cell type
+fac_results <- list()
+
+for (ct in target_cts) {
+    genes <- symbol_gene_list[[ct]]
+    if (length(genes) < 10) next
+    
+    cat(paste0("\n  Processing ", ct, " (", length(genes), " genes)...\n"))
+    
+    # GO Biological Process
+    ego_bp <- enrichGO(gene = genes, OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                       ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                       minGSSize = 5, maxGSSize = 500)
+    
+    # GO Molecular Function
+    ego_mf <- enrichGO(gene = genes, OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                       ont = "MF", pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                       minGSSize = 5, maxGSSize = 500)
+    
+    # GO Cellular Component
+    ego_cc <- enrichGO(gene = genes, OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                       ont = "CC", pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                       minGSSize = 5, maxGSSize = 500)
+    
+    # Combine results
+    combined <- data.frame()
+    if (!is.null(ego_bp) && nrow(ego_bp@result %>% filter(p.adjust < 0.05)) > 0) {
+        bp_df <- ego_bp@result %>% filter(p.adjust < 0.05) %>% mutate(Ontology = "BP")
+        combined <- rbind(combined, bp_df)
+    }
+    if (!is.null(ego_mf) && nrow(ego_mf@result %>% filter(p.adjust < 0.05)) > 0) {
+        mf_df <- ego_mf@result %>% filter(p.adjust < 0.05) %>% mutate(Ontology = "MF")
+        combined <- rbind(combined, mf_df)
+    }
+    if (!is.null(ego_cc) && nrow(ego_cc@result %>% filter(p.adjust < 0.05)) > 0) {
+        cc_df <- ego_cc@result %>% filter(p.adjust < 0.05) %>% mutate(Ontology = "CC")
+        combined <- rbind(combined, cc_df)
+    }
+    
+    combined$CellType <- ct
+    fac_results[[ct]] <- combined
+    
+    cat(paste0("    BP: ", sum(combined$Ontology == "BP"), 
+               " | MF: ", sum(combined$Ontology == "MF"),
+               " | CC: ", sum(combined$Ontology == "CC"), "\n"))
+}
+
+fac_all <- bind_rows(fac_results)
+cat("\nTotal annotation terms across all cell types:", nrow(fac_all), "\n")
+```
+
+```{r fac_cluster_heatmap, fig.width=14, fig.height=10}
+# --- Cluster terms by gene overlap to create annotation clusters ---
+cat("\n--- Clustering terms by gene overlap ---\n")
+
+# For each cell type, compute a gene-overlap Jaccard similarity matrix between terms
+# Then identify top annotation themes
+
+# Helper function: compute Jaccard similarity between gene sets
+jaccard <- function(a, b) {
+    length(intersect(a, b)) / length(union(a, b))
+}
+
+# Build annotation theme summary per cell type
+theme_summary <- list()
+
+for (ct in target_cts) {
+    ct_terms <- fac_all %>% filter(CellType == ct)
+    if (nrow(ct_terms) < 3) next
+    
+    # Parse geneID column (slash-separated)
+    gene_sets <- strsplit(ct_terms$geneID, "/")
+    names(gene_sets) <- ct_terms$Description
+    
+    # Compute Jaccard similarity matrix
+    n <- length(gene_sets)
+    if (n > 100) {
+        # Take top 100 by significance to keep computation manageable
+        ct_terms <- ct_terms %>% arrange(p.adjust) %>% head(100)
+        gene_sets <- strsplit(ct_terms$geneID, "/")
+        names(gene_sets) <- ct_terms$Description
+        n <- length(gene_sets)
+    }
+    
+    sim_mat <- matrix(0, n, n, dimnames = list(names(gene_sets), names(gene_sets)))
+    for (i in 1:(n-1)) {
+        for (j in (i+1):n) {
+            sim_mat[i,j] <- sim_mat[j,i] <- jaccard(gene_sets[[i]], gene_sets[[j]])
+        }
+    }
+    diag(sim_mat) <- 1
+    
+    # Hierarchical clustering
+    hc <- hclust(as.dist(1 - sim_mat), method = "average")
+    
+    # Cut tree to get annotation clusters (target ~5-10 clusters)
+    k <- min(max(3, round(n / 5)), 10)
+    clusters <- cutree(hc, k = k)
+    
+    ct_terms$AnnotCluster <- clusters
+    
+    # For each annotation cluster, find the representative term (lowest p.adjust)
+    representatives <- ct_terms %>%
+        group_by(AnnotCluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 1) %>%
+        ungroup() %>%
+        mutate(ClusterSize = table(clusters)[as.character(AnnotCluster)])
+    
+    representatives$CellType <- ct
+    theme_summary[[ct]] <- representatives
+}
+
+theme_all <- bind_rows(theme_summary)
+cat("Annotation clusters identified:\n")
+print(theme_all %>% count(CellType))
+```
+
+```{r fac_summary_plot, fig.width=12, fig.height=18}
+# --- Summary plot: Annotation cluster themes per cell type ---
+if (nrow(theme_all) > 0) {
+    # Take top 10 annotation clusters per cell type
+    top_themes <- theme_all %>%
+        group_by(CellType) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 10) %>%
+        ungroup()
+    
+    top_themes$Description <- str_wrap(top_themes$Description, width = 45)
+    top_themes$CellType <- factor(top_themes$CellType, levels = target_cts)
+    
+    # Order themes top-to-bottom by CellType
+    top_themes <- top_themes %>% arrange(CellType, p.adjust)
+    top_themes$Description <- factor(top_themes$Description, levels = rev(unique(top_themes$Description)))
+    
+    top_themes$neg_log_p <- -log10(top_themes$p.adjust)
+    
+    # Add ontology as shape/color
+    p_fac <- ggplot(top_themes, aes(x = CellType, y = Description, 
+                                     size = as.numeric(ClusterSize), color = Ontology)) +
+        geom_point(alpha = 0.8) +
+        scale_color_manual(values = c("BP" = "#E41A1C", "MF" = "#377EB8", "CC" = "#4DAF4A")) +
+        theme_minimal() +
+        labs(title = "Functional Annotation Clusters (DAVID-style)",
+             subtitle = "Representative term per cluster, colored by GO ontology",
+             y = "", x = "", size = "Cluster\nsize") +
+        theme(axis.text.x = element_text(size = 12, face = "bold", angle = 45, hjust = 1),
+              axis.text.y = element_text(size = 8),
+              panel.border = element_rect(color = "black", fill = NA))
+    
+    ggsave("../figures/DAVID/FAC_Summary_Dotplot.png", p_fac, 
+           width = 12, height = 18, bg = "white")
+    print(p_fac)
+}
+```
+
+## 5. Multi-Ontology Comparative Heatmap
+
+This section shows which GO ontologies (BP, MF, CC) and KEGG pathways contribute to each cell type's functional identity.
+
+```{r multi_ontology_heatmap, fig.width=10, fig.height=8}
+cat("\n--- Multi-Ontology Comparative Heatmap ---\n")
+
+# Count significant terms per cell type per ontology
+ontology_counts <- fac_all %>%
+    group_by(CellType, Ontology) %>%
+    summarise(n_terms = n(), .groups = "drop")
+
+# Add KEGG counts
+if (exists("kegg_sig") && nrow(kegg_sig) > 0) {
+    if ("Cluster" %in% colnames(kegg_sig)) {
+        kegg_counts_df <- as.data.frame(table(kegg_sig$Cluster))
+        colnames(kegg_counts_df) <- c("CellType", "n_terms")
+        kegg_counts_df$Ontology <- "KEGG"
+        ontology_counts <- bind_rows(ontology_counts, kegg_counts_df)
+    }
+}
+
+# Add Reactome counts
+if (exists("reactome_sig") && nrow(reactome_sig) > 0) {
+    if ("Cluster" %in% colnames(reactome_sig)) {
+        react_counts_df <- as.data.frame(table(reactome_sig$Cluster))
+        colnames(react_counts_df) <- c("CellType", "n_terms")
+        react_counts_df$Ontology <- "Reactome"
+        ontology_counts <- bind_rows(ontology_counts, react_counts_df)
+    }
+}
+
+if (nrow(ontology_counts) > 0) {
+    ontology_counts$CellType <- factor(ontology_counts$CellType, levels = target_cts)
+    ontology_counts$Ontology <- factor(ontology_counts$Ontology, 
+                                        levels = c("BP", "MF", "CC", "KEGG", "Reactome"))
+    
+    p_multi <- ggplot(ontology_counts, aes(x = CellType, y = Ontology, fill = n_terms)) +
+        geom_tile(color = "white", linewidth = 1) +
+        geom_text(aes(label = n_terms), size = 5, fontface = "bold") +
+        scale_x_discrete(drop = FALSE) +
+        scale_fill_gradient(low = "lightyellow", high = "firebrick3", name = "# Significant\nTerms") +
+        theme_minimal(base_size = 14) +
+        labs(title = "Annotation Database Coverage per Cell Type",
+             subtitle = "Number of significant terms (p.adjust < 0.05) per database",
+             x = "", y = "") +
+        theme(axis.text.x = element_text(face = "bold", angle = 45, hjust = 1),
+              axis.text.y = element_text(face = "bold"),
+              panel.grid = element_blank())
+    
+    ggsave("../figures/DAVID/Multi_Ontology_Heatmap.png", p_multi, 
+           width = 10, height = 6, bg = "white")
+    print(p_multi)
+}
+```
+
+## 6. Cross-Database Term Overlap (UpSet-style)
+
+```{r cross_db_comparison, fig.width=10, fig.height=8}
+cat("\n--- Cross-Database Comparison ---\n")
+
+# For each cell type, collect the unique genes that appear in significant terms
+# from GO BP, GO MF, GO CC, KEGG, and Reactome
+# Then show how many genes are shared vs unique to each database
+
+if (!requireNamespace("ggVennDiagram", quietly = TRUE)) {
+    install.packages("ggVennDiagram", repos = "http://cran.us.r-project.org")
+}
+library(ggVennDiagram)
+
+# Focus on the metal trio for a clean Venn
+for (ct in c("ItC", "Copper", "Iron")) {
+    ct_bp <- fac_all %>% filter(CellType == ct, Ontology == "BP")
+    ct_mf <- fac_all %>% filter(CellType == ct, Ontology == "MF")
+    ct_cc <- fac_all %>% filter(CellType == ct, Ontology == "CC")
+    
+    bp_genes <- unique(unlist(strsplit(ct_bp$geneID, "/")))
+    mf_genes <- unique(unlist(strsplit(ct_mf$geneID, "/")))
+    cc_genes <- unique(unlist(strsplit(ct_cc$geneID, "/")))
+    
+    if (length(bp_genes) > 0 && length(mf_genes) > 0 && length(cc_genes) > 0) {
+        venn_list <- list("GO:BP" = bp_genes, "GO:MF" = mf_genes, "GO:CC" = cc_genes)
+        
+        p_venn <- ggVennDiagram(venn_list, label_alpha = 0) +
+            scale_fill_gradient(low = "white", high = "steelblue") +
+            labs(title = paste0("Gene Coverage Across GO Ontologies: ", ct)) +
+            theme(legend.position = "bottom")
+        
+        ggsave(paste0("../figures/DAVID/Venn_GO_Ontologies_", ct, ".png"), p_venn, 
+               width = 7, height = 6, bg = "white")
+        print(p_venn)
+    }
+}
+```
+
+## 7. Spatial Validation of KEGG Pathways
+
+Project the top KEGG pathway gene sets onto the spatial data to visualize pathway activity across the midgut.
+
+```{r spatial_kegg_validation, fig.width=14, fig.height=10}
+cat("\n--- Spatial Validation of KEGG Pathways ---\n")
+
+if (!is.null(sub_guts) && exists("kegg_sig") && nrow(kegg_sig) > 0) {
+    # Set up spatial cell types (same logic)
+    sub_guts$Detailed_CellType <- as.character(sub_guts$Most_Likely_CellType)
+    
+    # Pick top 1 most significant KEGG pathway per metal cell type
+    metal_kegg_top <- kegg_sig %>%
+        filter(Cluster %in% c("Copper", "Iron", "ItC")) %>%
+        group_by(Cluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 1) %>%
+        ungroup()
+    
+    if (nrow(metal_kegg_top) > 0) {
+        library(patchwork)
+        spatial_plots <- list()
+        
+        for (i in 1:nrow(metal_kegg_top)) {
+            pathway_name <- metal_kegg_top$Description[i]
+            ct_name <- metal_kegg_top$Cluster[i]
+            
+            # Get genes in pathway (geneID is Entrez, need to map back to symbols)
+            pathway_entrez <- unlist(strsplit(metal_kegg_top$geneID[i], "/"))
+            pathway_symbols <- mapIds(org.Dm.eg.db, keys = pathway_entrez,
+                                      column = "SYMBOL", keytype = "ENTREZID",
+                                      multiVals = "first")
+            pathway_symbols <- na.omit(pathway_symbols)
+            
+            # Map back to uppercase (spatial data gene names)
+            pathway_upper <- toupper(pathway_symbols)
+            spatial_genes <- intersect(pathway_upper, rownames(sub_guts))
+            
+            cat(sprintf("  %s (%s): %d/%d genes in spatial data\n",
+                        pathway_name, ct_name, length(spatial_genes), length(pathway_symbols)))
+            
+            if (length(spatial_genes) >= 3) {
+                score_name <- paste0("KEGG_", gsub("[^[:alnum:]]", "_", ct_name))
+                sub_guts <- AddModuleScore(sub_guts, features = list(spatial_genes), 
+                                           name = score_name)
+                
+                score_col <- paste0(score_name, "1")
+                
+                p_spatial <- ggplot(sub_guts@meta.data, 
+                                    aes(x = x_centroid, y = y_centroid, color = .data[[score_col]])) +
+                    geom_point(size = 0.5) +
+                    scale_color_viridis_c(option = "inferno") +
+                    theme_minimal() +
+                    coord_fixed() +
+                    labs(title = str_wrap(paste0(ct_name, ": ", pathway_name), width = 40),
+                         color = "Score")
+                
+                spatial_plots[[ct_name]] <- p_spatial
+            }
+        }
+        
+        if (length(spatial_plots) > 0) {
+            p_combined <- wrap_plots(spatial_plots, ncol = length(spatial_plots))
+            ggsave("../figures/DAVID/Spatial_KEGG_Pathways.png", p_combined, 
+                   width = 7 * length(spatial_plots), height = 6, bg = "white")
+            print(p_combined)
+        }
+    }
+} else {
+    cat("Spatial data not available or no KEGG results to validate.\n")
+}
+
+cat("\n========== DAVID-INSPIRED ANALYSIS COMPLETE ==========\n")
+```

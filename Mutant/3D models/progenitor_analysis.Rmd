@@ -1,0 +1,763 @@
+---
+title: "Progenitor Bin Analysis (ISC and EB)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(Matrix)
+library(Matrix.utils)
+library(zoo)
+library(patchwork)
+library(shiny)
+library(plotly)
+
+# Set path to 03Slide4 data
+data_path <- "../Random data/VisiumHD_Drosophila_Resolution_List.rds"
+```
+
+## 1. Load Data
+We load the Visium HD segmented data from the saved resolution list.
+
+```{r load_data}
+# --- 1. Load Data (Raw Visium HD Strategy) ---
+data_dir <- "/home/mattia/Thesis/03Slide4/binned_data"
+
+# Clean up Windows :Zone.Identifier metadata files
+zone_files <- list.files(path = data_dir, pattern = "Zone.Identifier$", recursive = TRUE, full.names = TRUE)
+if (length(zone_files) > 0) {
+  message("Cleaning up metadata files...")
+  unlink(zone_files)
+}
+
+# Fix Visium HD directory structure for Seurat's Load10X_Spatial
+if (!dir.exists(file.path(data_dir, "binned_outputs"))) {
+  message("Restoring SpaceRanger Visium HD directory structure...")
+  dir.create(file.path(data_dir, "binned_outputs"), showWarnings = FALSE)
+  for (res in c("square_002um", "square_008um", "square_016um")) {
+    old_p <- file.path(data_dir, res)
+    new_p <- file.path(data_dir, "binned_outputs", res)
+    if (dir.exists(old_p)) file.rename(old_p, new_p)
+  }
+}
+
+# Load the data
+# Slice name must match available H&E image if present
+seurat_obj <- Load10X_Spatial(data_dir, slice = "HE_Stain_Slice")
+
+# Set Default Assay to 16um Bins
+DefaultAssay(seurat_obj) <- "Spatial.016um"
+
+# Filter out bins with zero counts
+seurat_obj <- subset(seurat_obj, subset = nCount_Spatial.016um > 0)
+message("Initial Object Count (Loaded & Filtered): ", ncol(seurat_obj))
+
+# Normalize with SCTransform (Standard for Visium HD)
+message("Running SCTransform on 16um bins...")
+seurat_obj <- SCTransform(seurat_obj, assay = "Spatial.016um", verbose = FALSE)
+message("Object Count after SCTransform: ", ncol(seurat_obj))
+
+# --- Debugging Information ---
+message("Assays available: ", paste(Assays(seurat_obj), collapse = ", "))
+message("Default Assay: ", DefaultAssay(seurat_obj))
+
+# 0. Handle Seurat V5 multi-layer objects
+if (inherits(seurat_obj[[DefaultAssay(seurat_obj)]], "Assay5")) {
+  message("Seurat V5 assay detected. Joining layers...")
+  seurat_obj <- JoinLayers(seurat_obj, assay = DefaultAssay(seurat_obj))
+}
+
+# 1. Check for duplicate cell names (barcodes)
+if (any(duplicated(Cells(seurat_obj)))) {
+  message("Duplicate cell barcodes found! This is likely causing the row.names error.")
+  # We subset to unique barcodes to be absolutely sure
+  seurat_obj <- seurat_obj[, !duplicated(Cells(seurat_obj))]
+  message("Reduced to ", ncol(seurat_obj), " unique cell barcodes.")
+}
+
+# 2. Check for duplicate gene names
+if (any(duplicated(rownames(seurat_obj)))) {
+  message("Duplicate gene names detected. Unique-ifying names...")
+  new_names <- make.unique(rownames(seurat_obj))
+  if (inherits(seurat_obj[[DefaultAssay(seurat_obj)]], "Assay5")) {
+    rownames(seurat_obj[[DefaultAssay(seurat_obj)]]) <- new_names
+  } else {
+    rownames(seurat_obj[[DefaultAssay(seurat_obj)]]@counts) <- new_names
+    rownames(seurat_obj[[DefaultAssay(seurat_obj)]]@data) <- new_names
+  }
+}
+
+# Ensure data is normalized
+if (!"data" %in% Layers(seurat_obj, assay = DefaultAssay(seurat_obj))) {
+  message("Normalizing data...")
+  seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+}
+
+# Final Check: Are cell names unique? 
+```
+
+## 2. Define Refined Progenitor Markers
+To address potential bias towards large, transcriptionally dominant Enterocytes (ECs), we use an expanded marker set including both **Positive (Progenitor)** and **Negative (EC/Copper Cell)** signatures.
+
+```{r define_markers}
+# 1. Positive Markers (ISC and EB)
+# Standard: esg, Dl (ISC), Su(H) (EB), klu (EB), sanpodo (ISC), Nrt
+# Custom: GFP-construct, Cas9-construct
+pos_markers_raw <- c("esg", "Dl", "Su(H)", "klu", "sanpodo", "Nrt", "GFP-construct", "Cas9-construct")
+
+# 2. Negative Markers (Enterocytes and Copper Cells)
+# ECs: Myo61F, LManVI, alpha-Try, beta-Try
+# Copper Cells (mEC): MtnA, Npc2e
+neg_markers_raw <- c("Myo61F", "LManVI", "alpha-Try", "beta-Try", "MtnA", "Npc2e")
+
+# Helper to find present markers (case-insensitive)
+find_present <- function(m_list, obj) {
+  found <- m_list[m_list %in% rownames(obj)]
+  missing <- m_list[!m_list %in% found]
+  for (m in missing) {
+    match <- grep(paste0("^", m, "$"), rownames(obj), ignore.case = TRUE, value = TRUE)
+    if (length(match) > 0) found <- c(found, match[1])
+  }
+  return(unique(found))
+}
+
+pos_markers <- find_present(pos_markers_raw, seurat_obj)
+neg_markers <- find_present(neg_markers_raw, seurat_obj)
+
+message("Positive Markers used: ", paste(pos_markers, collapse = ", "))
+message("Negative Markers (EC filter) used: ", paste(neg_markers, collapse = ", "))
+```
+
+## 3. Calculate Refined Progenitor Score
+We calculate a **Contrast Score** by subtracting a fraction of the EC signature from the Progenitor signature. This ensures that bins with high EC contamination are penalized, even if they have some progenitor signal.
+
+```{r calculate_score}
+# 1. Calculate Average Positive Expression
+pos_mat <- GetAssayData(seurat_obj, assay = "SCT", layer = "data")[pos_markers, , drop = FALSE]
+pos_score <- colMeans(as.matrix(pos_mat))
+
+# 2. Calculate Average Negative Expression (EC bias)
+neg_mat <- GetAssayData(seurat_obj, assay = "SCT", layer = "data")[neg_markers, , drop = FALSE]
+neg_score <- colMeans(as.matrix(neg_mat))
+
+# 3. Final Weighted Contrast Score
+# We subtract 50% of the EC signature to clean up the identification
+seurat_obj$Progenitor_Score_Raw <- pos_score
+seurat_obj$EC_Penalty <- neg_score
+seurat_obj$Progenitor_Score <- pos_score - (0.5 * neg_score)
+
+# Visualize the scores
+# Ensure score doesn't go below 0 for standard range
+seurat_obj$Progenitor_Score[seurat_obj$Progenitor_Score < 0] <- 0
+
+hist(seurat_obj$Progenitor_Score, breaks = 50, main = "Weighted Progenitor Score Distribution", xlab = "Score (Positive - 0.5*Negative)")
+message("Object Count after Progenitor Scoring: ", ncol(seurat_obj))
+```
+
+## 4. Identify Top 10% Bins
+We rank the bins by the Progenitor Score and select the top 10%. We use rank with ties handled correctly to ensure we have two groups even in zero-inflated data.
+
+```{r identify_bins}
+# Using rank to avoid issues with many identical scores (like 0)
+# We handle ties by assigning them the same rank, but we want a clear split
+scores <- seurat_obj$Progenitor_Score
+n_cells <- length(scores)
+top_n <- ceiling(n_cells * 0.10)
+
+# Identify the score threshold for the top 10%
+# If many cells have the same score at the boundary, we might get more than 10%
+# But we must ensure 'Others' exists.
+threshold <- quantile(scores, 0.90)
+
+if (threshold == 0 && sum(scores > 0) > 0) {
+  # If 90% or more cells are 0, take all cells with score > 0 as "High"
+  # or a subset of them if they are too many. 
+  # Here we'll take everyone > 0 if threshold is 0.
+  message("90th percentile is 0. Selecting all bins with score > 0 as Progenitor-High.")
+  seurat_obj$Progenitor_Status <- ifelse(scores > 0, "Progenitor-High", "Others")
+} else if (all(scores == 0)) {
+  stop("All Progenitor Scores are 0. No bins identified.")
+} else {
+  # Standard case
+  seurat_obj$Progenitor_Status <- ifelse(scores >= threshold, "Progenitor-High (Top 10%)", "Others (90%)")
+}
+
+# Ensure we have at least two levels
+seurat_obj$Progenitor_Status <- factor(seurat_obj$Progenitor_Status)
+message("Cell count per identity:")
+print(table(seurat_obj$Progenitor_Status))
+
+# Check if we have two groups
+if (length(unique(seurat_obj$Progenitor_Status)) < 2) {
+  stop("Could not identify two groups (Progenitor-High and Others). Try a different threshold or markers.")
+}
+message("Object Count after Status Assignment: ", ncol(seurat_obj))
+```
+
+## 5. Differential Gene Expression (DGE) Analysis
+We compare the identified progenitor-high bins against the rest of the cells.
+
+```{r dge_analysis}
+# Set identity to Progenitor_Status
+Idents(seurat_obj) <- "Progenitor_Status"
+
+# Get the names of the two identities
+idents <- levels(seurat_obj$Progenitor_Status)
+high_ident <- idents[grep("High", idents)]
+low_ident <- idents[grep("Other", idents)]
+
+# Perform DGE
+progenitor_markers <- FindMarkers(seurat_obj, 
+                                 ident.1 = high_ident, 
+                                 ident.2 = low_ident, 
+                                 only.pos = TRUE, 
+                                 min.pct = 0.1, 
+                                 logfc.threshold = 0.25)
+
+# Display top 20 DEGs
+head(progenitor_markers, 50)
+
+# Save result to Excel folder
+output_csv <- "../Excels/Progenitor_Top10_DEGs.csv"
+write.csv(progenitor_markers, output_csv)
+message("DGE results saved to: ", output_csv)
+message("Object Count after DGE: ", ncol(seurat_obj))
+```
+
+## 6. Visualization
+We visualize the spatial distribution of the score and the identified bins.
+
+```{r visualization, fig.width=12, fig.height=10}
+# --- Standard Spatial Visualization ---
+message("Generating spatial plots...")
+
+# Diagnostic Plots: Progenitor Score, EC Penalty, and Final Filtered Score
+p1 <- SpatialFeaturePlot(seurat_obj, features = "Progenitor_Score_Raw") + ggtitle("Raw Progenitor Marker Avg")
+p2 <- SpatialFeaturePlot(seurat_obj, features = "EC_Penalty") + ggtitle("EC Signature (Penalty)")
+p3 <- SpatialFeaturePlot(seurat_obj, features = "Progenitor_Score") + ggtitle("Final Contrast Score")
+p4 <- SpatialDimPlot(seurat_obj, group.by = "Progenitor_Status") + ggtitle("Identified Progenitor Bins")
+
+print((p1 + p2) / (p3 + p4))
+message("Object Count after Visualization: ", ncol(seurat_obj))
+
+
+# Individual marker plots using Seurat native function
+if (length(pos_markers) > 0) {
+  p_markers <- SpatialFeaturePlot(seurat_obj, features = pos_markers, ncol = 3, combine = FALSE)
+  if (length(p_markers) > 0) print(wrap_plots(p_markers, ncol = 3))
+}
+```
+
+
+## 7. Sample Subsetting (Interactive Lasso Selection)
+Before performing the spatial similarity analysis, we split the sample into WT and Mutant areas. This uses an interactive Shiny lasso tool.
+
+```{r interactive_subsetting}
+# --- File Paths for Selections ---
+selection_wt_file <- "../Random data/Slide4_Progenitor_WT_Selection.csv"
+selection_mut_file <- "../Random data/Slide4_Progenitor_Mutant_Selection.csv"
+
+# Barcode Matching Helper (Precise for Visium HD Bins)
+clean_barcodes_local <- function(selection, all_bins) {
+  if (is.null(selection)) return(character(0))
+  # Use direct character intersection to avoid numeric conversion issues
+  selection <- as.character(selection)
+  valid <- intersect(selection, all_bins)
+  
+  if (length(valid) == 0 && length(selection) > 0) {
+      # Fallback: try prefix-based numeric matching if direct fails
+      message("Direct barcode match failed. Attempting numeric extraction...")
+      sel_nums <- gsub("[^0-9]", "", selection)
+      all_nums <- gsub("[^0-9]", "", all_bins)
+      match_idx <- match(sel_nums, all_nums)
+      valid <- all_bins[match_idx[!is.na(match_idx)]]
+  }
+  return(valid)
+}
+
+if (file.exists(selection_wt_file) && file.exists(selection_mut_file)) {
+    message("Loading existing WT/Mutant bin selections from CSV...")
+    wt_bins <- as.character(read.csv(selection_wt_file)$x)
+    mut_bins <- as.character(read.csv(selection_mut_file)$x)
+} else {
+    message("Launching Shiny app for WT and Mutant bin selection...")
+    coords <- GetTissueCoordinates(seurat_obj)
+    # Ensure coords and barcodes match
+    common_barcodes <- intersect(rownames(coords), Cells(seurat_obj))
+    coords_df <- data.frame(x = coords[common_barcodes, 1], 
+                            y = coords[common_barcodes, 2], 
+                            barcode = common_barcodes)
+    
+    # Debug info
+    message("Plotting ", nrow(coords_df), " bins.")
+    message("Barcode Format: ", head(common_barcodes, 1))
+
+    ui <- fluidPage(
+        titlePanel("Progenitor Bin Splitting (03Slide4)"),
+        sidebarLayout(
+            sidebarPanel(
+                h4("Instructions"),
+                p("1. Use the Lasso tool on the plot to select the WT area."),
+                p("2. Click 'Save WT Bins'."),
+                p("3. Select the Mutant area and click 'Save Mutant Bins'."),
+                hr(),
+                actionButton("save_wt", "Save WT Bins"),
+                verbatimTextOutput("st_wt"),
+                hr(),
+                actionButton("save_mut", "Save Mutant Bins"),
+                verbatimTextOutput("st_mut"),
+                hr(), 
+                actionButton("done", "DONE (Continue)", class = "btn-success")
+            ),
+            mainPanel(plotlyOutput("plot", height = "700px"))
+        )
+    )
+    
+    server <- function(input, output, session) {
+        v <- reactiveValues(wt = NULL, mut = NULL)
+        
+        output$plot <- renderPlotly({
+            plot_ly(coords_df, x=~x, y=~y, key=~barcode, type="scatter", mode="markers",
+                    marker=list(size=3, color='gray', opacity=0.5), source="src") %>%
+                layout(dragmode="lasso", yaxis=list(autorange="reversed"), title = "Select WT and Mutant Regions")
+        })
+        
+        observeEvent(input$save_wt, {
+            d <- event_data("plotly_selected", source="src")
+            if(!is.null(d)) {
+                v$wt <- unique(as.character(d$key))
+                message("Saved ", length(v$wt), " IDs to WT.")
+            }
+        })
+        
+        observeEvent(input$save_mut, {
+            d <- event_data("plotly_selected", source="src")
+            if(!is.null(d)) {
+                v$mut <- unique(as.character(d$key))
+                message("Saved ", length(v$mut), " IDs to Mutant.")
+            }
+        })
+        
+        output$st_wt <- renderText({ 
+            if(is.null(v$wt)) "WT: No bins saved" 
+            else paste("WT:", length(v$wt), "bins saved") 
+        })
+        
+        output$st_mut <- renderText({ 
+            if(is.null(v$mut)) "Mutant: No bins saved" 
+            else paste("Mutant:", length(v$mut), "bins saved") 
+        })
+        
+        observeEvent(input$done, { stopApp(list(wt=v$wt, mut=v$mut)) })
+    }
+    
+    sel <- runApp(shinyApp(ui, server))
+    all_bins <- Cells(seurat_obj)
+    wt_bins <- clean_barcodes_local(sel$wt, all_bins)
+    mut_bins <- clean_barcodes_local(sel$mut, all_bins)
+    
+    # Save the cleaned, unique barcodes
+    write.csv(data.frame(x = unique(wt_bins)), selection_wt_file, row.names = FALSE)
+    write.csv(data.frame(x = unique(mut_bins)), selection_mut_file, row.names = FALSE)
+    message("Selections saved. WT:", length(wt_bins), " Mutant:", length(mut_bins))
+}
+
+# Apply to Seurat object
+seurat_obj$Sample_Group <- "Background"
+if(length(wt_bins) > 0) seurat_obj$Sample_Group[Cells(seurat_obj) %in% wt_bins] <- "WT"
+if(length(mut_bins) > 0) seurat_obj$Sample_Group[Cells(seurat_obj) %in% mut_bins] <- "Mutant"
+
+message("Final group assignment counts:")
+print(table(seurat_obj$Sample_Group))
+
+# Visualize the splitting results
+if ("Sample_Group" %in% colnames(seurat_obj@meta.data)) {
+  print(SpatialDimPlot(seurat_obj, group.by = "Sample_Group") + ggtitle("WT/Mutant Selection"))
+}
+
+message("Total Object Count (Bins): ", ncol(seurat_obj))
+```
+
+## 8. Progenitor Spatial Similarity (Splitted WT vs Mutant)
+This section implements a refined "triangle plot" for both WT and Mutant progenitor populations.
+
+```{r similarity_plot_refined_split, fig.width=15, fig.height=8}
+# 1. Refined Calculation Function
+calculate_triangle_matrix_refined <- function(obj, n_bins = 100, smoothing_window = 3) {
+    if (ncol(obj) < 10) return(NULL)
+    
+    var_genes <- VariableFeatures(obj)
+    if (length(var_genes) < 100) {
+      obj <- FindVariableFeatures(obj, nfeatures = 2000, verbose = FALSE)
+      var_genes <- VariableFeatures(obj)
+    }
+    
+    obj$Bin <- factor(cut(obj$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+    
+    # Use SCT assay for high-quality spatial correlation
+    exp_mat <- GetAssayData(obj, assay = "SCT", layer = "data")[var_genes, ]
+    bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, obj$Bin, mean, na.rm = TRUE)))
+    
+    # A. Interpolate missing bins
+    bin_means <- t(apply(bin_means, 1, function(x) {
+        if (all(is.na(x))) return(x)
+        na.approx(x, na.rm = FALSE, rule = 2)
+    }))
+    
+    # C. Noise Filtering (Moving Average Smoothing)
+    bin_smoothed <- t(apply(bin_means, 1, function(x) {
+        if(all(x == 0)) return(x)
+        res <- as.numeric(stats::filter(x, rep(1/smoothing_window, smoothing_window), sides = 2))
+        res[is.na(res)] <- mean(x, na.rm=T)
+        return(res)
+    }))
+    
+    cor_mat <- cor(bin_smoothed, method = "pearson", use = "pairwise.complete.obs")
+    diag(cor_mat) <- NA
+    global_mean <- mean(cor_mat, na.rm = TRUE)
+    cor_mat_adj <- cor_mat - global_mean
+    diag(cor_mat_adj) <- 1
+    
+    return(cor_mat_adj)
+}
+
+# 2. Plotting Function
+plot_triangle_local <- function(sim_mat, title) {
+    if (is.null(sim_mat)) return(NULL)
+    n <- nrow(sim_mat)
+    tri_data <- expand.grid(i = 1:n, j = 1:n) %>% filter(j >= i) %>% rowwise() %>%
+        mutate(Similarity = sim_mat[i, j]) %>% filter(!is.na(Similarity))
+    
+    poly_list <- lapply(1:nrow(tri_data), function(idx) {
+        row <- tri_data[idx, ]
+        cx <- (row$i + row$j) / 2; cy <- (row$j - row$i) / 2
+        data.frame(x = c(cx, cx + 0.5, cx, cx - 0.5), y = c(cy + 0.5, cy, cy - 0.5, cy), Similarity = row$Similarity, ID = idx)
+    })
+    poly_df <- do.call(rbind, poly_list)
+    
+    ggplot(poly_df, aes(x = x, y = y, fill = Similarity, group = ID)) +
+        geom_polygon() +
+        scale_fill_gradient2(high = "#B2182B", mid = "#F7F7F7", low = "#2166AC", midpoint = 0, name = "Similarity", limits = c(-0.4, 0.4), oob = scales::squish) +
+        theme_minimal() + coord_fixed(ratio = 1) + labs(title = title, x = "AP Axis", y = "Dist") +
+        theme(panel.grid = element_blank(), axis.text.y = element_blank())
+}
+
+# 3. Analyze each group
+# Ensure Spatial_Pseudotime exists
+if (!"Spatial_Pseudotime" %in% colnames(seurat_obj@meta.data)) {
+  coords <- GetTissueCoordinates(seurat_obj)
+  seurat_obj$Spatial_Pseudotime <- 100 * (coords[, 1] - min(coords[, 1])) / (max(coords[, 1]) - min(coords[, 1]))
+}
+
+# Diagnostic: Check Progenitor-High counts in each group
+is_high_global <- grepl("High", seurat_obj$Progenitor_Status)
+group_counts <- table(seurat_obj$Sample_Group, is_high_global)
+message("Progenitor Distribution across selected areas (Global High = TRUE):")
+print(group_counts)
+
+# Helper for robust subsetting
+get_subset_prog <- function(obj, group_name) {
+    # 1. Try Global Top 10%
+    cells_global <- Cells(obj)[is_high_global & obj$Sample_Group == group_name]
+    
+    if (length(cells_global) >= 10) {
+        message(paste("Using", length(cells_global), "global progenitor-high bins for", group_name))
+        return(subset(obj, cells = cells_global))
+    }
+    
+    # 2. Fallback: Top 10% WITHIN the group if global is empty/too small
+    message(paste("Warning: Global progenitor-high bins not found in", group_name, ". Falling back to local top 10%..."))
+    grp_cells <- Cells(obj)[obj$Sample_Group == group_name]
+    if (length(grp_cells) < 10) return(NULL)
+    
+    sub_grp <- subset(obj, cells = grp_cells)
+    threshold_local <- quantile(sub_grp$Progenitor_Score, 0.90)
+    cells_local <- Cells(sub_grp)[sub_grp$Progenitor_Score >= threshold_local]
+    
+    if (length(cells_local) >= 10) {
+        message(paste("Using", length(cells_local), "local progenitor-high bins for", group_name))
+        return(subset(sub_grp, cells = cells_local))
+    }
+    return(NULL)
+}
+
+# Analyze WT
+wt_prog <- get_subset_prog(seurat_obj, "WT")
+p_wt <- if(!is.null(wt_prog)) plot_triangle_local(calculate_triangle_matrix_refined(wt_prog), "WT Progenitors (Slide 4)") else NULL
+
+# Analyze Mutant
+mut_prog <- get_subset_prog(seurat_obj, "Mutant")
+p_mut <- if(!is.null(mut_prog)) plot_triangle_local(calculate_triangle_matrix_refined(mut_prog), "Mutant Progenitors (Slide 4)") else NULL
+
+# Display side-by-side
+if (!is.null(p_wt) && !is.null(p_mut)) {
+    p_final <- (p_wt | p_mut) + plot_layout(guides = "collect")
+    print(p_final)
+    ggsave("../figures/Progenitor_Triangle_Comparison_WT_Mutant.png", p_final, width = 15, height = 7)
+}
+# ==============================================================================
+# --- PART II: SEGMENTED CELL ANALYSIS (COMPARISON) ---
+# ==============================================================================
+
+# Path to RDS list (should be consistent with previous runs)
+rds_path <- "../Random data/VisiumHD_Drosophila_Resolution_List.rds"
+if (!file.exists(rds_path)) stop("RDS Resolution List not found at: ", rds_path)
+
+vhd_list <- readRDS(rds_path)
+seurat_seg <- vhd_list$seg
+message("Loaded Segmented Assay: ", ncol(seurat_seg), " cells.")
+
+# Standard Log-Normalization for segmented data
+seurat_seg <- NormalizeData(seurat_seg, verbose = FALSE)
+
+# Deduplicate row.names if any (safeguard)
+if (any(duplicated(Cells(seurat_seg)))) {
+  seurat_seg <- seurat_seg[, !duplicated(Cells(seurat_seg))]
+  message("Deduplicated barcodes: ", ncol(seurat_seg), " unique cells.")
+}
+
+# Run Dimensional Reduction for UMAP plots (user-requested)
+message("Running PCA and UMAP for segmented data...")
+seurat_seg <- FindVariableFeatures(seurat_seg, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+seurat_seg <- ScaleData(seurat_seg, verbose = FALSE)
+seurat_seg <- RunPCA(seurat_seg, features = VariableFeatures(seurat_seg), verbose = FALSE)
+seurat_seg <- RunUMAP(seurat_seg, dims = 1:20, verbose = FALSE)
+```
+
+## 10. Basic Progenitor Scoring (Segmented)
+For the segmented assay, we use the original 5 markers and a standard sum-based score with a top 5% threshold.
+
+```{r score_seg}
+# Original marker set
+seg_markers_base <- c("esg", "Dl", "Su(H)", "GFP-construct", "Cas9-construct")
+seg_markers <- seg_markers_base[seg_markers_base %in% rownames(seurat_seg)]
+
+# Basic Sum Scoring
+seg_scores <- colSums(as.matrix(GetAssayData(seurat_seg, layer = "data")[seg_markers, ]))
+seurat_seg$Progenitor_Score <- seg_scores
+
+# Identify Top 5%
+thresh_seg <- quantile(seg_scores, 0.95)
+seurat_seg$Progenitor_Status <- ifelse(seg_scores >= thresh_seg, "Progenitor-High (Top 5%)", "Others (95%)")
+seurat_seg$Progenitor_Status <- factor(seurat_seg$Progenitor_Status)
+
+print(table(seurat_seg$Progenitor_Status))
+
+# Visualization (Using UMAP as requested)
+p_seg1 <- FeaturePlot(seurat_seg, features = "Progenitor_Score") + ggtitle("Segmented: Progenitor Score (UMAP)")
+p_seg2 <- DimPlot(seurat_seg, group.by = "Progenitor_Status") + ggtitle("Segmented: Top 5% Bins (UMAP)")
+print(p_seg1 / p_seg2)
+```
+
+## 11. Interactive WT/Mutant Selection (Segmented)
+We provide a dedicated lasso selection for the segmented data to ensure spatial accuracy for these specific coordinates.
+
+```{r lasso_seg, eval=FALSE}
+library(shiny)
+library(plotly)
+
+# Prepare coordinates from centroids (3D UMAP Logic)
+if (all(c("x_centroid", "y_centroid") %in% colnames(seurat_seg@meta.data))) {
+    coords_seg_raw <- seurat_seg@meta.data[, c("x_centroid", "y_centroid")]
+    colnames(coords_seg_raw) <- c("x", "y")
+} else {
+    coords_seg_raw <- GetTissueCoordinates(seurat_seg)
+    colnames(coords_seg_raw) <- c("x", "y")
+}
+
+coords_df_seg <- data.frame(
+    x = coords_seg_raw$x,
+    y = coords_seg_raw$y,
+    barcode = rownames(coords_seg_raw)
+)
+
+ui <- fluidPage(
+    titlePanel("Slide 4: Segmented Progenitor Selection"),
+    sidebarLayout(
+        sidebarPanel(
+            actionButton("save_wt", "Save WT Selection"),
+            actionButton("save_mut", "Save Mutant Selection"),
+            helpText("Lasso area on plot and click Save."),
+            textOutput("status")
+        ),
+        mainPanel(plotlyOutput("plot", height = "800px"))
+    )
+)
+
+server <- function(input, output, session) {
+    output$plot <- renderPlotly({
+        plot_ly(coords_df_seg, x=~x, y=~y, key=~barcode, type="scatter", mode="markers",
+                marker = list(size = 3, opacity = 0.5, color = 'gray'), source = "subset_source") %>%
+        layout(dragmode = "lasso", xaxis = list(title = "X"), yaxis = list(title = "Y", autorange = "reversed"))
+    })
+    
+    # Helper to clean/format barcodes (from 3D UMAP Logic)
+    clean_barcodes_local <- function(selection, all_cells) {
+        if (is.null(selection)) return(NULL)
+        normalized <- tryCatch({ sprintf("cellid_%09d-1", as.numeric(selection))
+        }, warning = function(w) selection, error = function(e) selection)
+        valid_fmt <- intersect(normalized, all_cells)
+        valid_raw <- intersect(selection, all_cells)
+        if (length(valid_fmt) > length(valid_raw)) return(valid_fmt) else return(valid_raw)
+    }
+
+    observeEvent(input$save_wt, {
+        d <- event_data("plotly_selected", source = "subset_source")
+        if(!is.null(d)) {
+            selected <- clean_barcodes_local(d$key, Cells(seurat_seg))
+            write.csv(data.frame(barcode=selected), "../Random data/Slide4_Segmented_WT_Selection.csv", row.names=F)
+            output$status <- renderText(paste("Saved", length(selected), "WT cells."))
+        }
+    })
+    observeEvent(input$save_mut, {
+        d <- event_data("plotly_selected", source = "subset_source")
+        if(!is.null(d)) {
+            selected <- clean_barcodes_local(d$key, Cells(seurat_seg))
+            write.csv(data.frame(barcode=selected), "../Random data/Slide4_Segmented_Mutant_Selection.csv", row.names=F)
+            output$status <- renderText(paste("Saved", length(selected), "Mutant cells."))
+        }
+    })
+}
+shinyApp(ui, server)
+```
+
+## 12. Segmented Similarity Triangle Plots (Progenitors vs Others)
+```{r similarity_seg, fig.width=15, fig.height=12}
+# Load Segmented Selections
+wt_seg_ids <- if(file.exists("../Random data/Slide4_Segmented_WT_Selection.csv")) read.csv("../Random data/Slide4_Segmented_WT_Selection.csv")$barcode else NULL
+mut_seg_ids <- if(file.exists("../Random data/Slide4_Segmented_Mutant_Selection.csv")) read.csv("../Random data/Slide4_Segmented_Mutant_Selection.csv")$barcode else NULL
+
+if(!is.null(wt_seg_ids) && !is.null(mut_seg_ids)){
+    # Setup Groups
+    seurat_seg$Sample_Group <- "Background"
+    seurat_seg$Sample_Group[Cells(seurat_seg) %in% wt_seg_ids] <- "WT"
+    seurat_seg$Sample_Group[Cells(seurat_seg) %in% mut_seg_ids] <- "Mutant"
+    
+    # Calculate Spatial Pseudotime for Segmented
+    coords_seg <- GetTissueCoordinates(seurat_seg)
+    x_col_seg <- grep("x|centroid", colnames(coords_seg), ignore.case = TRUE, value = TRUE)[1]
+    seurat_seg$Spatial_Pseudotime <- 100 * (coords_seg[[x_col_seg]] - min(coords_seg[[x_col_seg]])) / (max(coords_seg[[x_col_seg]]) - min(coords_seg[[x_col_seg]]))
+    
+    # Function to plot triangle helper (assumes ggplot2 in env)
+    plot_tri_helper <- function(sim_mat, title) {
+        if(is.null(sim_mat)) return(NULL)
+        n <- nrow(sim_mat)
+        tri_data <- expand.grid(i = 1:n, j = 1:n) %>% filter(j >= i) %>% rowwise() %>% mutate(Similarity = sim_mat[i, j])
+        poly_list <- lapply(1:nrow(tri_data), function(idx) {
+            row <- tri_data[idx, ]; cx <- (row$i + row$j) / 2; cy <- (row$j - row$i) / 2
+            data.frame(x = c(cx, cx + 0.5, cx, cx - 0.5), y = c(cy + 0.5, cy, cy - 0.5, cy), Similarity = row$Similarity, ID = idx)
+        })
+        ggplot(do.call(rbind, poly_list), aes(x = x, y = y, fill = Similarity, group = ID)) +
+            geom_polygon() + scale_fill_gradient2(high = "#B2182B", mid = "#F7F7F7", low = "#2166AC", midpoint = 0, name = "Rel. Sim", limits = c(-0.4, 0.4), oob = scales::squish) +
+            theme_minimal() + coord_fixed(ratio = 1) + labs(title = title) + theme(panel.grid = element_blank(), axis.text.y = element_blank())
+    }
+
+    # Redefining refined triangle matrix function for segmented assay (standalone logic)
+    calculate_triangle_matrix_refined <- function(obj, n_bins = 100, smoothing_window = 3) {
+        if (is.null(obj) || ncol(obj) < 10) return(NULL)
+        var_genes <- VariableFeatures(obj)
+        if (length(var_genes) < 100) { obj <- FindVariableFeatures(obj, nfeatures = 2000, verbose = FALSE); var_genes <- VariableFeatures(obj) }
+        
+        obj$Bin <- factor(cut(obj$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+        exp_mat <- GetAssayData(obj, layer = "data")[var_genes, ]
+        bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, obj$Bin, mean, na.rm = TRUE)))
+        bin_means <- t(apply(bin_means, 1, function(x) zoo::na.approx(x, na.rm = FALSE, rule = 2)))
+        bin_smoothed <- t(apply(bin_means, 1, function(x) {
+            if(all(x == 0)) return(x)
+            res <- as.numeric(stats::filter(x, rep(1/smoothing_window, smoothing_window), sides = 2)); res[is.na(res)] <- mean(x, na.rm=T); return(res)
+        }))
+        cor_mat <- cor(bin_smoothed, method = "pearson", use = "pairwise.complete.obs")
+        diag(cor_mat) <- NA; global_mean <- mean(cor_mat, na.rm = TRUE)
+        cor_mat_adj <- cor_mat - global_mean; diag(cor_mat_adj) <- 1; return(cor_mat_adj)
+    }
+
+    # Subset Logic
+    is_prog <- seurat_seg$Progenitor_Status == "Progenitor-High (Top 5%)"
+    is_others <- seurat_seg$Progenitor_Status == "Others (95%)"
+    
+    # Progenitor Subsets
+    prog_wt <- subset(seurat_seg, cells = Cells(seurat_seg)[is_prog & seurat_seg$Sample_Group == "WT"])
+    prog_mut <- subset(seurat_seg, cells = Cells(seurat_seg)[is_prog & seurat_seg$Sample_Group == "Mutant"])
+    # Others Subsets
+    others_wt <- subset(seurat_seg, cells = Cells(seurat_seg)[is_others & seurat_seg$Sample_Group == "WT"])
+    others_mut <- subset(seurat_seg, cells = Cells(seurat_seg)[is_others & seurat_seg$Sample_Group == "Mutant"])
+
+    # Generate Plots
+    p1 <- plot_tri_helper(calculate_triangle_matrix_refined(prog_wt), "Progenitor WT")
+    p2 <- plot_tri_helper(calculate_triangle_matrix_refined(prog_mut), "Progenitor Mutant")
+    p3 <- plot_tri_helper(calculate_triangle_matrix_refined(others_wt), "Others WT (Non-Prog)")
+    p4 <- plot_tri_helper(calculate_triangle_matrix_refined(others_mut), "Others Mutant (Non-Prog)")
+    
+    # 4-Panel Figure
+    p_final <- (p1 + p2) / (p3 + p4)
+    print(p_final)
+    ggsave("../figures/Progenitor_vs_Others_Similarity_Segmented.png", p_final, width = 15, height = 12)
+    message("Segmented Triangle Comparison saved to figures/.")
+}
+```
+
+## 13. Segmented Identity DGE (Condition-Specific)
+```{r dge_seg}
+# Prepare Subsets by Selection Group
+wt_cells_obj <- subset(seurat_seg, subset = Sample_Group == "WT")
+mut_cells_obj <- subset(seurat_seg, subset = Sample_Group == "Mutant")
+
+# A. WT Progenitor Identity (Progenitor vs Others in WT)
+Idents(wt_cells_obj) <- wt_cells_obj$Progenitor_Status
+message("Running DGE: WT Progenitor vs Others...")
+wt_id_markers <- FindMarkers(wt_cells_obj, ident.1 = "Progenitor-High (Top 5%)", ident.2 = "Others (95%)", min.pct = 0.2, logfc.threshold = 0.25)
+wt_id_markers$gene <- rownames(wt_id_markers)
+
+# B. Mutant Progenitor Identity (Progenitor vs Others in Mutant)
+Idents(mut_cells_obj) <- mut_cells_obj$Progenitor_Status
+message("Running DGE: Mutant Progenitor vs Others...")
+mut_id_markers <- FindMarkers(mut_cells_obj, ident.1 = "Progenitor-High (Top 5%)", ident.2 = "Others (95%)", min.pct = 0.2, logfc.threshold = 0.25)
+mut_id_markers$gene <- rownames(mut_id_markers)
+
+# Display Results
+print("Top 20 WT Progenitor Identity Markers:")
+print(head(wt_id_markers, 20))
+
+print("Top 20 Mutant Progenitor Identity Markers:")
+print(head(mut_id_markers, 20))
+
+# Save
+write.csv(wt_id_markers, "../Excels/Slide4_Segmented_WT_Progenitor_Markers.csv")
+write.csv(mut_id_markers, "../Excels/Slide4_Segmented_Mutant_Progenitor_Markers.csv")
+```
+
+## 14. Progenitor Identity Shift Comparison
+```{r identity_comparison}
+# Filter for significant enriched markers (p_adj < 0.05, positive logFC)
+wt_sig_markers <- wt_id_markers$gene[wt_id_markers$p_val_adj < 0.05 & wt_id_markers$avg_log2FC > 0]
+mut_sig_markers <- mut_id_markers$gene[mut_id_markers$p_val_adj < 0.05 & mut_id_markers$avg_log2FC > 0]
+
+# 1. Conserved Progenitor Markers (Define identity in both states)
+conserved_markers <- intersect(wt_sig_markers, mut_sig_markers)
+
+# 2. Lost Progenitor Markers (Reduced enrichment in mutant)
+lost_markers <- setdiff(wt_sig_markers, mut_sig_markers)
+
+# 3. Gained (Ectopic) Progenitor Markers (Newly enriched in mutant)
+gained_markers <- setdiff(mut_sig_markers, wt_sig_markers)
+
+message("\n--- Conserved Progenitor Markers ---")
+print(conserved_markers)
+
+message("\n--- Lost Progenitor Identity Genes (WT specific) ---")
+print(lost_markers)
+
+message("\n--- Gained (Ectopic) Progenitor Markers (Mutant specific) ---")
+print(gained_markers)
+
+# Export Comparison
+write.csv(data.frame(gene = conserved_markers), "../Excels/Slide4_Conserved_Progenitor_Markers.csv")
+write.csv(data.frame(gene = lost_markers), "../Excels/Slide4_Lost_Progenitor_Markers.csv")
+write.csv(data.frame(gene = gained_markers), "../Excels/Slide4_Gained_Progenitor_Markers.csv")
+```

@@ -1,0 +1,601 @@
+---
+title: "Gut 3 Spatial Analysis"
+output: html_document
+date: "2026-02-13"
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(viridis)
+library(clusterProfiler)
+library(org.Dm.eg.db)
+library(pheatmap)
+library(RColorBrewer)
+
+# Set base theme
+theme_set(theme_bw())
+```
+
+# 1. Load Data
+We load the processed Gut 3 object from the 3D UMAP analysis. This object already contains:
+- `Spatial_Pseudotime`: Position along the gut axis (0-100)
+- `Predicted_CellType`: Cell type labels from label transfer
+
+```{r load_data}
+input_file <- "../Random data/gut3_processed_for_analysis.rds"
+
+if (!file.exists(input_file)) {
+  stop("Input file not found! Please run '3D_UMAP_Analysis.Rmd' first to generate 'gut3_processed_for_analysis.rds'.")
+}
+
+seurat_obj <- readRDS(input_file)
+
+# Basic QC Check
+print("Loaded Gut 3 Object:")
+print(seurat_obj)
+print(head(seurat_obj@meta.data[, c("Predicted_CellType", "Spatial_Pseudotime")]))
+```
+
+# 2. Identify Cell-Type Specific Markers
+We identify markers for each cell type present in Gut 3.
+
+```{r find_markers}
+Idents(seurat_obj) <- seurat_obj$Predicted_CellType
+
+# Find markers for every cluster compared to all remaining cells
+# Using standard parameters for robustness
+markers_all <- FindAllMarkers(
+  seurat_obj,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = FALSE
+)
+
+# Filter for significance
+markers_sig <- markers_all %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  top_n(n = 50, wt = avg_log2FC) # Keep top 50 for plotting candidates
+
+# Save for reference
+write.csv(markers_sig, "../Excels/gut3_celltype_markers.csv")
+print(table(markers_sig$cluster))
+```
+
+# 3. Trajectory line Plots (Expression vs Length)
+We plot specific marker genes for each cell type as smooth lines along the gut length.
+
+```{r trajectory_plots, fig.width=10, fig.height=6}
+# Function to plot expression trends
+plot_trajectory_trend <- function(obj, cell_type, genes, y_limit = NULL) {
+  
+  # Subset to specific cell type
+  sub_obj <- subset(obj, idents = cell_type)
+  
+  # Check if genes exist
+  valid_genes <- genes[genes %in% rownames(sub_obj)]
+  if(length(valid_genes) == 0) return(NULL)
+  
+  # Fetch data
+  expr_data <- FetchData(sub_obj, vars = c(valid_genes, "Spatial_Pseudotime"))
+  
+  # Pivot to long format for ggplot
+  expr_long <- tidyr::pivot_longer(
+    expr_data, 
+    cols = all_of(valid_genes), 
+    names_to = "Gene", 
+    values_to = "Expression"
+  )
+  
+  # Max-Scaling normalization per gene (0 to 1) 
+  # Keeps 0 at 0 (no expression) and makes max expression 1
+  expr_long <- expr_long %>%
+    group_by(Gene) %>%
+    mutate(Scaled_Expr = Expression / max(Expression, na.rm = TRUE)) %>%
+    ungroup()
+
+  # Plot
+  p <- ggplot(expr_long, aes(x = Spatial_Pseudotime, y = Scaled_Expr, color = Gene)) +
+    # Use GAM smoothing for clean trajectory lines
+    geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE, linewidth = 1.2) +
+    
+    # Enforce X-axis limits (0-100)
+    coord_cartesian(xlim = c(0, 100), ylim = c(0, 1.05), expand = FALSE) +
+    
+    labs(
+      title = paste("Trajectory: ", cell_type),
+      x = "Gut Length (Pseudotime 0-100)",
+      y = "Relative Expression (Scaled 0-1)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right")
+  
+  return(p)
+}
+
+# Generate plots for each cell type
+unique_types <- unique(seurat_obj$Predicted_CellType)
+plot_list <- list()
+
+for (ctype in unique_types) {
+  # Pick top 5 markers for this cell type to plot
+  top_genes <- markers_sig %>% 
+    filter(cluster == ctype) %>% 
+    top_n(5, wt = avg_log2FC) %>% 
+    pull(gene)
+    
+  if (length(top_genes) > 0) {
+    p <- plot_trajectory_trend(seurat_obj, ctype, top_genes)
+    print(p)
+    ggsave(paste0("../figures/gut3_trajectory_", gsub("/", "_", ctype), ".png"), plot = p, width = 8, height = 5)
+  }
+}
+```
+
+# 3.1. Collapsed Trajectories (Progenitors & Enterocytes)
+We group cells into broader categories to see general trends.
+
+```{r collapsed_trajectories, fig.width=10, fig.height=6}
+# 1. Create Collapsed Metadata
+current_types <- as.character(seurat_obj$Predicted_CellType)
+collapsed_types <- current_types
+
+# Define groups
+progenitors <- c("ISC", "EB")
+enterocytes <- c("aEC", "mEC", "pEC", "dEC", "Enterocyte", "LFC", "Copper", "Iron")
+
+# Replace
+collapsed_types[collapsed_types %in% progenitors] <- "Progenitor"
+collapsed_types[collapsed_types %in% enterocytes] <- "Enterocyte"
+# Keep others as is (e.g. EE, etc) or group into "Other"
+# collapsed_types[!collapsed_types %in% c("Progenitor", "Enterocyte")] <- "Other"
+
+seurat_obj$Collapsed_Type <- collapsed_types
+
+# 2. Find Markers for Collapsed Groups
+Idents(seurat_obj) <- seurat_obj$Collapsed_Type
+markers_collapsed <- FindAllMarkers(
+  seurat_obj,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = FALSE
+)
+
+# 3. Plot for Progenitor and Enterocyte
+target_groups <- c("Progenitor", "Enterocyte")
+
+for (group in target_groups) {
+  if (group %in% unique(seurat_obj$Collapsed_Type)) {
+    # Get top 5 markers for this BROAD group
+    top_genes <- markers_collapsed %>% 
+      filter(cluster == group) %>% 
+      top_n(5, wt = avg_log2FC) %>% 
+      pull(gene)
+    
+    if (length(top_genes) > 0) {
+      p <- plot_trajectory_trend(seurat_obj, group, top_genes)
+      print(p)
+      ggsave(paste0("../figures/gut3_trajectory_COLLAPSED_", group, ".png"), plot = p, width = 8, height = 5)
+    }
+  }
+}
+```
+
+
+# 3.2. Functional Trajectories (Signaling, Identity, Metabolism)
+We plot trajectories for genes associated with specific biological functions.
+
+```{r functional_trajectories, fig.width=10, fig.height=6}
+# Helper: Fetch genes from GO Term
+get_genes_from_go <- function(go_id, org_db = org.Dm.eg.db) {
+  tryCatch({
+    genes <- AnnotationDbi::select(org_db, keys = go_id, columns = "SYMBOL", keytype = "GOALL")
+    return(unique(genes$SYMBOL))
+  }, error = function(e) {
+    message(paste("Error fetching GO:", go_id, "-", e$message))
+    return(NULL)
+  })
+}
+
+# Define Categories & GO Terms
+functional_categories <- list(
+  # Signaling
+  "Notch_Signaling" = "GO:0007219",
+  "Wnt_Signaling"   = "GO:0016055",
+  "EGFR_Signaling"  = "GO:0007173",
+  "JAK_STAT"        = "GO:0007259",
+  
+  # Identity
+  "Transcription_Factors" = "GO:0003700", # DNA-binding transcription factor activity
+  
+  # Defense
+  "Antimicrobial_Peptides" = "GO:0042742", # Defense response to bacterium
+  
+  # Metabolism
+  "Lipid_Metabolism" = "GO:0006629",
+  "Proteases"        = "GO:0004252"  # Serine-type endopeptidase activity
+)
+
+# Plotting Loop
+for (cat_name in names(functional_categories)) {
+  go_term <- functional_categories[[cat_name]]
+  
+  # 1. Get Genes
+  go_genes <- get_genes_from_go(go_term)
+  
+  # 2. Filter: Must be in Seurat Object AND Variable/Expressed
+  # Strategy: Intersect with Variable Features OR Top Markers to avoid noise
+  valid_genes <- intersect(go_genes, rownames(seurat_obj))
+  
+  # Further filter: Keep only those with meaningful expression
+  # Calculate average expression per gene across all cells
+  # This is computationally expensive, so let's stick to VariableFeatures relative to dataset
+  # OR: Use the markers_sig list we already generated!
+  
+  # Let's prioritize genes that are MARKERS for at least one cell type
+  # This ensures they have spatial patterns
+  relevant_genes <- intersect(valid_genes, unique(markers_sig$gene))
+  
+  # If too few, look at highly expressed ones
+  if (length(relevant_genes) < 3) {
+      # Fallback 1: Top variable features present in GO list
+      top_var <- VariableFeatures(seurat_obj)[1:2000]
+      relevant_genes <- intersect(valid_genes, top_var)
+  }
+  
+  # Fallback 2: If still too few, just take highest expressed valid genes
+  if (length(relevant_genes) < 3) {
+      if(length(valid_genes) > 0) {
+        relevant_genes <- valid_genes
+        message("    Using all detected genes (not just variable ones) for this category.")
+      }
+  }
+  
+  # Pick Top 5-8 by total variance/expression to keep plot readable
+  if (length(relevant_genes) > 0) {
+    # Sort by total expression to pick "major" players
+    counts_mat <- GetAssayData(seurat_obj, layer = "counts")
+    # Backup to data layer if counts is missing (e.g. if only data slot populated after SCT/integration)
+    if (is.null(counts_mat)) {
+        counts_mat <- GetAssayData(seurat_obj, layer = "data")
+    }
+    
+    total_expr <- rowSums(counts_mat[relevant_genes, , drop=FALSE])
+    top_selection <- names(sort(total_expr, decreasing = TRUE))[1:min(8, length(relevant_genes))]
+    
+    message(paste("Plotting", cat_name, ":", paste(top_selection, collapse=", ")))
+    
+    # Plot Global Trend across all cells
+    # We must set a temporary global identity so the subset function works
+    obj_global <- seurat_obj
+    obj_global$Global_ID <- "All Cells"
+    Idents(obj_global) <- "Global_ID"
+    
+    p <- plot_trajectory_trend(obj_global, "All Cells", top_selection) 
+      
+    if (!is.null(p)) {
+       p <- p + ggtitle(paste("Functional Trajectory:", cat_name, "(Global)"))
+       print(p)
+       ggsave(paste0("../figures/gut3_func_traj_", cat_name, ".png"), plot = p, width = 9, height = 6)
+    }
+  } else {
+    message(paste("No relevant variable genes found for", cat_name))
+  }
+}
+```
+
+# 4. Binned Gene Ontology Analysis
+We bin cells by gut length (size=2), find markers for each bin, and analyze GO enrichment.
+
+## 4.1. Helper Functions
+```{r binning_setup}
+# 1. Create Bins
+bin_size <- 2
+seurat_obj$Bin_ID <- floor(seurat_obj$Spatial_Pseudotime / bin_size) * bin_size
+seurat_obj$Bin_Label <- paste0("Pos_", sprintf("%03d", seurat_obj$Bin_ID))
+
+# Ensure bins are ordered factors
+bins <- sort(unique(seurat_obj$Bin_ID))
+labels <- paste0("Pos_", sprintf("%03d", bins))
+seurat_obj$Bin_Label <- factor(seurat_obj$Bin_Label, levels = labels)
+
+message(paste("Created", length(bins), "spatial bins."))
+
+# 2. GO Analysis Function
+run_binned_go <- function(obj, subset_name) {
+  message(paste("Running Binned GO for:", subset_name))
+  
+  # Set Indents to Bins
+  Idents(obj) <- obj$Bin_Label
+  
+  # Find Markers for each BIN
+  # We check "one-vs-rest" to find what is specific to that spatial position
+  bin_markers <- FindAllMarkers(
+    obj,
+    only.pos = TRUE,
+    min.pct = 0.1,      # Lower threshold to catch spatially restricted signals
+    logfc.threshold = 0.25,
+    verbose = FALSE
+  )
+  
+  if (nrow(bin_markers) == 0) {
+    message("No markers found for bins.")
+    return(NULL)
+  }
+  
+  # Run GO Enrichment
+  go_results <- compareCluster(
+    gene ~ cluster, 
+    data = bin_markers, 
+    fun = "enrichGO",
+    OrgDb = org.Dm.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",  # Biological Process
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  # SIMPLIFY: Remove redundant terms to condense the list
+  try({
+      go_results <- clusterProfiler::simplify(go_results, cutoff = 0.7, by = "p.adjust", select_fun = min)
+      message("Simplified GO terms.")
+  }, silent = TRUE)
+  
+  return(go_results)
+}
+```
+
+## 4.2. Run Analysis on Subsets
+```{r run_go_subsets}
+# A. All Cell Types
+go_all <- run_binned_go(seurat_obj, "All Cells")
+
+# B. Progenitors (ISC + EB)
+progenitors <- c("ISC", "EB")
+# Check if present
+valid_prog <- progenitors[progenitors %in% unique(seurat_obj$Predicted_CellType)]
+if(length(valid_prog) > 0) {
+  # Better safe: subset by metadata
+  obj_prog <- subset(seurat_obj, subset = Predicted_CellType %in% valid_prog)
+  go_prog <- run_binned_go(obj_prog, "Progenitors")
+} else {
+  go_prog <- NULL
+}
+
+# C. Enterocytes (All EC types)
+ec_types <- c("aEC", "mEC", "pEC", "dEC", "Enterocyte")
+valid_ec <- ec_types[ec_types %in% unique(seurat_obj$Predicted_CellType)]
+if(length(valid_ec) > 0) {
+  obj_ec <- subset(seurat_obj, subset = Predicted_CellType %in% valid_ec)
+  go_ec <- run_binned_go(obj_ec, "Enterocytes")
+} else {
+  go_ec <- NULL
+}
+```
+
+# 5. GO Term Visualization
+We create two specific plots:
+1. **Specific Terms**: Terms found present specifically in one area.
+2. **Bimodal Terms**: Terms that appear early and late, but not in the middle.
+
+```{r go_visualization, fig.width=12, fig.height=10}
+plot_go_heatmap <- function(go_res, title, filter_type = "specific", max_terms = 50) {
+  if (is.null(go_res)) return(NULL)
+  
+  df <- as.data.frame(go_res)
+  
+  # Matrix: Terms x Bins (p.adjust or count)
+  # We use -log10(p.adjust) for intensity
+  df$intensity <- -log10(df$p.adjust)
+  
+  # Pivot
+  mat_long <- df[, c("Description", "cluster", "intensity")]
+  mat_wide <- tidyr::pivot_wider(mat_long, names_from = cluster, values_from = intensity, values_fill = 0)
+  
+  # Convert to matrix
+  mat <- as.matrix(mat_wide[, -1])
+  rownames(mat) <- mat_wide$Description
+  
+  # --- FILTERING LOGIC ---
+  n_bins <- ncol(mat)
+  
+  # Define indices (approximate thirds)
+  early_idx  <- 1:floor(n_bins/3)
+  mid_idx    <- (floor(n_bins/3)+1):floor(2*n_bins/3)
+  late_idx   <- (floor(2*n_bins/3)+1):n_bins
+  
+  keep_rows <- c()
+  
+  for (i in 1:nrow(mat)) {
+    row_vals <- mat[i, ]
+    vals_early <- mean(row_vals[early_idx] > 1.3)
+    vals_mid   <- mean(row_vals[mid_idx] > 1.3)
+    vals_late  <- mean(row_vals[late_idx] > 1.3)
+    
+    if (filter_type == "specific") {
+      if (max(row_vals) > 0 && (max(row_vals) / sum(row_vals)) > 0.4) {
+        keep_rows <- c(keep_rows, i)
+      }
+    } else if (filter_type == "bimodal") {
+      if (vals_early > 0 && vals_late > 0 && vals_mid == 0) {
+        keep_rows <- c(keep_rows, i)
+      }
+    }
+  }
+  
+  if (length(keep_rows) < 2) {
+    message(paste("Not enough terms found for filter:", filter_type))
+    return(NULL)
+  }
+  
+  mat_filtered <- mat[keep_rows, , drop = FALSE]
+  
+  # --- EVEN SPATIAL DISTRIBUTION: Pick Top N per Region ---
+  # Find peak bin index for each row
+  peak_bin <- apply(mat_filtered, 1, which.max)
+  
+  # Assign region to each row based on peak
+  row_regions <- ifelse(peak_bin %in% early_idx, "Anterior",
+                 ifelse(peak_bin %in% mid_idx,   "Mid", "Posterior"))
+  
+  # Number of terms per region
+  n_per_reg <- ceiling(max_terms / 3)
+  
+  distributed_rows <- c()
+  for (reg in c("Anterior", "Mid", "Posterior")) {
+    reg_rows <- rownames(mat_filtered)[row_regions == reg]
+    if (length(reg_rows) > 0) {
+      # Sort region-specific rows by their max significance
+      reg_mat <- mat_filtered[reg_rows, , drop=FALSE]
+      reg_sig <- apply(reg_mat, 1, max)
+      # Keep top N
+      keep_reg <- names(sort(reg_sig, decreasing = TRUE))[1:min(n_per_reg, length(reg_rows))]
+      distributed_rows <- c(distributed_rows, keep_reg)
+    }
+  }
+  
+  mat_final <- mat_filtered[distributed_rows, , drop=FALSE]
+  # Re-order final matrix by peak position for smooth visual flow
+  peak_final <- apply(mat_final, 1, which.max)
+  mat_final <- mat_final[order(peak_final), , drop=FALSE]
+  
+  # Heatmap
+  pheatmap(
+    mat_final,
+    cluster_cols = FALSE, 
+    cluster_rows = FALSE, 
+    main = paste(title, "-", filter_type, "(Even Dist)"),
+    show_colnames = TRUE,
+    fontsize_row = 8,
+    color = colorRampPalette(c("white", "red"))(50)
+  )
+}
+```
+
+# 5.1 Plot Heatmaps (Even Distribution)
+```{r plot_heatmaps, fig.width=12, fig.height=10}
+# 1. All Cells
+plot_go_heatmap(go_all, "All Cells - Specific", "specific")
+plot_go_heatmap(go_all, "All Cells - Bimodal", "bimodal")
+
+# 2. Progenitors
+if(!is.null(go_prog)) {
+  plot_go_heatmap(go_prog, "Progenitors - Specific", "specific")
+  plot_go_heatmap(go_prog, "Progenitors - Bimodal", "bimodal")
+}
+
+# 3. Enterocytes
+if(!is.null(go_ec)) {
+  plot_go_heatmap(go_ec, "Enterocytes - Specific", "specific")
+  plot_go_heatmap(go_ec, "Enterocytes - Bimodal", "bimodal")
+}
+```
+
+# 5.2 Functional Grouped Heatmap (All Cells)
+Focus on Signaling, Metabolism, Identity, and others.
+
+```{r go_functional_grouped, fig.width=12, fig.height=12}
+plot_functional_grouped_heatmap <- function(go_res, title, max_per_cat = 15) {
+  if (is.null(go_res)) return(NULL)
+  
+  df <- as.data.frame(go_res)
+  df$intensity <- -log10(df$p.adjust)
+  
+  # --- Helper: Categorize Terms ---
+  categorize_term <- function(desc) {
+    desc_lc <- tolower(desc)
+    
+    # signaling pathways (grouped together as requested)
+    signaling_keywords <- c("signal", "notch", "wnt", "egfr", "jak", "stat", "tgf", "hedgehog", "hippo", "pathway", "receptor", "ligand", "transduction")
+    if (any(sapply(signaling_keywords, grepl, x = desc_lc))) return("Signaling")
+    
+    # Identity / Differentiation
+    identity_keywords <- c("differentiation", "fate", "identity", "specification", "development", "transcription factor", "morphogenesis")
+    if (any(sapply(identity_keywords, grepl, x = desc_lc))) return("Identity/Development")
+    
+    # Metabolism
+    metabolism_keywords <- c("metabolic", "metabolism", "biosynthetic", "catabolic", "lipid", "protease", "peptidase", "carbohydrate", "energy")
+    if (any(sapply(metabolism_keywords, grepl, x = desc_lc))) return("Metabolism")
+    
+    # Defense/Stress
+    defense_keywords <- c("defense", "immune", "stress", "stimulus", "bacterium", "antimicrobial", "damage", "wounding")
+    if (any(sapply(defense_keywords, grepl, x = desc_lc))) return("Stress/Defense")
+    
+    return("Other Processes")
+  }
+  
+  df$Category <- sapply(df$Description, categorize_term)
+  
+  # --- EVEN SELECTION per category and region ---
+  # Pivot to matrix first to find peaks
+  mat_long <- df[, c("Description", "cluster", "intensity", "Category")]
+  mat_wide <- tidyr::pivot_wider(mat_long, names_from = cluster, values_from = intensity, values_fill = 0)
+  
+  # Determine peak region for each term
+  bin_names <- colnames(mat_wide)[3:ncol(mat_wide)]
+  n_bins <- length(bin_names)
+  early_idx <- 1:floor(n_bins/3)
+  mid_idx   <- (floor(n_bins/3)+1):floor(2*n_bins/3)
+  late_idx  <- (floor(2*n_bins/3)+1):n_bins
+  
+  # Extract values matrix
+  val_mat <- as.matrix(mat_wide[, bin_names])
+  peak_bin <- apply(val_mat, 1, which.max)
+  mat_wide$Region <- ifelse(peak_bin %in% early_idx, "Anterior",
+                     ifelse(peak_bin %in% mid_idx,   "Mid", "Posterior"))
+  
+  # Add Max Intensity as column to avoid dimension mismatch in grouped top_n
+  mat_wide$MaxIntensity <- apply(val_mat, 1, max)
+  
+  # Select Top N per Category to ensure coverage
+  selected_terms <- mat_wide %>%
+    group_by(Category) %>%
+    # Within each category, we still want a bit of spatial distribution if possible, 
+    # but top significance takes priority for functional groups
+    top_n(max_per_cat, wt = MaxIntensity) %>%
+    ungroup() %>%
+    pull(Description)
+    
+  # Final Matrix
+  final_df <- mat_wide[mat_wide$Description %in% selected_terms, ]
+  mat_final <- as.matrix(final_df[, bin_names])
+  rownames(mat_final) <- final_df$Description
+  
+  # Annotation for rows
+  annotation_row <- data.frame(Category = factor(final_df$Category))
+  rownames(annotation_row) <- final_df$Description
+  
+  # Ordering: Group by Category first, then by Peak Bin
+  df_order <- data.frame(
+    Description = final_df$Description,
+    Category = final_df$Category,
+    Peak = apply(mat_final, 1, which.max)
+  )
+  # Order by category (Grouped) and then by spatial peak
+  df_order <- df_order[order(df_order$Category, df_order$Peak), ]
+  
+  mat_final <- mat_final[df_order$Description, ]
+  annotation_row <- annotation_row[df_order$Description, , drop=FALSE]
+  
+  # Plot
+  pheatmap(
+    mat_final,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    annotation_row = annotation_row,
+    main = paste(title, "- Functional Groups"),
+    show_colnames = TRUE,
+    fontsize_row = 7,
+    color = colorRampPalette(c("white", "blue", "red"))(100)
+  )
+}
+
+# Run for All Cells
+plot_functional_grouped_heatmap(go_all, "All Cells")
+```

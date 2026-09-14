@@ -1,0 +1,1964 @@
+---
+title: "Deepened GO Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Dm.eg.db)
+library(stringr)
+library(reshape2)
+library(rioja)
+library(dendextend)
+library(ggsci)
+
+# ------------------------------------------------------------------------------
+# 1. Load Data
+# ------------------------------------------------------------------------------
+if (exists("merged_guts")) {
+    cat("Using existing 'merged_guts' object from environment.\n")
+    sub_guts <- merged_guts
+} else {
+    path_def <- "../../111125ST_def/Random data/merged_guts.rds"
+    path_norm <- "../Random data/merged_guts.rds"
+    if (file.exists(path_norm)) {
+        cat("Loading merged_guts from", path_norm, "\n")
+        sub_guts <- readRDS(path_norm)
+    } else if (file.exists(path_def)) {
+        cat("Loading merged_guts from", path_def, "\n")
+        sub_guts <- readRDS(path_def)
+    } else {
+        stop("merged_guts not found. Please ensure it is loaded or available in '../Random data/merged_guts.rds'")
+    }
+}
+
+# Ensure figures directory exists
+if (!dir.exists("../figures/3D_glo")) dir.create("../figures/3D_glo", recursive=TRUE, showWarnings=FALSE)
+```
+
+## 1. Differential Gene Ontology Analysis for Specific Cell Types
+
+We analyze target cell types: **aEC, mEC, Copper, LFC, pEC**.
+
+```{r cell_type_go, fig.width=10, fig.height=12}
+# Target cell types
+target_cts <- c("aEC", "A3_aEC", "ItC", "Copper", "LFC", "Iron", "pEC")
+
+# Check metadata column for cell types
+# Based on Trajectory.Rmd, Most_Likely_CellType or Predicted_CellType is used.
+if ("Most_Likely_CellType" %in% colnames(sub_guts@meta.data)) {
+    ct_col <- "Most_Likely_CellType"
+} else if ("Predicted_CellType" %in% colnames(sub_guts@meta.data)) {
+    ct_col <- "Predicted_CellType"
+} else {
+    # Fallback to current Idents
+    ct_col <- "Idents"
+}
+
+cat("Using metadata column:", ct_col, "\n")
+
+# Create a custom detailed cell type column
+sub_guts$Detailed_CellType <- as.character(sub_guts@meta.data[[ct_col]])
+
+# Split mECs based on Zip42C.1 and Zip42C.2 expression
+mEC_idx <- which(sub_guts$Detailed_CellType == "mEC")
+if (length(mEC_idx) > 0) {
+    expr_data <- GetAssayData(sub_guts, layer = "data")
+    zip42_expr <- rep(0, length(mEC_idx))
+    if ("Zip42C.1" %in% rownames(expr_data)) zip42_expr <- zip42_expr + expr_data["Zip42C.1", mEC_idx]
+    if ("Zip42C.2" %in% rownames(expr_data)) zip42_expr <- zip42_expr + expr_data["Zip42C.2", mEC_idx]
+    
+    sub_guts$Detailed_CellType[mEC_idx[zip42_expr > 0]] <- "ItC"
+    sub_guts$Detailed_CellType[mEC_idx[zip42_expr == 0]] <- "A3_aEC"
+}
+
+# Split LFCs based on CG17571 expression
+lfc_idx <- which(sub_guts$Detailed_CellType == "LFC")
+if (length(lfc_idx) > 0) {
+    expr_data <- GetAssayData(sub_guts, layer = "data")
+    cg17571_expr <- rep(0, length(lfc_idx))
+    if ("CG17571" %in% rownames(expr_data)) cg17571_expr <- expr_data["CG17571", lfc_idx]
+    
+    sub_guts$Detailed_CellType[lfc_idx[cg17571_expr > 0]] <- "Iron"
+    sub_guts$Detailed_CellType[lfc_idx[cg17571_expr == 0]] <- "LFC"
+}
+
+# Subset for target cell types
+sub_ct <- subset(sub_guts, cells = Cells(sub_guts)[sub_guts$Detailed_CellType %in% target_cts])
+Idents(sub_ct) <- factor(sub_ct$Detailed_CellType, levels = target_cts)
+
+cat("\n============================================\n")
+cat("CELL COUNTS FOR SPATIAL GO ANALYSIS:\n")
+print(table(Idents(sub_ct)))
+cat("============================================\n\n")
+
+# 1.1 Find Markers
+cat("Finding markers for target cell types...\n")
+ct_markers <- FindAllMarkers(sub_ct, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Special handling for aEC vs pEC to find distinguishing terms
+# We run FindMarkers directly between them and add these to the pool
+cat("Finding differential markers between aEC and pEC...\n")
+a_vs_p <- FindMarkers(sub_ct, ident.1 = "aEC", ident.2 = "pEC", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+p_vs_a <- FindMarkers(sub_ct, ident.1 = "pEC", ident.2 = "aEC", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+a_vs_p$gene <- rownames(a_vs_p)
+a_vs_p$cluster <- "aEC"
+p_vs_a$gene <- rownames(p_vs_a)
+p_vs_a$cluster <- "pEC"
+
+# Combine with main markers
+ct_markers_combined <- rbind(ct_markers, a_vs_p, p_vs_a)
+
+# 1.2 Run GO Enrichment
+cat("Running compareCluster for Cell Type GO enrichment...\n")
+# Increase to top 300 genes to ensure enough results for aEC/pEC
+top_ct_genes <- ct_markers_combined %>% group_by(cluster) %>% top_n(n = 300, wt = avg_log2FC)
+ct_gene_list <- split(top_ct_genes$gene, top_ct_genes$cluster)
+
+ct_go_res <- compareCluster(geneCluster = ct_gene_list, fun = "enrichGO", 
+                            OrgDb = org.Dm.eg.db, keyType = "SYMBOL", 
+                            ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.2) # Loosen cutoff for selection
+
+# 1.3 Process and Plot
+    # We avoid simplify() if it merges terms across aEC and pEC too aggressively, 
+    # instead we select top 7 per cluster from the raw results.
+    ct_go_all <- ct_go_res@compareClusterResult
+    
+    # Identify top 7 terms per cell type based on p.adjust
+    top_terms_by_cluster <- ct_go_all %>%
+        filter(p.adjust < 0.1) %>% # Set a reasonable significance threshold
+        group_by(Cluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 7) %>%
+        mutate(Rank = row_number()) %>%
+        ungroup()
+    
+    # Ensure aEC and pEC have 7 terms by picking from higher p-values if needed
+    if (nrow(top_terms_by_cluster %>% filter(Cluster == "aEC")) < 7 || 
+        nrow(top_terms_by_cluster %>% filter(Cluster == "pEC")) < 7) {
+        cat("Note: Loosening p-value filter to ensure 7 terms for aEC/pEC.\n")
+        top_terms_by_cluster <- ct_go_all %>%
+            group_by(Cluster) %>%
+            arrange(p.adjust) %>%
+            slice_head(n = 7) %>%
+            mutate(Rank = row_number()) %>%
+            ungroup()
+    }
+    
+    # SPECIFIC FILTERING
+    ct_plot_data_specific <- ct_go_all %>% 
+        inner_join(top_terms_by_cluster %>% dplyr::select(Cluster, Description, Rank), 
+                   by = c("Cluster", "Description"))
+    
+    ct_plot_data_specific$GeneRatio_num <- sapply(ct_plot_data_specific$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    ct_plot_data_specific$Description <- str_wrap(ct_plot_data_specific$Description, width = 45)
+    ct_plot_data_specific$Cluster <- factor(ct_plot_data_specific$Cluster, levels = target_cts)
+    
+    term_order_ct_specific <- top_terms_by_cluster %>% 
+        arrange(factor(Cluster, levels=target_cts), Rank) %>%
+        pull(Description) %>%
+        unique() %>%
+        str_wrap(width = 45)
+    
+    ct_plot_data_specific$Description <- factor(ct_plot_data_specific$Description, levels = rev(term_order_ct_specific))
+    
+    p_ct_go_specific <- ggplot(ct_plot_data_specific, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(size = "Gene ratio", title = "Cell Type Specific GO Enrichment (Specific)", y = "", x = "") +
+        theme(axis.text.x = element_text(size=12, face="bold", angle = 90, vjust = 0.5, hjust=1),
+              axis.text.y = element_text(size=10),
+              panel.grid.major.x = element_line(linetype="dotted", color="grey80"),
+              panel.border = element_rect(color="black", fill=NA))
+              
+    ggsave("../figures/3D_glo/CellType_GO_Dotplot.png", p_ct_go_specific, width = 10, height = 12)
+    print(p_ct_go_specific)
+    
+    # SHARED FILTERING: Top 5 terms across all
+    top_terms_shared <- ct_go_all %>% group_by(Cluster) %>% arrange(p.adjust) %>% slice_head(n = 5) %>% mutate(Rank = row_number()) %>% ungroup()
+    top_descriptions_shared <- unique(top_terms_shared$Description)
+    ct_plot_data_shared <- ct_go_all %>% filter(Description %in% top_descriptions_shared)
+    
+    ct_plot_data_shared$GeneRatio_num <- sapply(ct_plot_data_shared$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    ct_plot_data_shared$Description <- str_wrap(ct_plot_data_shared$Description, width = 45)
+    ct_plot_data_shared$Cluster <- factor(ct_plot_data_shared$Cluster, levels = target_cts)
+    
+    term_ordering_shared <- top_terms_shared %>% group_by(Description) %>% slice_min(Rank, n=1, with_ties=FALSE) %>% ungroup() %>% arrange(factor(Cluster, levels=target_cts), Rank)
+    term_order_shared <- str_wrap(term_ordering_shared$Description, width = 45)
+    ct_plot_data_shared$Description <- factor(ct_plot_data_shared$Description, levels = rev(term_order_shared))
+    
+    p_ct_go_shared <- ggplot(ct_plot_data_shared, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "mako", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(size = "Gene ratio", title = "Cell Type Shared GO Enrichment (Top 5 Terms)", y = "", x = "") +
+        theme(axis.text.x = element_text(size=12, face="bold", angle = 90, vjust = 0.5, hjust=1),
+              axis.text.y = element_text(size=10),
+              panel.grid.major.x = element_line(linetype="dotted", color="grey80"),
+              panel.border = element_rect(color="black", fill=NA))
+              
+    ggsave("../figures/3D_glo/CellType_GO_Shared_Dotplot.png", p_ct_go_shared, width = 10, height = 12)
+    print(p_ct_go_shared)
+```
+
+## 2. Constrained Hierarchical Clustering of Bins by GO Terms (2.5% Resolution)
+
+We apply 40 bins (2.5% resolution) and run GO on all expressed genes per bin.
+
+```{r bin_go_clustering, fig.width=12, fig.height=15}
+# 2.1 Binning (40 bins = 2.5% resolution)
+n_bins <- 40
+sub_guts$Bin <- factor(cut(sub_guts$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+
+# 2.2 Collect genes per bin
+# "Run GO on all genes for each bin" -> We take genes with positive mean expression in the bin
+# To keep it robust, we take the top N expressed genes in each bin as the 'active' set.
+cat("Extracting active gene sets per bin (top 200 genes by mean expression)...\n")
+exp_mat <- GetAssayData(sub_guts, layer = "data")
+bin_gene_lists <- list()
+
+for (i in 1:n_bins) {
+    cells_in_bin <- Cells(sub_guts)[sub_guts$Bin == i]
+    if (length(cells_in_bin) > 5) { # Minimum cells required
+        bin_means <- rowMeans(exp_mat[, cells_in_bin])
+        # Take top 200 genes for enrichment test
+        active_genes <- names(sort(bin_means, decreasing = TRUE))[1:200]
+        bin_gene_lists[[paste0("B", i)]] <- active_genes
+    }
+}
+
+# 2.3 Run Bin GO Enrichment
+cat("Running compareCluster for Bins (this may take a few minutes)...\n")
+bin_go_res <- compareCluster(geneCluster = bin_gene_lists, fun = "enrichGO", 
+                             OrgDb = org.Dm.eg.db, keyType = "SYMBOL", 
+                             ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.5)
+
+# 2.4 Profile Matrix and Clustering
+if (!is.null(bin_go_res) && nrow(bin_go_res@compareClusterResult) > 0) {
+    
+    # Create profile matrix: Bins (cols) x GO Terms (rows)
+    # Value: -log10(p.adjust)
+    res_df <- bin_go_res@compareClusterResult
+    res_df$negLogP <- -log10(res_df$p.adjust)
+    
+    # Pivot to wide format for clustering
+    profile_mat <- acast(res_df, Description ~ Cluster, value.var = "negLogP", fill = 0)
+    
+    # Handle bin ordering (B1, B2, ..., B40)
+    bin_order <- paste0("B", 1:n_bins)
+    available_bins <- intersect(bin_order, colnames(profile_mat))
+    profile_mat <- profile_mat[, available_bins]
+    
+    # 2.5 Constrained Hierarchical Clustering (CONISS) on GO profiles
+    cat("Performing CONISS on GO profiles...\n")
+    dist_mat <- dist(t(profile_mat), method = "euclidean")
+    go_hc <- chclust(dist_mat, method = "coniss")
+    
+    # 2.6 Constrained Dendrogram Visualization (Similar to reference)
+    k_to_use <- 5 # Matching user image
+    dend <- as.dendrogram(go_hc)
+    dend <- color_branches(dend, k = k_to_use)
+    cluster_labels <- cutree(go_hc, k = k_to_use)
+    
+    # Dutta Regions Math for Annotation
+    dutta_breaks <- c(0, 15, 39, 53, 85, 100) * (n_bins / 100)
+    display_breaks <- dutta_breaks + 0.5
+    display_mids <- (display_breaks[-1] + display_breaks[-length(display_breaks)]) / 2
+    region_labs <- c("R1", "R2", "R3", "R4", "R5")
+    
+    bg_colors <- scales::hue_pal()(k_to_use)
+    cluster_rle <- rle(cluster_labels)
+    ends <- cumsum(cluster_rle$lengths)
+    starts <- c(1, ends[-length(ends)] + 1)
+    
+    rects_df <- data.frame(
+        xmin = starts - 0.5,
+        xmax = ends + 0.5,
+        ymin = -Inf,
+        ymax = max(go_hc$height) * 1.1,
+        fill = factor(cluster_rle$values)
+    )
+    
+    p_dend <- ggplot(as.ggdend(dend)) +
+        geom_rect(data = rects_df, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, fill=fill), alpha = 0.2, inherit.aes = FALSE) +
+        scale_fill_manual(values = bg_colors, guide = "none") +
+        geom_vline(xintercept = display_breaks, color = "black", linetype = "dotted", size = 0.8) +
+        annotate("text", x = display_mids, y = max(go_hc$height) * 1.05, 
+                 label = region_labs, fontface = "bold", size = 5) +
+        theme_minimal() +
+        labs(title = "Constrained Hierarchical Clustering of Bins (GO Profile Basis)",
+             subtitle = paste("CONISS Clustering | 40 Bins (2.5%) | K =", k_to_use),
+             y = "Height (Dissimilarity)", x = "Anatomical Bin Position (Anterior -> Posterior)") +
+        theme(axis.text.x = element_blank(), panel.grid = element_blank())
+
+    ggsave("../figures/3D_glo/Bin_GO_Dendrogram.png", p_dend, width = 10, height = 6)
+    print(p_dend)
+    
+    # 2.7 High-Res Comparative GO Map (Dotplot)
+    # Pick top 2-3 terms per domain (R1-R5) or just interesting terms
+    # We'll pick top 5 terms per cluster (k_to_use)
+    res_df$Domain <- paste0("Domain_", cluster_labels[match(res_df$Cluster, available_bins)])
+    
+    top_bin_terms <- res_df %>%
+        group_by(Domain) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 5) %>%
+        pull(Description) %>%
+        unique()
+    
+    bin_plot_data <- res_df[res_df$Description %in% top_bin_terms, ]
+    bin_plot_data$Cluster <- factor(bin_plot_data$Cluster, levels = available_bins)
+    
+    # Numeric GeneRatio
+    bin_plot_data$GeneRatio_num <- sapply(bin_plot_data$GeneRatio, function(x) {
+        p <- as.numeric(strsplit(x, "/")[[1]])
+        p[1] / p[2]
+    })
+    
+    bin_plot_data$Description <- str_wrap(bin_plot_data$Description, width = 50)
+    
+    # Order Y-axis by spatial appearance
+    term_order_bin <- bin_plot_data %>% 
+        group_by(Description) %>% 
+        summarize(min_bin = min(as.numeric(Cluster))) %>%
+        arrange(min_bin) %>%
+        pull(Description)
+    bin_plot_data$Description <- factor(bin_plot_data$Description, levels = rev(term_order_bin))
+
+    p_bin_dot <- ggplot(bin_plot_data, aes(x = Cluster, y = Description, size = GeneRatio_num, color = negLogP)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", name = "-log10(P_adj)") +
+        theme_minimal() +
+        labs(size = "Gene ratio", title = "GO Profiles Along Trajectory (40 Bins)", y = "", x = "Spatial Bin") +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+              axis.text.y = element_text(size = 9),
+              panel.border = element_rect(color = "black", fill = NA))
+    
+    ggsave("../figures/3D_glo/HighRes_Bin_GO_Map.png", p_bin_dot, width = 12, height = 10)
+    print(p_bin_dot)
+    
+} else {
+    cat("Warning: No significant Bin GO enrichment found.\n")
+}
+```
+
+## 3. Differential Gene Ontology Analysis for Single Cell Object
+
+We load the single cell object downstream to obtain the GO enrichment for cell types that might be dropped out in the spatial data (like ZIP42C for mEC).
+
+```{r sc_cell_type_go, fig.width=10, fig.height=12}
+# 1. Ensure required packages for DGE and GO analysis are loaded
+library(clusterProfiler)
+library(enrichplot)
+library(org.Dm.eg.db)
+library(Seurat)
+
+# --- Load Single Cell Data ---
+sc_obj_sec3 <- readRDS("../Random data/sc_lineage_labeled.rds")
+
+# Map clusters to expected names
+sc_obj_sec3$Detailed_CellType <- as.character(sc_obj_sec3$Combined_Cluster)
+sc_obj_sec3$Detailed_CellType[sc_obj_sec3$Detailed_CellType == "mEC_Zip_pos"] <- "ItC"
+sc_obj_sec3$Detailed_CellType[sc_obj_sec3$Detailed_CellType == "mEC_Zip_neg"] <- "A3_aEC"
+
+# Set the active identity
+Idents(sc_obj_sec3) <- "Detailed_CellType"
+
+# --- A. Differential Gene Expression (DGE) ---
+# Find markers comparing Copper cells to ItC on single cell data
+dge_results <- FindMarkers(sc_obj_sec3, 
+                           ident.1 = "Copper", 
+                           ident.2 = "ItC", 
+                           test.use = "wilcox", 
+                           min.pct = 0.25, 
+                           logfc.threshold = 0.25)
+
+# Filter for statistically significant markers (relax to p_val < 0.05 to capture more ItC genes)
+sig_markers <- dge_results[dge_results$p_val < 0.05, ]
+
+# Separate genes upregulated in Copper cells vs those upregulated in ItC
+genes_up_copper <- rownames(sig_markers[sig_markers$avg_log2FC > 0, ])
+genes_up_itc <- rownames(sig_markers[sig_markers$avg_log2FC < 0, ])
+
+# --- B. Gene Identifier Conversion ---
+entrez_up_copper <- mapIds(org.Dm.eg.db, 
+                           keys = genes_up_copper, 
+                           column = "ENTREZID", 
+                           keytype = "SYMBOL", 
+                           multiVals = "first")
+
+entrez_up_itc <- mapIds(org.Dm.eg.db, 
+                        keys = genes_up_itc, 
+                        column = "ENTREZID", 
+                        keytype = "SYMBOL", 
+                        multiVals = "first")
+
+# Clean up any NAs that failed to map
+entrez_up_copper <- na.omit(entrez_up_copper)
+entrez_up_itc <- na.omit(entrez_up_itc)
+
+# --- C. Differential GO Enrichment Analysis ---
+gene_clusters <- list(
+  "Copper Cells" = entrez_up_copper, 
+  "Interstitial Cells (ItC)" = entrez_up_itc
+)
+
+# Define the background universe (all expressed genes in the single cell object)
+# This drastically increases statistical power by removing unexpressed genes from the multiple-testing penalty
+expressed_genes <- rownames(GetAssayData(sc_obj_sec3, layer = "data"))
+universe_entrez <- na.omit(mapIds(org.Dm.eg.db, 
+                                  keys = expressed_genes, 
+                                  column = "ENTREZID", 
+                                  keytype = "SYMBOL", 
+                                  multiVals = "first"))
+
+# We set pvalueCutoff to 1.0 to guarantee we can retrieve the top 15 terms even if they have lower significance
+comp_go <- compareCluster(geneCluster = gene_clusters, 
+                          fun = "enrichGO", 
+                          universe = universe_entrez,
+                          OrgDb = org.Dm.eg.db, 
+                          ont = "BP", 
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 1.0, 
+                          qvalueCutoff = 1.0, 
+                          readable = TRUE)
+
+# Simplify to remove redundant terms and prevent one cluster from overwhelming the plot
+comp_go <- simplify(comp_go, cutoff = 0.7, by = "pvalue", select_fun = min)
+
+# Force extract top 15 terms per cluster by pvalue
+library(dplyr)
+top15_terms <- comp_go@compareClusterResult %>%
+    group_by(Cluster) %>%
+    arrange(pvalue) %>%
+    slice_head(n = 15) %>%
+    pull(Description) %>%
+    unique()
+
+# --- D. Visualization ---
+p_sec3 <- dotplot(comp_go, showCategory = top15_terms, title = "Differential GO: Copper Cells vs ItC (Single Cell Data)")
+
+# Ensure the output directory exists
+dir.create("../figures/3D_glo", recursive = TRUE, showWarnings = FALSE)
+
+# Save the plot
+ggsave("../figures/3D_glo/Sec3_Copper_vs_ItC_GO.png", p_sec3, width = 10, height = 12)
+print(p_sec3)
+
+# --- E. mEC vs Copper Cells (Ion, Transport, Assembly) ---
+cat("\nComparing mEC vs Copper cells...\n")
+dge_mec_cu <- tryCatch(FindMarkers(sc_obj_sec3, ident.1 = "A3_aEC", ident.2 = "Copper", test.use = "wilcox", min.pct = 0.1, logfc.threshold = 0.1), error = function(e) NULL)
+
+if(!is.null(dge_mec_cu)) {
+    sig_mec_cu <- dge_mec_cu[dge_mec_cu$p_val < 0.05, ]
+    genes_up_mec <- rownames(sig_mec_cu[sig_mec_cu$avg_log2FC > 0, ])
+    genes_up_cu2 <- rownames(sig_mec_cu[sig_mec_cu$avg_log2FC < 0, ])
+
+    entrez_up_mec <- na.omit(mapIds(org.Dm.eg.db, keys = genes_up_mec, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+    entrez_up_cu2 <- na.omit(mapIds(org.Dm.eg.db, keys = genes_up_cu2, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+
+    gene_clusters_mec_cu <- list("mEC" = entrez_up_mec, "Copper Cells" = entrez_up_cu2)
+
+    comp_mec_cu <- compareCluster(geneCluster = gene_clusters_mec_cu, fun = "enrichGO", OrgDb = org.Dm.eg.db, ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 1.0, qvalueCutoff = 1.0, readable = TRUE)
+    comp_mec_cu <- simplify(comp_mec_cu, cutoff = 0.7, by = "pvalue", select_fun = min)
+
+    library(stringr)
+    filtered_terms_mec <- comp_mec_cu@compareClusterResult %>%
+        filter(str_detect(tolower(Description), "ion|transport|assembly")) %>%
+        group_by(Cluster) %>%
+        arrange(pvalue) %>%
+        slice_head(n = 5) %>%
+        pull(Description) %>%
+        unique()
+
+    if(length(filtered_terms_mec) > 0) {
+        p_mec_cu <- dotplot(comp_mec_cu, showCategory = filtered_terms_mec, title = "mEC vs Copper: Ion, Transport, Assembly")
+        ggsave("../figures/3D_glo/Sec3_mEC_vs_Copper_Transport_GO.png", p_mec_cu, width = 10, height = 12)
+        print(p_mec_cu)
+    } else {
+        cat("\nNo ion/transport/assembly terms found for mEC vs Copper\n")
+    }
+}
+
+# --- F. LFC vs Iron Cells ---
+cat("\nComparing LFC vs Iron cells...\n")
+# Ensure LFC cells are split by CG17571 to define Iron cells
+lfc_idx_sc3 <- which(sc_obj_sec3$Detailed_CellType == "LFC")
+if (length(lfc_idx_sc3) > 0) {
+    expr_data_sc3 <- GetAssayData(sc_obj_sec3, layer = "data")
+    cg17571_expr_sc3 <- rep(0, length(lfc_idx_sc3))
+    if ("CG17571" %in% rownames(expr_data_sc3)) {
+        cg17571_expr_sc3 <- expr_data_sc3["CG17571", lfc_idx_sc3]
+    }
+    sc_obj_sec3$Detailed_CellType[lfc_idx_sc3[cg17571_expr_sc3 > 0]] <- "Iron"
+    sc_obj_sec3$Detailed_CellType[lfc_idx_sc3[cg17571_expr_sc3 == 0]] <- "LFC"
+}
+Idents(sc_obj_sec3) <- "Detailed_CellType"
+
+dge_lfc_fe <- tryCatch(FindMarkers(sc_obj_sec3, ident.1 = "LFC", ident.2 = "Iron", test.use = "wilcox", min.pct = 0.1, logfc.threshold = 0.1), error = function(e) NULL)
+
+if(!is.null(dge_lfc_fe)) {
+    sig_lfc_fe <- dge_lfc_fe[dge_lfc_fe$p_val < 0.05, ]
+    genes_up_lfc <- rownames(sig_lfc_fe[sig_lfc_fe$avg_log2FC > 0, ])
+    genes_up_fe <- rownames(sig_lfc_fe[sig_lfc_fe$avg_log2FC < 0, ])
+    
+    entrez_up_lfc <- na.omit(mapIds(org.Dm.eg.db, keys = genes_up_lfc, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+    entrez_up_fe <- na.omit(mapIds(org.Dm.eg.db, keys = genes_up_fe, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+    
+    gene_clusters_lfc_fe <- list("LFC" = entrez_up_lfc, "Iron Cells" = entrez_up_fe)
+    
+    comp_lfc_fe <- compareCluster(geneCluster = gene_clusters_lfc_fe, fun = "enrichGO", OrgDb = org.Dm.eg.db, ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 1.0, qvalueCutoff = 1.0, readable = TRUE)
+    comp_lfc_fe <- simplify(comp_lfc_fe, cutoff = 0.7, by = "pvalue", select_fun = min)
+    
+    top15_lfc_fe <- comp_lfc_fe@compareClusterResult %>%
+        group_by(Cluster) %>%
+        arrange(pvalue) %>%
+        slice_head(n = 15) %>%
+        pull(Description) %>%
+        unique()
+    
+    if(length(top15_lfc_fe) > 0) {
+        p_lfc_fe <- dotplot(comp_lfc_fe, showCategory = top15_lfc_fe, title = "Differential GO: LFC vs Iron Cells")
+        ggsave("../figures/3D_glo/Sec3_LFC_vs_Iron_GO.png", p_lfc_fe, width = 10, height = 12)
+        print(p_lfc_fe)
+    }
+}
+
+```
+
+```{r sc_html_plot, fig.width=12, fig.height=20}
+# --- G. Interactive HTML Plot for all ItC and Copper GO terms ---
+cat("\nGenerating Interactive HTML Plot for top 50 Copper vs ItC GO terms...\n")
+library(plotly)
+library(htmlwidgets)
+library(dplyr)
+library(stringr)
+
+# Filter for significance, then extract top 50 terms per cluster
+significant_terms <- comp_go@compareClusterResult %>% filter(p.adjust < 0.05)
+
+if(nrow(significant_terms) > 0) {
+    top50_html_terms <- significant_terms %>%
+        group_by(Cluster) %>%
+        arrange(pvalue) %>%
+        slice_head(n = 50) %>%
+        pull(Description) %>%
+        unique()
+    
+    # Wrap text to prevent horizontal overlap, and subset comp_go
+    comp_go_sig <- comp_go
+    comp_go_sig@compareClusterResult <- significant_terms
+    comp_go_sig@compareClusterResult$Description <- str_wrap(comp_go_sig@compareClusterResult$Description, width = 50)
+    top50_html_terms_wrapped <- str_wrap(top50_html_terms, width = 50)
+
+    p_all <- dotplot(comp_go_sig, showCategory = top50_html_terms_wrapped, title = "Top 50 Significant GO Terms: Copper vs ItC") +
+        theme(axis.text.y = element_text(size = 10))
+    
+    # Increase height based on number of terms (approx 35px per term to completely prevent vertical overlap)
+    n_terms <- length(top50_html_terms_wrapped)
+    p_all_html <- ggplotly(p_all, height = max(800, n_terms * 35))
+    
+    saveWidget(p_all_html, file = "../figures/3D_glo/Sec3_Copper_vs_ItC_Top50_GO.html", selfcontained = TRUE)
+    cat("Interactive HTML plot saved to ../figures/3D_glo/Sec3_Copper_vs_ItC_Top50_GO.html\n")
+} else {
+    cat("No significant GO terms remaining for HTML plot.\n")
+}
+```
+
+```{r}
+# --- H. Venn Diagram of Copper vs ItC Shared and Unique Genes ---
+cat("\nGenerating Venn Diagram for Copper vs ItC genes...\n")
+```
+
+```{r sc_venn_diagram, fig.width=6.5, fig.height=4}
+library(ggVennDiagram)
+
+expr_copper <- GetAssayData(sc_obj_sec3, layer = "data")[, sc_obj_sec3$Detailed_CellType == "Copper", drop = FALSE]
+expr_itc <- GetAssayData(sc_obj_sec3, layer = "data")[, sc_obj_sec3$Detailed_CellType == "ItC", drop = FALSE]
+
+pct_copper <- rowSums(expr_copper > 0) / ncol(expr_copper)
+pct_itc <- rowSums(expr_itc > 0) / ncol(expr_itc)
+
+shared_genes <- rownames(expr_copper)[pct_copper > 0.25 & pct_itc > 0.25]
+shared_genes <- setdiff(shared_genes, c(genes_up_copper, genes_up_itc))
+
+venn_list <- list(
+    "ItC" = c(genes_up_itc, shared_genes),
+    "Copper Cells" = c(genes_up_copper, shared_genes)
+)
+
+p_venn <- ggVennDiagram(venn_list, label_alpha = 0) + 
+    scale_fill_gradient(low = "white", high = "red") + 
+    labs(title = "Gene Expression Overlap: ItC vs Copper Cells",
+         subtitle = "Intersection = Shared highly expressed genes\nSides = Significantly upregulated markers") +
+    coord_flip() + 
+    scale_x_continuous(expand = expansion(mult = 0.3)) + 
+    scale_y_continuous(expand = expansion(mult = 0.3)) +
+    theme(legend.position = "bottom", aspect.ratio = 0.6) 
+
+ggsave("../figures/3D_glo/Sec3_Copper_vs_ItC_Venn.png", p_venn, width = 8, height = 5.5)
+print(p_venn)
+```
+
+```{r sc_venn_diagram_strict, fig.width=6.5, fig.height=4}
+# --- I. Strict Venn Diagram based strongly on Log2 Fold Change (Bimod Test) ---
+cat("\nGenerating Strict Venn Diagram for Copper vs ItC genes (bimod test, log2FC > 1.0, 2-fold)...\n")
+
+# We use the 'bimod' Likelihood-ratio test (a classic scRNA-seq method) and a strict 2-fold change cutoff (logfc.threshold = 1.0)
+# We also enforce adjusted p-value < 0.05 for ultimate stringency.
+dge_strict <- FindMarkers(sc_obj_sec3, ident.1 = "Copper", ident.2 = "ItC", test.use = "bimod", min.pct = 0.25, logfc.threshold = 2.0)
+sig_strict <- dge_strict[dge_strict$p_val_adj < 0.05, ]
+
+genes_up_copper_strict <- rownames(sig_strict[sig_strict$avg_log2FC > 0, ])
+genes_up_itc_strict <- rownames(sig_strict[sig_strict$avg_log2FC < 0, ])
+
+# Shared genes logically include anything expressed broadly that didn't make the strict marker cutoff
+shared_genes_strict <- rownames(expr_copper)[pct_copper > 0.25 & pct_itc > 0.25]
+shared_genes_strict <- setdiff(shared_genes_strict, c(genes_up_copper_strict, genes_up_itc_strict))
+
+venn_list_strict <- list(
+    "ItC" = c(genes_up_itc_strict, shared_genes_strict),
+    "Copper Cells" = c(genes_up_copper_strict, shared_genes_strict)
+)
+
+p_venn_strict <- ggVennDiagram(venn_list_strict, label_alpha = 0) + 
+    scale_fill_gradient(low = "white", high = "red") + 
+    labs(title = "Strict Expression Overlap: ItC vs Copper Cells",
+         subtitle = "Intersection = Shared highly expressed genes\nSides = Strict Upregulated Markers (Bimod test, log2FC > 1, 2-fold)") +
+    coord_flip() + 
+    scale_x_continuous(expand = expansion(mult = 0.3)) + 
+    scale_y_continuous(expand = expansion(mult = 0.3)) +
+    theme(legend.position = "bottom", aspect.ratio = 0.6) 
+
+ggsave("../figures/3D_glo/Sec3_Copper_vs_ItC_Venn_Strict.png", p_venn_strict, width = 8, height = 5.5)
+print(p_venn_strict)
+```
+
+```{r sc_strict_marker_dotplot, fig.width=12, fig.height=4}
+# --- J. Interactive HTML DotPlot of ALL Extreme Marker Genes ---
+cat("\nGenerating Interactive HTML DotPlot for ALL extreme markers of Copper and ItC cells...\n")
+library(plotly)
+library(htmlwidgets)
+
+# Order ALL strict markers by absolute log2FC
+top_copper <- rownames(sig_strict[sig_strict$avg_log2FC > 0, ])
+top_copper <- top_copper[order(sig_strict[top_copper, "avg_log2FC"], decreasing = TRUE)]
+
+top_itc <- rownames(sig_strict[sig_strict$avg_log2FC < 0, ])
+top_itc <- top_itc[order(sig_strict[top_itc, "avg_log2FC"], decreasing = FALSE)]
+
+all_markers <- c(top_copper, top_itc)
+
+if(length(all_markers) > 0) {
+    # Temporarily set identity to plot just these two cell types clearly
+    Idents(sc_obj_sec3) <- "Detailed_CellType"
+    
+    chunk_size <- 20
+    dotplot_list <- list()
+    
+    for(i in seq(1, length(all_markers), by = chunk_size)) {
+        end_idx <- min(i + chunk_size - 1, length(all_markers))
+        genes_chunk <- all_markers[i:end_idx]
+        part_num <- ceiling(i / chunk_size)
+        
+        p_dot <- DotPlot(sc_obj_sec3, features = genes_chunk, idents = c("Copper", "ItC")) + 
+            theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+                  axis.text.y = element_text(size = 9)) +
+            labs(title = paste0("All Strict Markers: Copper vs ItC (2-fold change) (Part ", part_num, ")"))
+        
+        # Save to list and print to the R environment
+        dotplot_list[[part_num]] <- p_dot
+        print(p_dot)
+        
+        # Convert to plotly and save as a separate, uncrowded HTML file
+        p_dot_html <- ggplotly(p_dot, height = 300)
+        html_file <- paste0("../figures/3D_glo/Sec3_Copper_vs_ItC_Strict_DotPlot_Part_", part_num, ".html")
+        saveWidget(p_dot_html, file = html_file, selfcontained = TRUE)
+        cat(sprintf("Saved HTML Part %d to %s\n", part_num, html_file))
+    }
+} else {
+    cat("No markers survived the strict 4-fold cutoff to plot.\n")
+}
+```
+
+```{r sc_custom_marker_dotplot, fig.width=5, fig.height=10}
+# --- J2. Custom 20-Gene DotPlot (Copper vs ItC) ---
+cat("\nGenerating Custom Top 20 Marker DotPlot for Copper and ItC...\n")
+
+# Top 10 ItC markers
+top_itc_10 <- head(genes_up_itc_strict[order(sig_strict[genes_up_itc_strict, "avg_log2FC"], decreasing = FALSE)], 10)
+
+# Copper markers: 5 literature + 5 top (using harmonized uppercase names)
+copper_lit <- c("LAB", "VHA16-1", "VHA100-4", "CTR1A", "CTR1B", "MTNA", "MTNB", "MTNC")
+avail_lit <- intersect(copper_lit, genes_up_copper_strict)
+selected_lit <- head(avail_lit, 5)
+
+# Fill the rest with top markers not already selected
+top_copper_ranked <- genes_up_copper_strict[order(sig_strict[genes_up_copper_strict, "avg_log2FC"], decreasing = TRUE)]
+top_copper_ranked <- setdiff(top_copper_ranked, selected_lit)
+selected_top_copper <- head(top_copper_ranked, 10 - length(selected_lit))
+
+final_copper_10 <- c(selected_lit, selected_top_copper)
+custom_20_markers <- c(final_copper_10, top_itc_10)
+
+if(length(custom_20_markers) > 0) {
+    Idents(sc_obj_sec3) <- "Detailed_CellType"
+    p_dot_custom <- DotPlot(sc_obj_sec3, features = custom_20_markers, idents = c("Copper", "ItC")) + 
+        coord_flip() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12, face = "bold"),
+              axis.text.y = element_text(size = 12)) +
+        labs(title = "Top 20 Markers: Copper (Literature + Top) vs ItC (Top)")
+    
+    ggsave("../figures/3D_glo/Sec3_Copper_vs_ItC_Custom20_DotPlot.png", p_dot_custom, width = 5, height = 10, bg = "white")
+    print(p_dot_custom)
+} else {
+    cat("No markers available for custom plot.\n")
+}
+```
+
+```{r sc_gene_module_go, fig.width=10, fig.height=12}
+# --- K. Gene Module GO Enrichment (Top 50 Markers per Cell Type) ---
+# Instead of relying on GSEA or variable-size marker lists,
+# we force a fixed module of exactly 50 genes per cell type,
+# ranked by log2FC from the bimod test (each vs all other cells).
+# This puts Copper and ItC on perfectly equal statistical footing.
+cat("\nCalculating top 50 gene modules for Copper and ItC...\n")
+
+Idents(sc_obj_sec3) <- "Detailed_CellType"
+module_size <- 200
+
+# Copper module: top 50 genes upregulated in Copper vs all other cells
+dge_copper <- FindMarkers(sc_obj_sec3, ident.1 = "Copper", test.use = "bimod", min.pct = 0.1, logfc.threshold = 0)
+dge_copper <- dge_copper[dge_copper$avg_log2FC > 0 & dge_copper$p_val_adj < 0.05, ]
+dge_copper <- dge_copper[order(dge_copper$avg_log2FC, decreasing = TRUE), ]
+copper_module <- head(rownames(dge_copper), module_size)
+
+# ItC module: top 50 genes upregulated in ItC vs all other cells
+dge_itc <- FindMarkers(sc_obj_sec3, ident.1 = "ItC", test.use = "bimod", min.pct = 0.1, logfc.threshold = 0)
+dge_itc <- dge_itc[dge_itc$avg_log2FC > 0 & dge_itc$p_val_adj < 0.05, ]
+dge_itc <- dge_itc[order(dge_itc$avg_log2FC, decreasing = TRUE), ]
+itc_module <- head(rownames(dge_itc), module_size)
+
+cat(sprintf("Copper module: %d genes (requested %d)\n", length(copper_module), module_size))
+cat(sprintf("ItC module:    %d genes (requested %d)\n", length(itc_module), module_size))
+cat(sprintf("\nCopper top 10: %s\n", paste(head(copper_module, 10), collapse = ", ")))
+cat(sprintf("ItC top 10:    %s\n", paste(head(itc_module, 10), collapse = ", ")))
+
+# Map to Entrez IDs
+entrez_copper_mod <- na.omit(mapIds(org.Dm.eg.db, keys = copper_module, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+entrez_itc_mod <- na.omit(mapIds(org.Dm.eg.db, keys = itc_module, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+
+cat(sprintf("\nCopper module mapped to Entrez: %d\n", length(entrez_copper_mod)))
+cat(sprintf("ItC module mapped to Entrez:    %d\n", length(entrez_itc_mod)))
+
+# Run GO enrichment on each module independently using compareCluster
+module_clusters <- list(
+    "Copper (Top 50)" = entrez_copper_mod,
+    "ItC (Top 50)" = entrez_itc_mod
+)
+
+comp_go_modules <- compareCluster(geneCluster = module_clusters,
+                                  fun = "enrichGO",
+                                  universe = universe_entrez,
+                                  OrgDb = org.Dm.eg.db,
+                                  ont = "BP",
+                                  pAdjustMethod = "BH",
+                                  pvalueCutoff = 0.05,
+                                  qvalueCutoff = 0.05,
+                                  readable = TRUE)
+
+if(nrow(comp_go_modules@compareClusterResult) > 0) {
+    # Extract top 15 per cluster
+    top15_module_terms <- comp_go_modules@compareClusterResult %>%
+        group_by(Cluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 15) %>%
+        pull(Description) %>%
+        unique()
+    
+    cat(sprintf("\nTotal significant GO terms: %d\n", nrow(comp_go_modules@compareClusterResult)))
+    cat(sprintf("Showing top terms: %d\n", length(top15_module_terms)))
+    
+    # Wrap descriptions
+    comp_go_modules@compareClusterResult$Description <- stringr::str_wrap(comp_go_modules@compareClusterResult$Description, width = 50)
+    top15_wrapped <- stringr::str_wrap(top15_module_terms, width = 50)
+    
+    p_mod_go <- dotplot(comp_go_modules, showCategory = top15_wrapped,
+                        title = "GO Enrichment: Top 50 Gene Modules (p.adjust < 0.05)") +
+        theme(axis.text.y = element_text(size = 9, lineheight = 0.8))
+    
+    ggsave("../figures/3D_glo/Sec3_Copper_vs_ItC_Module_GO.png", p_mod_go, width = 10, height = 10)
+    print(p_mod_go)
+} else {
+    cat("No GO terms survived p.adjust < 0.05. Try increasing module_size to 100.\n")
+}
+```
+
+```{r sc_venn_diagram_strict_lfc_fe, fig.width=6.5, fig.height=4}
+# --- L. Strict Venn Diagram based strongly on Log2 Fold Change (LFC vs Iron) ---
+cat("\nGenerating Strict Venn Diagram for LFC vs Iron cells (bimod test, log2FC > 1.0, 2-fold)...\n")
+
+dge_strict_fe <- FindMarkers(sc_obj_sec3, ident.1 = "LFC", ident.2 = "Iron", test.use = "bimod", min.pct = 0.25, logfc.threshold = 1.0)
+sig_strict_fe <- dge_strict_fe[dge_strict_fe$p_val_adj < 0.05, ]
+
+genes_up_lfc_strict <- rownames(sig_strict_fe[sig_strict_fe$avg_log2FC > 0, ])
+genes_up_fe_strict <- rownames(sig_strict_fe[sig_strict_fe$avg_log2FC < 0, ])
+
+expr_lfc <- GetAssayData(sc_obj_sec3, layer = "data")[, sc_obj_sec3$Detailed_CellType == "LFC", drop = FALSE]
+expr_fe <- GetAssayData(sc_obj_sec3, layer = "data")[, sc_obj_sec3$Detailed_CellType == "Iron", drop = FALSE]
+
+pct_lfc <- rowSums(expr_lfc > 0) / ncol(expr_lfc)
+pct_fe <- rowSums(expr_fe > 0) / ncol(expr_fe)
+
+shared_genes_strict_fe <- rownames(expr_lfc)[pct_lfc > 0.25 & pct_fe > 0.25]
+shared_genes_strict_fe <- setdiff(shared_genes_strict_fe, c(genes_up_lfc_strict, genes_up_fe_strict))
+
+venn_list_strict_fe <- list(
+    "Iron Cells" = c(genes_up_fe_strict, shared_genes_strict_fe),
+    "LFC" = c(genes_up_lfc_strict, shared_genes_strict_fe)
+)
+
+p_venn_strict_fe <- ggVennDiagram(venn_list_strict_fe, label_alpha = 0) + 
+    scale_fill_gradient(low = "white", high = "red") + 
+    labs(title = "Strict Expression Overlap: LFC vs Iron Cells",
+         subtitle = "Intersection = Shared highly expressed genes\nSides = Extreme Upregulated Markers (Bimod test, log2FC > 1, 2-fold)") +
+    coord_flip() + 
+    scale_x_continuous(expand = expansion(mult = 0.3)) + 
+    scale_y_continuous(expand = expansion(mult = 0.3)) +
+    theme(legend.position = "bottom", aspect.ratio = 0.6) 
+
+ggsave("../figures/3D_glo/Sec3_LFC_vs_Iron_Venn_Strict.png", p_venn_strict_fe, width = 8, height = 5.5)
+print(p_venn_strict_fe)
+```
+
+```{r sc_strict_marker_dotplot_lfc_fe, fig.width=12, fig.height=4}
+# --- M. Interactive HTML DotPlot of ALL Extreme Marker Genes (LFC vs Iron) ---
+cat("\nGenerating Interactive HTML DotPlot for ALL extreme markers of LFC and Iron cells...\n")
+
+top_lfc <- genes_up_lfc_strict[order(sig_strict_fe[genes_up_lfc_strict, "avg_log2FC"], decreasing = TRUE)]
+top_fe <- genes_up_fe_strict[order(sig_strict_fe[genes_up_fe_strict, "avg_log2FC"], decreasing = FALSE)]
+
+all_markers_fe <- c(top_lfc, top_fe)
+
+if(length(all_markers_fe) > 0) {
+    Idents(sc_obj_sec3) <- "Detailed_CellType"
+    chunk_size <- 20
+    
+    for(i in seq(1, length(all_markers_fe), by = chunk_size)) {
+        end_idx <- min(i + chunk_size - 1, length(all_markers_fe))
+        genes_chunk <- all_markers_fe[i:end_idx]
+        part_num <- ceiling(i / chunk_size)
+        
+        p_dot <- DotPlot(sc_obj_sec3, features = genes_chunk, idents = c("LFC", "Iron")) + 
+            theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+                  axis.text.y = element_text(size = 9)) +
+            labs(title = paste0("Extreme Markers: LFC vs Iron (Part ", part_num, ")"))
+        
+        print(p_dot)
+        
+        p_dot_html <- ggplotly(p_dot, height = 300)
+        html_file <- paste0("../figures/3D_glo/Sec3_LFC_vs_Iron_Strict_DotPlot_Part_", part_num, ".html")
+        saveWidget(p_dot_html, file = html_file, selfcontained = TRUE)
+        cat(sprintf("Saved HTML Part %d to %s\n", part_num, html_file))
+    }
+} else {
+    cat("No markers survived the strict 4-fold cutoff to plot.\n")
+}
+```
+
+```{r sc_custom_marker_dotplot_lfc_fe, fig.width=5, fig.height=10}
+# --- M2. Custom 20-Gene DotPlot (LFC vs Iron) ---
+cat("\nGenerating Custom Top 20 Marker DotPlot for LFC and Iron...\n")
+
+top_lfc_10 <- head(genes_up_lfc_strict[order(sig_strict_fe[genes_up_lfc_strict, "avg_log2FC"], decreasing = TRUE)], 10)
+top_fe_10 <- head(genes_up_fe_strict[order(sig_strict_fe[genes_up_fe_strict, "avg_log2FC"], decreasing = FALSE)], 10)
+
+custom_20_fe_markers <- c(top_lfc_10, top_fe_10)
+
+if(length(custom_20_fe_markers) > 0) {
+    Idents(sc_obj_sec3) <- "Detailed_CellType"
+    p_dot_custom_fe <- DotPlot(sc_obj_sec3, features = custom_20_fe_markers, idents = c("LFC", "Iron")) + 
+        coord_flip() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12, face = "bold"),
+              axis.text.y = element_text(size = 12)) +
+        labs(title = "Top 20 Markers: LFC vs Iron")
+    
+    ggsave("../figures/3D_glo/Sec3_LFC_vs_Iron_Custom20_DotPlot.png", p_dot_custom_fe, width = 5, height = 10, bg = "white")
+    print(p_dot_custom_fe)
+} else {
+    cat("No markers available for custom plot.\n")
+}
+```
+
+```{r sc_gene_module_go_lfc_fe, fig.width=10, fig.height=12}
+# --- N. Gene Module GO Enrichment (Top 50 Markers per Cell Type) for LFC vs Iron ---
+cat("\nCalculating top 50 gene modules for LFC and Iron cells...\n")
+
+Idents(sc_obj_sec3) <- "Detailed_CellType"
+module_size <- 50
+
+dge_lfc_mod <- FindMarkers(sc_obj_sec3, ident.1 = "LFC", test.use = "bimod", min.pct = 0.1, logfc.threshold = 0)
+dge_lfc_mod <- dge_lfc_mod[dge_lfc_mod$avg_log2FC > 0 & dge_lfc_mod$p_val_adj < 0.05, ]
+dge_lfc_mod <- dge_lfc_mod[order(dge_lfc_mod$avg_log2FC, decreasing = TRUE), ]
+lfc_module <- head(rownames(dge_lfc_mod), module_size)
+
+dge_fe_mod <- FindMarkers(sc_obj_sec3, ident.1 = "Iron", test.use = "bimod", min.pct = 0.1, logfc.threshold = 0)
+dge_fe_mod <- dge_fe_mod[dge_fe_mod$avg_log2FC > 0 & dge_fe_mod$p_val_adj < 0.05, ]
+dge_fe_mod <- dge_fe_mod[order(dge_fe_mod$avg_log2FC, decreasing = TRUE), ]
+fe_module <- head(rownames(dge_fe_mod), module_size)
+
+cat(sprintf("LFC module:  %d genes\n", length(lfc_module)))
+cat(sprintf("Iron module: %d genes\n", length(fe_module)))
+
+entrez_lfc_mod <- na.omit(mapIds(org.Dm.eg.db, keys = lfc_module, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+entrez_fe_mod <- na.omit(mapIds(org.Dm.eg.db, keys = fe_module, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first"))
+
+module_clusters_fe <- list(
+    "LFC (Top 50)" = entrez_lfc_mod,
+    "Iron Cells (Top 50)" = entrez_fe_mod
+)
+
+comp_go_modules_fe <- compareCluster(geneCluster = module_clusters_fe,
+                                  fun = "enrichGO",
+                                  universe = universe_entrez,
+                                  OrgDb = org.Dm.eg.db,
+                                  ont = "BP",
+                                  pAdjustMethod = "BH",
+                                  pvalueCutoff = 0.05,
+                                  qvalueCutoff = 0.05,
+                                  readable = TRUE)
+
+if(!is.null(comp_go_modules_fe) && nrow(comp_go_modules_fe@compareClusterResult) > 0) {
+    top15_module_terms_fe <- comp_go_modules_fe@compareClusterResult %>%
+        group_by(Cluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 15) %>%
+        pull(Description) %>%
+        unique()
+    
+    comp_go_modules_fe@compareClusterResult$Description <- stringr::str_wrap(comp_go_modules_fe@compareClusterResult$Description, width = 50)
+    top15_wrapped_fe <- stringr::str_wrap(top15_module_terms_fe, width = 50)
+    
+    p_mod_go_fe <- dotplot(comp_go_modules_fe, showCategory = top15_wrapped_fe,
+                        title = "GO Enrichment: Top 50 Gene Modules (p.adjust < 0.05)") +
+        theme(axis.text.y = element_text(size = 9, lineheight = 0.8))
+    
+    ggsave("../figures/3D_glo/Sec3_LFC_vs_Iron_Module_GO.png", p_mod_go_fe, width = 10, height = 10)
+    print(p_mod_go_fe)
+} else {
+    cat("No GO terms survived p.adjust < 0.05.\n")
+}
+```
+
+```{r sc_global_similarity_heatmap, fig.width=8, fig.height=7}
+# --- O. Global Transcriptomic Similarity Matrix (Pearson) ---
+cat("\nGenerating Global Transcriptomic Similarity Matrix (Pearson)...\n")
+
+heatmap_cts <- c("aEC", "A3_aEC", "ItC", "Copper", "LFC", "Iron", "pEC")
+sc_obj_heatmap <- subset(sc_obj_sec3, Detailed_CellType %in% heatmap_cts)
+sc_obj_heatmap$Detailed_CellType <- factor(sc_obj_heatmap$Detailed_CellType, levels = heatmap_cts)
+
+# Calculate Average Expression for the target cell types manually to avoid Seurat layer warnings
+expr_mat <- GetAssayData(sc_obj_heatmap, layer = "data")
+if(is.null(expr_mat) || nrow(expr_mat) == 0) {
+    expr_mat <- GetAssayData(sc_obj_heatmap, slot = "data") # Fallback for older Seurat objects
+}
+
+avg_expr <- sapply(levels(sc_obj_heatmap$Detailed_CellType), function(ct) {
+    cells <- colnames(sc_obj_heatmap)[sc_obj_heatmap$Detailed_CellType == ct]
+    if (length(cells) == 0) return(rep(0, nrow(expr_mat)))
+    if (length(cells) == 1) return(expr_mat[, cells])
+    Matrix::rowMeans(expr_mat[, cells])
+})
+avg_expr <- as.matrix(avg_expr)
+
+# Remove genes with zero variance across all cell types before correlation
+var_genes <- apply(avg_expr, 1, var)
+avg_expr_filtered <- avg_expr[var_genes > 0, ]
+
+# Compute Pearson correlation matrix
+cor_mat <- cor(avg_expr_filtered, method = "pearson")
+
+# Ensure pheatmap is available
+if(!requireNamespace("pheatmap", quietly = TRUE)) {
+    install.packages("pheatmap", repos = "http://cran.us.r-project.org")
+}
+library(pheatmap)
+
+# Create color palette similar to reference (blue to white to red)
+heat_cols <- colorRampPalette(c("navy", "white", "firebrick3"))(100)
+
+p_heat <- pheatmap::pheatmap(cor_mat, 
+                             color = heat_cols, 
+                             display_numbers = FALSE, 
+                             fontsize = 12, 
+                             main = "Global Transcriptomic Similarity Matrix (Pearson)",
+                             angle_col = 45,
+                             treeheight_row = 30,
+                             treeheight_col = 30)
+
+# Save the plot with explicitly white background to prevent transparency rendering as black
+ggsave("../figures/3D_glo/Sec3_Global_Similarity_Heatmap.png", plot = p_heat$gtable, width = 8, height = 7, bg = "white")
+```
+
+
+## 4. Single Cell GO Enrichment (500-Gene Pipeline)
+
+This section loads single-cell data and runs a comprehensive GO enrichment pipeline
+with marker injection for under-represented cell types, publication-quality filtering
+(p.adjust < 0.05), and specificity filtering (terms present in 1-3 cell types only).
+
+```{r sc_go_500, fig.width=10, fig.height=14}
+cat("\n\n--- Starting Single Cell Data Analysis (500-Gene Pipeline) ---\n")
+sc_obj <- readRDS("../Random data/sc_lineage_labeled.rds")
+
+# Ensure cell types are detailed
+sc_obj$Detailed_CellType <- as.character(sc_obj$Combined_Cluster)
+sc_obj$Detailed_CellType[sc_obj$Detailed_CellType == "mEC_Zip_pos"] <- "ItC"
+sc_obj$Detailed_CellType[sc_obj$Detailed_CellType == "mEC_Zip_neg"] <- "A3_aEC"
+
+# Split LFC by CG17571
+lfc_idx_sc <- which(sc_obj$Detailed_CellType == "LFC")
+if (length(lfc_idx_sc) > 0) {
+    expr_data_sc <- GetAssayData(sc_obj, layer = "data")
+    cg17571_expr_sc <- rep(0, length(lfc_idx_sc))
+    if ("CG17571" %in% rownames(expr_data_sc)) {
+        cg17571_expr_sc <- expr_data_sc["CG17571", lfc_idx_sc]
+    }
+    sc_obj$Detailed_CellType[lfc_idx_sc[cg17571_expr_sc > 0]] <- "Iron"
+    sc_obj$Detailed_CellType[lfc_idx_sc[cg17571_expr_sc == 0]] <- "LFC"
+}
+
+target_cts_sc <- c("aEC", "ItC", "A3_aEC", "Copper", "Iron", "LFC", "pEC")
+
+sub_sc <- subset(sc_obj, cells = Cells(sc_obj)[sc_obj$Detailed_CellType %in% target_cts_sc])
+Idents(sub_sc) <- factor(sub_sc$Detailed_CellType, levels = target_cts_sc)
+
+cat("\nSC CELL COUNTS:\n")
+print(table(Idents(sub_sc)))
+
+# --- Find Markers ---
+cat("Finding markers for SC cell types...\n")
+sc_markers <- FindAllMarkers(sub_sc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+cat("Finding differential SC markers between aEC and pEC...\n")
+sc_a_vs_p <- FindMarkers(sub_sc, ident.1 = "aEC", ident.2 = "pEC", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+sc_p_vs_a <- FindMarkers(sub_sc, ident.1 = "pEC", ident.2 = "aEC", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+sc_a_vs_p$cluster <- "aEC"
+sc_a_vs_p$gene <- rownames(sc_a_vs_p)
+sc_p_vs_a$cluster <- "pEC"
+sc_p_vs_a$gene <- rownames(sc_p_vs_a)
+
+sc_markers_combined <- rbind(sc_markers, sc_a_vs_p, sc_p_vs_a)
+
+# --- Multi-strategy marker injection for mEC_ZIP42C_neg ---
+cat("\n--- Marker injection for mEC_ZIP42C_neg ---\n")
+neg_markers <- sc_markers_combined %>% filter(cluster == "A3_aEC")
+cat(paste0("  Base markers for mEC_ZIP42C_neg: ", nrow(neg_markers), "\n"))
+
+if (nrow(neg_markers) < 100) {
+    # Strategy 1: vs ItC
+    cat("  Injecting markers: mEC_ZIP42C_neg vs ItC...\n")
+    neg_vs_itc <- tryCatch(
+        FindMarkers(sub_sc, ident.1 = "A3_aEC", ident.2 = "ItC", 
+                    only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.1),
+        error = function(e) data.frame()
+    )
+    if (nrow(neg_vs_itc) > 0) {
+        neg_vs_itc$cluster <- "A3_aEC"
+        neg_vs_itc$gene <- rownames(neg_vs_itc)
+        sc_markers_combined <- rbind(sc_markers_combined, neg_vs_itc)
+        cat(paste0("    Added ", nrow(neg_vs_itc), " markers\n"))
+    }
+    
+    # Strategy 2: vs Copper
+    cat("  Injecting markers: mEC_ZIP42C_neg vs Copper...\n")
+    neg_vs_cu <- tryCatch(
+        FindMarkers(sub_sc, ident.1 = "A3_aEC", ident.2 = "Copper",
+                    only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.1),
+        error = function(e) data.frame()
+    )
+    if (nrow(neg_vs_cu) > 0) {
+        neg_vs_cu$cluster <- "A3_aEC"
+        neg_vs_cu$gene <- rownames(neg_vs_cu)
+        sc_markers_combined <- rbind(sc_markers_combined, neg_vs_cu)
+        cat(paste0("    Added ", nrow(neg_vs_cu), " markers\n"))
+    }
+}
+
+# Deduplicate
+sc_markers_combined <- sc_markers_combined %>% distinct(gene, cluster, .keep_all = TRUE)
+
+# --- Run GO Enrichment (500 genes) ---
+cat("\nRunning compareCluster for SC Cell Type GO enrichment (500 genes)...\n")
+top_sc_genes <- sc_markers_combined %>% group_by(cluster) %>% top_n(n = 500, wt = avg_log2FC)
+sc_gene_list <- split(top_sc_genes$gene, top_sc_genes$cluster)
+
+cat("Gene counts per cell type:\n")
+print(lengths(sc_gene_list))
+
+sc_go_res <- compareCluster(geneCluster = sc_gene_list, fun = "enrichGO", 
+                            OrgDb = org.Dm.eg.db, keyType = "SYMBOL", 
+                            ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.2)
+
+sc_go_all <- sc_go_res@compareClusterResult
+
+# --- SPECIFIC plot: publication-quality, 1-3 celltype specificity ---
+cat("\n--- Building SPECIFIC plot ---\n")
+
+# Count number of cell types per term
+term_ct_count <- sc_go_all %>%
+    filter(p.adjust < 0.05) %>%
+    group_by(Description) %>%
+    summarise(n_cts = n_distinct(Cluster)) %>%
+    ungroup()
+
+# Keep only terms in 1-3 celltypes (not ubiquitous)
+specific_terms <- term_ct_count %>% filter(n_cts <= 3) %>% pull(Description)
+cat(paste0("  Terms passing specificity filter (1-3 celltypes): ", length(specific_terms), "\n"))
+
+sc_go_specific <- sc_go_all %>%
+    filter(p.adjust < 0.05, Description %in% specific_terms)
+
+top_terms_specific <- sc_go_specific %>%
+    group_by(Cluster) %>%
+    arrange(p.adjust) %>%
+    slice_head(n = 7) %>%
+    mutate(Rank = row_number()) %>%
+    ungroup()
+
+# If any cluster has <7, fill from all significant
+for (ct in target_cts_sc) {
+    ct_terms <- top_terms_specific %>% filter(Cluster == ct)
+    if (nrow(ct_terms) < 7) {
+        cat(paste0("  ", ct, " has only ", nrow(ct_terms), " specific terms, filling...\n"))
+        extra <- sc_go_all %>%
+            filter(Cluster == ct, p.adjust < 0.05, !Description %in% ct_terms$Description) %>%
+            arrange(p.adjust) %>%
+            slice_head(n = 7 - nrow(ct_terms)) %>%
+            mutate(Rank = nrow(ct_terms) + row_number())
+        top_terms_specific <- rbind(top_terms_specific, extra)
+    }
+}
+
+sc_plot_data <- sc_go_all %>%
+    inner_join(top_terms_specific %>% dplyr::select(Cluster, Description, Rank),
+               by = c("Cluster", "Description"))
+
+sc_plot_data$GeneRatio_num <- sapply(sc_plot_data$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    if(length(parts) == 2) parts[1] / parts[2] else 0
+})
+
+sc_plot_data$Description <- str_wrap(sc_plot_data$Description, width = 45)
+sc_plot_data$Cluster <- factor(sc_plot_data$Cluster, levels = target_cts_sc)
+
+term_order_sc <- top_terms_specific %>%
+    arrange(factor(Cluster, levels = target_cts_sc), Rank) %>%
+    pull(Description) %>%
+    unique() %>%
+    str_wrap(width = 45)
+
+sc_plot_data$Description <- factor(sc_plot_data$Description, levels = rev(unique(term_order_sc)))
+
+p_sc_go <- ggplot(sc_plot_data, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+    geom_point() +
+    scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+    theme_minimal() +
+    labs(size = "Gene ratio", title = "SC Cell Type GO Enrichment (Specific, 500 genes)", y = "", x = "") +
+    theme(axis.text.x = element_text(size=12, face="bold", angle = 90, vjust = 0.5, hjust=1),
+          axis.text.y = element_text(size=10),
+          panel.grid.major.x = element_line(linetype="dotted", color="grey80"),
+          panel.border = element_rect(color="black", fill=NA))
+
+ggsave("../figures/3D_glo/SC_CellType_GO_Dotplot.png", p_sc_go, width = 10, height = 14)
+print(p_sc_go)
+
+# --- SHARED plot ---
+cat("\n--- Building SHARED plot ---\n")
+top_terms_shared <- sc_go_all %>%
+    filter(p.adjust < 0.05) %>%
+    group_by(Cluster) %>%
+    arrange(p.adjust) %>%
+    slice_head(n = 5) %>%
+    mutate(Rank = row_number()) %>%
+    ungroup()
+top_descriptions_shared <- unique(top_terms_shared$Description)
+sc_plot_shared <- sc_go_all %>% filter(Description %in% top_descriptions_shared, p.adjust < 0.05)
+
+sc_plot_shared$GeneRatio_num <- sapply(sc_plot_shared$GeneRatio, function(x) {
+    parts <- as.numeric(strsplit(x, "/")[[1]])
+    if(length(parts) == 2) parts[1] / parts[2] else 0
+})
+
+sc_plot_shared$Description <- str_wrap(sc_plot_shared$Description, width = 45)
+sc_plot_shared$Cluster <- factor(sc_plot_shared$Cluster, levels = target_cts_sc)
+
+term_ordering_shared <- top_terms_shared %>%
+    group_by(Description) %>%
+    slice_min(Rank, n=1, with_ties=FALSE) %>%
+    ungroup() %>%
+    arrange(factor(Cluster, levels=target_cts_sc), Rank)
+term_order_shared <- str_wrap(term_ordering_shared$Description, width = 45)
+sc_plot_shared$Description <- factor(sc_plot_shared$Description, levels = rev(term_order_shared))
+
+p_sc_go_shared <- ggplot(sc_plot_shared, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+    geom_point() +
+    scale_color_viridis_c(option = "mako", direction = -1, name = "P_adj") +
+    theme_minimal() +
+    labs(size = "Gene ratio", title = "SC Cell Type GO Enrichment (Shared Terms)", y = "", x = "") +
+    theme(axis.text.x = element_text(size=12, face="bold", angle = 90, vjust = 0.5, hjust=1),
+          axis.text.y = element_text(size=10),
+          panel.grid.major.x = element_line(linetype="dotted", color="grey80"),
+          panel.border = element_rect(color="black", fill=NA))
+
+ggsave("../figures/3D_glo/SC_CellType_GO_Shared_Dotplot.png", p_sc_go_shared, width = 10, height = 12)
+print(p_sc_go_shared)
+
+# --- Pairwise: ItC vs mEC_ZIP42C_neg ---
+cat("\n\n--- Pairwise Differential GO: ItC vs mEC_ZIP42C_neg ---\n")
+# Find markers upregulated in pos
+pw_pos <- sc_markers_combined %>% filter(cluster == "ItC") %>% top_n(n = 300, wt = avg_log2FC) %>% pull(gene)
+pw_neg <- sc_markers_combined %>% filter(cluster == "A3_aEC") %>% top_n(n = 300, wt = avg_log2FC) %>% pull(gene)
+
+pw_gene_list <- list("ItC" = pw_pos, "A3_aEC" = pw_neg)
+
+pw_go_res <- compareCluster(geneCluster = pw_gene_list, fun = "enrichGO",
+                             OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                             ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.2)
+
+if (!is.null(pw_go_res) && nrow(pw_go_res@compareClusterResult) > 0) {
+    pw_df <- pw_go_res@compareClusterResult
+    pw_top <- pw_df %>% filter(p.adjust < 0.05) %>% group_by(Cluster) %>% arrange(p.adjust) %>% slice_head(n = 10) %>% ungroup()
+    
+    if (nrow(pw_top) > 0) {
+        pw_top$GeneRatio_num <- sapply(pw_top$GeneRatio, function(x) {
+            parts <- as.numeric(strsplit(x, "/")[[1]])
+            if(length(parts) == 2) parts[1] / parts[2] else 0
+        })
+        pw_top$Description <- str_wrap(pw_top$Description, width = 50)
+        
+        p_pw <- ggplot(pw_top, aes(x = Cluster, y = reorder(Description, -p.adjust), 
+                                    size = GeneRatio_num, color = p.adjust)) +
+            geom_point() +
+            scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+            theme_minimal() +
+            labs(title = "Pairwise GO: ItC vs mEC_ZIP42C_neg", y = "", x = "", size = "Gene ratio") +
+            theme(axis.text.y = element_text(size = 9),
+                  panel.border = element_rect(color = "black", fill = NA))
+        
+        ggsave("../figures/3D_glo/SC_Pairwise_ZIP42C_GO.png", p_pw, width = 10, height = 8)
+        print(p_pw)
+    }
+}
+
+# --- Pairwise: Iron vs LFC_CG17571_neg ---
+cat("\n--- Pairwise Differential GO: Iron vs LFC_CG17571_neg ---\n")
+pw_pos_cu <- sc_markers_combined %>% filter(cluster == "Iron") %>% top_n(n = 300, wt = avg_log2FC) %>% pull(gene)
+pw_neg_cu <- sc_markers_combined %>% filter(cluster == "LFC") %>% top_n(n = 300, wt = avg_log2FC) %>% pull(gene)
+
+pw_gene_list_cu <- list("Iron" = pw_pos_cu, "LFC" = pw_neg_cu)
+
+pw_go_res_cu <- compareCluster(geneCluster = pw_gene_list_cu, fun = "enrichGO", 
+                                OrgDb = org.Dm.eg.db, keyType = "SYMBOL", 
+                                ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.5)
+    
+if (!is.null(pw_go_res_cu) && nrow(pw_go_res_cu@compareClusterResult) > 0) {
+    pw_df_cu <- pw_go_res_cu@compareClusterResult
+    pw_top_cu <- pw_df_cu %>% filter(p.adjust < 0.05) %>% group_by(Cluster) %>% arrange(p.adjust) %>% slice_head(n = 10) %>% ungroup()
+    
+    if (nrow(pw_top_cu) > 0) {
+        pw_top_cu$GeneRatio_num <- sapply(pw_top_cu$GeneRatio, function(x) {
+            parts <- as.numeric(strsplit(x, "/")[[1]])
+            if(length(parts) == 2) parts[1] / parts[2] else 0
+        })
+        pw_top_cu$Description <- str_wrap(pw_top_cu$Description, width = 50)
+        
+        p_pw_cu <- ggplot(pw_top_cu, aes(x = Cluster, y = reorder(Description, -p.adjust),
+                                          size = GeneRatio_num, color = p.adjust)) +
+            geom_point() +
+            scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+            theme_minimal() +
+            labs(title = "Pairwise GO: Iron vs LFC_CG17571_neg", y = "", x = "", size = "Gene ratio") +
+            theme(axis.text.y = element_text(size = 9),
+                  panel.border = element_rect(color = "black", fill = NA))
+        
+        ggsave("../figures/3D_glo/SC_Pairwise_CG17571_GO.png", p_pw_cu, width = 10, height = 8)
+        print(p_pw_cu)
+    }
+}
+
+# --- Spatial module scoring for ZIP42C markers ---
+cat("\n--- Spatial Module Scoring for ZIP42C markers ---\n")
+if (exists("sub_guts")) {
+    top_pos_genes <- sc_markers_combined %>% filter(cluster == "ItC") %>% top_n(n = 50, wt = avg_log2FC) %>% pull(gene)
+    top_neg_genes <- sc_markers_combined %>% filter(cluster == "A3_aEC") %>% top_n(n = 50, wt = avg_log2FC) %>% pull(gene)
+    
+    # Filter to genes present in spatial data
+    spatial_genes <- rownames(sub_guts)
+    pos_genes_spatial <- intersect(top_pos_genes, spatial_genes)
+    neg_genes_spatial <- intersect(top_neg_genes, spatial_genes)
+    
+    cat(paste0("  ItC genes in spatial data: ", length(pos_genes_spatial), "\n"))
+    cat(paste0("  mEC_ZIP42C_neg genes in spatial data: ", length(neg_genes_spatial), "\n"))
+    
+    if (length(pos_genes_spatial) >= 5 && length(neg_genes_spatial) >= 5) {
+        sub_guts <- AddModuleScore(sub_guts, features = list(pos_genes_spatial), name = "ZIP42C_Pos_Module")
+        sub_guts <- AddModuleScore(sub_guts, features = list(neg_genes_spatial), name = "ZIP42C_Neg_Module")
+        
+        if ("Spatial_Pseudotime" %in% colnames(sub_guts@meta.data)) {
+            library(patchwork)
+            plot_pos <- ggplot(sub_guts@meta.data, aes(x = x_centroid, y = y_centroid, color = ZIP42C_Pos_Module1)) +
+                geom_point(size = 0.5) + scale_color_viridis_c(option = "inferno") +
+                theme_minimal() + coord_fixed() + labs(title = "ItC Signature (Spatial)", color="Score")
+            
+            plot_neg <- ggplot(sub_guts@meta.data, aes(x = x_centroid, y = y_centroid, color = ZIP42C_Neg_Module1)) +
+                geom_point(size = 0.5) + scale_color_viridis_c(option = "inferno") +
+                theme_minimal() + coord_fixed() + labs(title = "mEC ZIP42C Neg Signature (Spatial)", color="Score")
+        
+            p_spatial <- plot_pos + plot_neg
+            ggsave("../figures/3D_glo/Spatial_ZIP42C_Modules.png", p_spatial, width = 14, height = 6)
+            print(p_spatial)
+            cat("Spatial module maps saved to Spatial_ZIP42C_Modules.png!\n")
+        }
+    }
+}
+
+cat("Finished SC Analysis!\n")
+
+# --- SC GO Subgroup Plots ---
+cat("\n--- Building Subgroup GO Plots (Prioritizing Cell-Type Specificity) ---\n")
+
+# Group 1: A3_aEC, ItC, Copper
+group1_cts <- c("A3_aEC", "ItC", "Copper")
+g1_all <- sc_go_all %>% filter(Cluster %in% group1_cts, p.adjust < 0.05)
+g1_counts <- g1_all %>% group_by(Description) %>% summarise(n_cts_sub = n())
+
+g1_terms <- g1_all %>%
+    left_join(g1_counts, by = "Description") %>%
+    group_by(Cluster) %>%
+    arrange(n_cts_sub, p.adjust) %>%  # Sort by uniqueness in subgroup first, then significance
+    slice_head(n = 7) %>%
+    ungroup()
+
+if(nrow(g1_terms) > 0) {
+    g1_terms$GeneRatio_num <- sapply(g1_terms$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    g1_terms$Description <- str_wrap(g1_terms$Description, width = 50)
+    g1_terms$Cluster <- factor(g1_terms$Cluster, levels = group1_cts)
+    
+    g1_order <- g1_terms %>% arrange(Cluster, n_cts_sub, p.adjust) %>% pull(Description) %>% unique()
+    g1_terms$Description <- factor(g1_terms$Description, levels = rev(g1_order))
+    
+    p_g1 <- ggplot(g1_terms, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(title = "Top Differentiating GO Terms: A3_aEC, ItC, Copper", y = "", x = "", size = "Gene ratio") +
+        theme(axis.text.x = element_text(size = 12, face = "bold"),
+              axis.text.y = element_text(size = 9),
+              panel.border = element_rect(color = "black", fill = NA))
+    
+    ggsave("../figures/3D_glo/SC_GO_Subgroup1.png", p_g1, width = 9, height = 12, bg = "white")
+    print(p_g1)
+}
+
+# Group 2: LFC, Iron, pEC
+group2_cts <- c("LFC", "Iron", "pEC")
+g2_all <- sc_go_all %>% filter(Cluster %in% group2_cts, p.adjust < 0.05)
+g2_counts <- g2_all %>% group_by(Description) %>% summarise(n_cts_sub = n())
+
+g2_terms <- g2_all %>%
+    left_join(g2_counts, by = "Description") %>%
+    group_by(Cluster) %>%
+    arrange(n_cts_sub, p.adjust) %>%
+    slice_head(n = 7) %>%
+    ungroup()
+
+if(nrow(g2_terms) > 0) {
+    g2_terms$GeneRatio_num <- sapply(g2_terms$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    g2_terms$Description <- str_wrap(g2_terms$Description, width = 50)
+    g2_terms$Cluster <- factor(g2_terms$Cluster, levels = group2_cts)
+    
+    g2_order <- g2_terms %>% arrange(Cluster, n_cts_sub, p.adjust) %>% pull(Description) %>% unique()
+    g2_terms$Description <- factor(g2_terms$Description, levels = rev(g2_order))
+    
+    p_g2 <- ggplot(g2_terms, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(title = "Top Differentiating GO Terms: LFC, Iron, pEC", y = "", x = "", size = "Gene ratio") +
+        theme(axis.text.x = element_text(size = 12, face = "bold"),
+              axis.text.y = element_text(size = 9),
+              panel.border = element_rect(color = "black", fill = NA))
+    
+    ggsave("../figures/3D_glo/SC_GO_Subgroup2.png", p_g2, width = 9, height = 12, bg = "white")
+    print(p_g2)
+}
+
+## 5. Curated Mid-Level GO Enrichment
+
+#**Algorithm**:
+
+#1. For each cell type independently, run `enrichGO` on its top marker genes.
+#2. Constrain gene-set size (`minGSSize=5, maxGSSize=500`) to exclude hyper-broad parent terms while retaining mid-level processes.
+#3. Apply `simplify(cutoff=0.5)` via GOSemSim to collapse semantically redundant terms into a single representative.
+#4. Take the top 10 most significant non-redundant terms per cell type.
+#5. Pool into a single dotplot.
+
+
+cat("\n\n========== CURATED MID-LEVEL GO ENRICHMENT ==========\n")
+
+if (!requireNamespace("GOSemSim", quietly = TRUE)) {
+    BiocManager::install("GOSemSim")
+}
+library(GOSemSim)
+
+# --- Build per-celltype gene lists from existing markers ---
+# Reuse sc_markers_combined (the 500-gene pipeline markers with neg injection)
+curated_genes <- sc_markers_combined %>% 
+    group_by(cluster) %>% 
+    top_n(n = 500, wt = avg_log2FC) %>% 
+    ungroup()
+
+# Rename clusters for visualization
+curated_genes <- curated_genes %>%
+    mutate(cluster = case_when(
+        cluster == "ItC" ~ "ItC (ZIP42C pos mEC)",
+        cluster == "A3_aEC" ~ "mEC",
+        TRUE ~ as.character(cluster)
+    ))
+
+curated_gene_list <- split(curated_genes$gene, curated_genes$cluster)
+
+# Update target_cts_sc for consistent ordering in Sections 5 and 6 plots
+target_cts_sc <- c("aEC", "ItC (ZIP42C pos mEC)", "mEC", "Copper", "Iron", "LFC", "pEC")
+
+cat("Gene counts per cell type for curated analysis:\n")
+print(lengths(curated_gene_list))
+
+# --- Per-celltype enrichGO + simplify ---
+curated_results <- list()
+
+for (ct in names(curated_gene_list)) {
+    cat(paste0("\n--- Processing: ", ct, " ---\n"))
+    
+    ego <- enrichGO(
+        gene         = curated_gene_list[[ct]],
+        OrgDb        = org.Dm.eg.db,
+        keyType      = "SYMBOL",
+        ont          = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.1,
+        minGSSize    = 5,
+        maxGSSize    = 500
+    )
+    
+    if (is.null(ego) || nrow(ego@result %>% filter(pvalue < 0.05)) == 0) {
+        cat(paste0("  No significant terms at pvalue<0.05 for ", ct, ", relaxing cutoff...\n"))
+        ego <- enrichGO(
+            gene         = curated_gene_list[[ct]],
+            OrgDb        = org.Dm.eg.db,
+            keyType      = "SYMBOL",
+            ont          = "BP",
+            pAdjustMethod = "none",
+            pvalueCutoff = 0.2,
+            qvalueCutoff = 0.5,
+            minGSSize    = 3,
+            maxGSSize    = 600
+        )
+    }
+    
+    if (!is.null(ego) && nrow(ego@result) > 0) {
+        ego_simple <- simplify(ego, cutoff = 0.5, by = "pvalue", select_fun = min)
+        
+        df <- ego_simple@result %>% 
+            filter(pvalue < 0.05) %>%
+            arrange(pvalue) %>% 
+            head(10)
+        
+        if (nrow(df) < 5) {
+            ego_simple2 <- simplify(ego, cutoff = 0.7, by = "pvalue", select_fun = min)
+            df <- ego_simple2@result %>% 
+                filter(pvalue < 0.05) %>%
+                arrange(pvalue) %>% 
+                head(10)
+        }
+        
+        if (nrow(df) > 0) {
+            df$Cluster <- ct
+            curated_results[[ct]] <- df
+            cat(paste0("  Kept ", nrow(df), " terms after simplification\n"))
+        } else {
+            cat(paste0("  No terms survived for ", ct, "\n"))
+        }
+    } else {
+        cat(paste0("  enrichGO returned no results for ", ct, "\n"))
+    }
+}
+
+# --- Combine and plot ---
+curated_all <- bind_rows(curated_results)
+
+if (nrow(curated_all) > 0) {
+    curated_all$GeneRatio_num <- sapply(curated_all$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    term_sharing <- curated_all %>% group_by(Description) %>% summarise(n_cts = n_distinct(Cluster))
+    cat("\n--- Term sharing distribution ---\n")
+    print(table(term_sharing$n_cts))
+    
+    curated_all$Description <- str_wrap(curated_all$Description, width = 45)
+    curated_all$Cluster <- factor(curated_all$Cluster, levels = target_cts_sc)
+    
+    curated_all <- curated_all %>% 
+        group_by(Cluster) %>% 
+        mutate(Rank = row_number()) %>% 
+        ungroup()
+    
+    term_order_curated <- curated_all %>% 
+        arrange(factor(Cluster, levels = target_cts_sc), Rank) %>% 
+        pull(Description) %>% 
+        unique()
+    
+    curated_all$Description <- factor(curated_all$Description, levels = rev(term_order_curated))
+    
+    all_curated_terms <- unique(as.character(curated_all$Description))
+    
+    curated_compare <- compareCluster(geneCluster = curated_gene_list, fun = "enrichGO",
+                                      OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                                      ont = "BP", pAdjustMethod = "BH", 
+                                      pvalueCutoff = 0.5, minGSSize = 5, maxGSSize = 500)
+    
+    cross_data <- curated_compare@compareClusterResult %>%
+        mutate(Description = str_wrap(Description, width = 45)) %>%
+        filter(Description %in% all_curated_terms, pvalue < 0.05)
+    
+    cross_data$GeneRatio_num <- sapply(cross_data$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    cross_data$Cluster <- factor(cross_data$Cluster, levels = target_cts_sc)
+    cross_data$Description <- factor(cross_data$Description, levels = rev(term_order_curated))
+    cross_data <- cross_data %>% filter(!is.na(Description))
+    
+    p_curated <- ggplot(cross_data, aes(x = Cluster, y = Description, 
+                                         size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "Adjusted\np-value") +
+        scale_size_continuous(range = c(2, 8), name = "Gene Ratio") +
+        theme_minimal(base_size = 12) +
+        labs(title = "Curated GO Biological Processes",
+             subtitle = "Per-celltype enrichment with semantic deduplication (simplify, cutoff=0.5)",
+             y = "", x = "") +
+        theme(
+            axis.text.x = element_text(size = 12, face = "bold", angle = 90, vjust = 0.5, hjust = 1),
+            axis.text.y = element_text(size = 10),
+            panel.grid.major.x = element_line(linetype = "dotted", color = "grey80"),
+            panel.border = element_rect(color = "black", fill = NA),
+            plot.title = element_text(face = "bold", size = 14),
+            plot.subtitle = element_text(size = 10, color = "grey40")
+        )
+    
+    ggsave("../figures/3D_glo/SC_Curated_GO_Dotplot.png", p_curated, width = 12, height = 16)
+    print(p_curated)
+    cat("Curated GO dotplot saved!\n")
+    
+    summary_tbl <- curated_all %>% group_by(Cluster) %>% summarise(n_terms = n(), .groups = "drop")
+    print(summary_tbl)
+    
+} else {
+    cat("No curated GO terms were found across any cell type.\n")
+}
+
+cat("\n========== CURATED GO ANALYSIS COMPLETE ==========\n")
+
+# ========== BROAD VIEW: high-level umbrella terms ==========
+cat("\n\n========== BROAD VIEW GO ENRICHMENT ==========\n")
+
+broad_results <- list()
+
+for (ct in names(curated_gene_list)) {
+    cat(paste0("\n--- Broad Processing: ", ct, " ---\n"))
+    
+    ego_broad <- enrichGO(
+        gene         = curated_gene_list[[ct]],
+        OrgDb        = org.Dm.eg.db,
+        keyType      = "SYMBOL",
+        ont          = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.1,
+        minGSSize    = 50,
+        maxGSSize    = 1000
+    )
+    
+    if (is.null(ego_broad) || nrow(ego_broad@result %>% filter(pvalue < 0.05)) == 0) {
+        cat(paste0("  No significant broad terms for ", ct, ", relaxing...\n"))
+        ego_broad <- enrichGO(
+            gene         = curated_gene_list[[ct]],
+            OrgDb        = org.Dm.eg.db,
+            keyType      = "SYMBOL",
+            ont          = "BP",
+            pAdjustMethod = "none",
+            pvalueCutoff = 0.2,
+            qvalueCutoff = 0.5,
+            minGSSize    = 30,
+            maxGSSize    = 1500
+        )
+    }
+    
+    if (!is.null(ego_broad) && nrow(ego_broad@result) > 0) {
+        ego_broad_simple <- simplify(ego_broad, cutoff = 0.4, by = "pvalue", select_fun = min)
+        
+        df_broad <- ego_broad_simple@result %>% 
+            filter(pvalue < 0.05) %>%
+            arrange(pvalue) %>% 
+            head(10)
+        
+        if (nrow(df_broad) < 5) {
+            ego_broad_simple2 <- simplify(ego_broad, cutoff = 0.6, by = "pvalue", select_fun = min)
+            df_broad <- ego_broad_simple2@result %>% 
+                filter(pvalue < 0.05) %>%
+                arrange(pvalue) %>% 
+                head(10)
+        }
+        
+        if (nrow(df_broad) > 0) {
+            df_broad$Cluster <- ct
+            broad_results[[ct]] <- df_broad
+            cat(paste0("  Kept ", nrow(df_broad), " broad terms\n"))
+        }
+    }
+}
+
+broad_all <- bind_rows(broad_results)
+
+if (nrow(broad_all) > 0) {
+    broad_all$GeneRatio_num <- sapply(broad_all$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    broad_all$Description <- str_wrap(broad_all$Description, width = 45)
+    broad_all$Cluster <- factor(broad_all$Cluster, levels = target_cts_sc)
+    
+    broad_all <- broad_all %>% 
+        group_by(Cluster) %>% 
+        mutate(Rank = row_number()) %>% 
+        ungroup()
+    
+    term_order_broad <- broad_all %>% 
+        arrange(factor(Cluster, levels = target_cts_sc), Rank) %>% 
+        pull(Description) %>% 
+        unique()
+    
+    broad_all$Description <- factor(broad_all$Description, levels = rev(term_order_broad))
+    
+    all_broad_terms <- unique(as.character(broad_all$Description))
+    
+    broad_compare <- compareCluster(geneCluster = curated_gene_list, fun = "enrichGO",
+                                     OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                                     ont = "BP", pAdjustMethod = "BH", 
+                                     pvalueCutoff = 0.5, minGSSize = 50, maxGSSize = 1000)
+    
+    cross_broad <- broad_compare@compareClusterResult %>%
+        mutate(Description = str_wrap(Description, width = 45)) %>%
+        filter(Description %in% all_broad_terms, p.adjust < 0.05)
+    
+    cross_broad$GeneRatio_num <- sapply(cross_broad$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    cross_broad$Cluster <- factor(cross_broad$Cluster, levels = target_cts_sc)
+    cross_broad$Description <- factor(cross_broad$Description, levels = rev(term_order_broad))
+    cross_broad <- cross_broad %>% filter(!is.na(Description))
+    
+    p_broad <- ggplot(cross_broad, aes(x = Cluster, y = Description, 
+                                        size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "Adjusted\np-value") +
+        scale_size_continuous(range = c(2, 8), name = "Gene Ratio") +
+        theme_minimal(base_size = 12) +
+        labs(title = "Broad GO Biological Processes",
+             subtitle = "High-level umbrella terms (minGSSize=50, maxGSSize=1000, simplify=0.4)",
+             y = "", x = "") +
+        theme(
+            axis.text.x = element_text(size = 12, face = "bold", angle = 90, vjust = 0.5, hjust = 1),
+            axis.text.y = element_text(size = 10),
+            panel.grid.major.x = element_line(linetype = "dotted", color = "grey80"),
+            panel.border = element_rect(color = "black", fill = NA),
+            plot.title = element_text(face = "bold", size = 14),
+            plot.subtitle = element_text(size = 10, color = "grey40")
+        )
+    
+    ggsave("../figures/3D_glo/SC_Broad_GO_Dotplot.png", p_broad, width = 12, height = 16)
+    print(p_broad)
+    cat("Broad GO dotplot saved!\n")
+}
+
+cat("\n========== ALL CURATED GO ANALYSES COMPLETE ==========\n")
+
+# ========== SPECIFIC VIEW: very granular metabolic processes ==========
+cat("\n\n========== SPECIFIC METABOLIC GO ENRICHMENT ==========\n")
+
+specific_results <- list()
+
+for (ct in names(curated_gene_list)) {
+    cat(paste0("\n--- Specific Processing: ", ct, " ---\n"))
+    
+    ego_spec <- enrichGO(
+        gene         = curated_gene_list[[ct]],
+        OrgDb        = org.Dm.eg.db,
+        keyType      = "SYMBOL",
+        ont          = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.1,
+        minGSSize    = 3,
+        maxGSSize    = 500
+    )
+    
+    if (is.null(ego_spec) || nrow(ego_spec@result %>% filter(p.adjust < 0.05)) == 0) {
+        cat(paste0("  No significant specific terms for ", ct, ", relaxing maxGSSize...\n"))
+        ego_spec <- enrichGO(
+            gene         = curated_gene_list[[ct]],
+            OrgDb        = org.Dm.eg.db,
+            keyType      = "SYMBOL",
+            ont          = "BP",
+            pAdjustMethod = "BH",
+            pvalueCutoff = 0.1,
+            qvalueCutoff = 0.2,
+            minGSSize    = 3,
+            maxGSSize    = 800
+        )
+    }
+    
+    if (!is.null(ego_spec) && nrow(ego_spec@result) > 0) {
+        # Keep unsimplified results to rescue metal/transport terms
+        unsimplified_df <- ego_spec@result %>% filter(p.adjust < 0.05)
+        
+        ego_spec_simple <- simplify(ego_spec, cutoff = 0.7, by = "p.adjust", select_fun = min)
+        
+        df_spec <- ego_spec_simple@result %>% 
+            filter(p.adjust < 0.05) %>%
+            arrange(p.adjust) %>% 
+            head(15)
+        
+        if (nrow(df_spec) < 5) {
+            ego_spec_simple2 <- simplify(ego_spec, cutoff = 0.85, by = "p.adjust", select_fun = min)
+            df_spec <- ego_spec_simple2@result %>% 
+                filter(p.adjust < 0.05) %>%
+                arrange(p.adjust) %>% 
+                head(15)
+        }
+        
+        # Rescue: if simplify collapsed away key metal/transport terms, force them back
+        metal_pattern <- "iron|copper|zinc|metal|ferr|siderophore|transition metal"
+        metal_terms <- unsimplified_df %>% 
+            filter(str_detect(tolower(Description), metal_pattern)) %>%
+            arrange(p.adjust) %>% head(3)
+        
+        if (nrow(metal_terms) > 0) {
+            new_metal <- metal_terms %>% filter(!Description %in% df_spec$Description)
+            if (nrow(new_metal) > 0) {
+                df_spec <- rbind(df_spec, new_metal) %>% 
+                    distinct(Description, .keep_all = TRUE) %>%
+                    arrange(p.adjust) %>% 
+                    head(15)
+                cat(paste0("  Rescued ", nrow(new_metal), " metal/transport terms for ", ct, "\n"))
+            }
+        }
+        
+        df_spec <- head(df_spec, 15)
+        
+        if (nrow(df_spec) > 0) {
+            df_spec$Cluster <- ct
+            specific_results[[ct]] <- df_spec
+            cat(paste0("  Kept ", nrow(df_spec), " specific terms\n"))
+        }
+    }
+}
+
+specific_all <- bind_rows(specific_results)
+
+if (nrow(specific_all) > 0) {
+    specific_all$GeneRatio_num <- sapply(specific_all$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    specific_all$Description <- str_wrap(specific_all$Description, width = 45)
+    specific_all$Cluster <- factor(specific_all$Cluster, levels = target_cts_sc)
+    
+    specific_all <- specific_all %>% 
+        group_by(Cluster) %>% 
+        mutate(Rank = row_number()) %>% 
+        ungroup()
+    
+    term_order_spec <- specific_all %>% 
+        arrange(factor(Cluster, levels = target_cts_sc), Rank) %>% 
+        pull(Description) %>% 
+        unique()
+    
+    specific_all$Description <- factor(specific_all$Description, levels = rev(term_order_spec))
+    
+    all_spec_terms <- unique(as.character(specific_all$Description))
+    
+    spec_compare <- compareCluster(geneCluster = curated_gene_list, fun = "enrichGO",
+                                    OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                                    ont = "BP", pAdjustMethod = "BH", 
+                                    pvalueCutoff = 0.5, minGSSize = 3, maxGSSize = 200)
+    
+    cross_spec <- spec_compare@compareClusterResult %>%
+        mutate(Description = str_wrap(Description, width = 45)) %>%
+        filter(Description %in% all_spec_terms, p.adjust < 0.05)
+    
+    cross_spec$GeneRatio_num <- sapply(cross_spec$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    cross_spec$Cluster <- factor(cross_spec$Cluster, levels = target_cts_sc)
+    cross_spec$Description <- factor(cross_spec$Description, levels = rev(term_order_spec))
+    cross_spec <- cross_spec %>% filter(!is.na(Description))
+    
+    p_specific <- ggplot(cross_spec, aes(x = Cluster, y = Description, 
+                                          size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "Adjusted\np-value") +
+        scale_size_continuous(range = c(2, 8), name = "Gene Ratio") +
+        theme_minimal(base_size = 12) +
+        labs(title = "Specific Metabolic GO Processes",
+             subtitle = "Fine-grained metabolic terms (minGSSize=3, maxGSSize=200)",
+             y = "", x = "") +
+        theme(
+            axis.text.x = element_text(size = 12, face = "bold", angle = 90, vjust = 0.5, hjust = 1),
+            axis.text.y = element_text(size = 10),
+            panel.grid.major.x = element_line(linetype = "dotted", color = "grey80"),
+            panel.border = element_rect(color = "black", fill = NA),
+            plot.title = element_text(face = "bold", size = 14),
+            plot.subtitle = element_text(size = 10, color = "grey40")
+        )
+    
+    ggsave("../figures/3D_glo/SC_Specific_Metabolic_GO_Dotplot.png", p_specific, width = 12, height = 16)
+    print(p_specific)
+    cat("Specific metabolic GO dotplot saved!\n")
+}
+
+cat("\n========== ALL GO ANALYSES COMPLETE ==========\n")
+```
+
+## 6. Targeted Metal/Ion Transport GO Activity
+
+This section focuses exclusively on ItC, Copper, and Iron cells — the three metal-handling cell types of the midgut — to extract GO terms related to copper, iron, zinc, and generic ion/metal transport.
+
+```{r metal_ion_go, fig.width=10, fig.height=14}
+cat("\n\n========== METAL/ION TRANSPORT GO ACTIVITY ==========\n")
+
+# Subset curated_gene_list to only the 3 metal-relevant cell types
+metal_cts <- c("ItC (ZIP42C pos mEC)", "Copper", "Iron")
+metal_gene_list <- curated_gene_list[metal_cts]
+cat("Gene counts for metal cell types:\n")
+print(lengths(metal_gene_list))
+
+# Run a dedicated compareCluster with small gene-set sizes to capture specific metal terms
+metal_compare <- compareCluster(geneCluster = metal_gene_list, fun = "enrichGO",
+                                OrgDb = org.Dm.eg.db, keyType = "SYMBOL",
+                                ont = "BP", pAdjustMethod = "BH", 
+                                pvalueCutoff = 1.0, minGSSize = 3, maxGSSize = 500)
+
+metal_df <- metal_compare@compareClusterResult
+
+# Filter for metal/ion related terms that are significant
+metal_pattern <- "iron|copper|zinc|metal|ferr|siderophore|transition metal|ion transport|cation|anion transport|calcium|potassium|sodium|proton|transmembrane transport|homeostasis|detoxif|oxidat|redox|v-type|vacuolar"
+metal_filtered <- metal_df %>% 
+    filter(str_detect(tolower(Description), metal_pattern), p.adjust < 0.05)
+
+cat(paste0("Total significant metal/ion terms found: ", nrow(metal_filtered), "\n"))
+
+if (nrow(metal_filtered) > 0) {
+    # Pick top 20 unique terms per cell type, prioritising cell-type specificity
+    metal_counts <- metal_filtered %>% group_by(Description) %>% summarise(n_cts = n())
+    
+    metal_top <- metal_filtered %>%
+        left_join(metal_counts, by = "Description") %>%
+        group_by(Cluster) %>%
+        arrange(n_cts, p.adjust) %>%
+        slice_head(n = 20) %>%
+        ungroup()
+    
+    # Keep only the selected terms, but show cross-enrichment across all 3 cell types
+    selected_terms <- unique(metal_top$Description)
+    plot_data_metal <- metal_filtered %>% filter(Description %in% selected_terms)
+    
+    # Parse GeneRatio
+    plot_data_metal$GeneRatio_num <- sapply(plot_data_metal$GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        if(length(parts) == 2) parts[1] / parts[2] else 0
+    })
+    
+    plot_data_metal$Description <- str_wrap(plot_data_metal$Description, width = 55)
+    plot_data_metal$Cluster <- factor(plot_data_metal$Cluster, levels = metal_cts)
+    
+    # Order terms by cell type where they are most significant
+    term_ordering_df <- plot_data_metal %>%
+        group_by(Description) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 1) %>%
+        ungroup() %>%
+        arrange(factor(Cluster, levels = metal_cts), p.adjust)
+    
+    term_order_metal <- term_ordering_df$Description
+    plot_data_metal$Description <- factor(plot_data_metal$Description, levels = rev(term_order_metal))
+    
+    p_metal <- ggplot(plot_data_metal, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "Adjusted\np-value") +
+        theme_minimal(base_size = 12) +
+        labs(title = "Metal & Ion Transport GO Activity",
+             subtitle = "ItC, Copper and Iron cells — significant terms only (p.adjust < 0.05)",
+             size = "Gene Ratio", y = "", x = "") +
+        theme(
+            axis.text.x = element_text(size = 12, face = "bold"),
+            axis.text.y = element_text(size = 9),
+            panel.grid.major.x = element_line(linetype = "dotted", color = "grey80"),
+            panel.border = element_rect(color = "black", fill = NA)
+        )
+    
+    ggsave("../figures/3D_glo/SC_Metal_Ion_GO_Dotplot.png", p_metal, width = 10, height = 14, bg = "white")
+    print(p_metal)
+    cat("Metal/Ion GO dotplot saved to SC_Metal_Ion_GO_Dotplot.png!\n")
+} else {
+    cat("No significant metal/ion GO terms found.\n")
+}
+
+cat("\n========== SCRIPT FULLY COMPLETE ==========\n")
+```

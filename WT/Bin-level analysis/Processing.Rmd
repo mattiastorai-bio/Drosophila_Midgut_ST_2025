@@ -1,0 +1,694 @@
+---
+title: "Preprocessing"
+output: html_document
+date: "2025-11-25"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(Matrix)
+library(spacexr)
+library(Matrix.utils)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(ggspavis)
+```
+
+```{r}
+# Define the full path to your .tar file
+#tar_file_path <- "/home/mattia/Thesis/Single-cell/GSE276185_RAW.tar"
+
+# Define a directory where you want to extract the files.
+# It's best practice to create a new, empty directory for extraction.
+#extract_dir <- "GSE276185_extracted"
+
+# Create the extraction directory if it doesn't exist
+#dir.create(extract_dir)
+
+# Extract the .tar file contents
+# 'tarfile': path to the archive
+# 'exdir': directory where files will be extracted
+# For compressed files like .tar.gz, R often automatically detects compression.
+#untar(tarfile = tar_file_path, exdir = extract_dir)
+
+# Check what files were extracted
+#list.files(extract_dir, recursive = TRUE)
+```
+
+```{r}
+# --- Step 2a: Define the directory containing the matrix files ---
+# You need to find the specific subdirectory within 'extract_dir' that holds the three required files.
+# Let's assume the files are directly in a subdirectory named 'sample1' after extraction.
+#data_dir <- "/home/mattia/Thesis/Single-cell/GSE276185_extracted/Ctrl/" 
+
+# Barcodes file path
+#barcodes_file <- file.path(data_dir, "GSM8492747_CtrlKO_DS-000A1_rep1_barcodes.tsv.gz") 
+
+# Matrix file path (usually ends with .mtx or .mtx.gz)
+#matrix_file <- file.path(data_dir, "GSM8492747_CtrlKO_DS-000A1_rep1_matrix.mtx.gz") 
+
+# Features/Genes file path (usually ends with .tsv or .tsv.gz)
+#features_file <- file.path(data_dir, "GSM8492747_CtrlKO_DS-000A1_rep1_features.tsv.gz")
+
+# The external metadata file
+#metadata_file <- "/home/mattia/Thesis/Single-cell/GSE276185_extracted/Ctrl/GSM8492747_CtrlKO_rep1_DS-000A1_QCed_metadata.tsv.gz"
+
+# --- B. Load the Metadata File ---
+#external_meta <- read.delim(
+ # file = metadata_file,
+  #header = TRUE,
+ # sep = "\t",
+  #row.names = 1 # **Crucial: Cell Barcodes must be the row names**
+#)
+```
+
+```{r}
+# Read the sparse matrix file (the main count data)
+#raw_matrix <- readMM(file = matrix_file)
+
+# Read the features/genes file
+#feature_names <- read.delim(
+ # file = features_file,
+ # header = FALSE,
+  #stringsAsFactors = FALSE
+#)
+
+# Read the barcodes file
+#barcode_names <- read.delim(
+ # file = barcodes_file,
+  #header = FALSE,
+  #stringsAsFactors = FALSE
+#)
+
+```
+
+```{r}
+# 1. Assign row names (Features/Genes) to the matrix
+# Use the second column of the features file (gene symbol) or the first (Ensembl ID), 
+# depending on which is the most descriptive. We'll use the second column [ , 2]
+#rownames(raw_matrix) <- feature_names[, 2] 
+
+# 2. Assign column names (Barcodes) to the matrix
+# Barcodes are typically in the first column [ , 1]
+#colnames(raw_matrix) <- barcode_names[, 1]
+
+# 3. Inspect the resulting matrix structure
+#print(paste("Dimensions of the matrix (Genes x Cells):", dim(raw_matrix)[1], "x", dim(raw_matrix)[2]))
+```
+
+```{r}
+#seurat_object <- CreateSeuratObject(
+ # counts = raw_matrix,
+ # project = "GSM8492747_Sample",
+  #min.cells = 3,         # Filter out genes expressed in < 3 cells
+  #min.features = 200     # Filter out cells with < 200 genes
+#)
+
+# Check the number of cells/features
+#seurat_object
+```
+
+```{r}
+# --- 2. Standardize Metadata Barcodes (THE FIX) ---
+# Remove the trailing suffix (e.g., -1, .1, etc.) from the row names of the metadata table.
+# This assumes the suffix is a period or dash followed by a digit at the end of the string.
+#rownames(external_meta) <- gsub("([\\.-][0-9]+)$", "", rownames(external_meta))
+
+# --- 3. Filter for Common Cells ---
+# Identify cells present in *both* the Seurat object and the modified external metadata
+#common_cells <- intersect(colnames(seurat_object), rownames(external_meta))
+
+# Subset the Seurat object to only include cells that are in the external metadata
+#seurat_object <- subset(seurat_object, cells = common_cells)
+
+# --- 4. Filter and Order Metadata ---
+# Subset the metadata to only include the common cells and order them to match the Seurat object
+#external_meta_filtered <- external_meta[colnames(seurat_object), ]
+
+# Final check: This MUST be TRUE
+#if(all(colnames(seurat_object) == rownames(external_meta_filtered))){
+  #  print("Barcodes match and are correctly ordered. Proceeding to add metadata.")
+#} else {
+  #  stop("Error: Cell barcodes still do not match or are not in the correct order. Check your barcode standardization steps.")
+#}
+
+# --- 5. Add Metadata to Seurat Object ---
+#seurat_object <- AddMetaData(
+ # object = seurat_object,
+  #metadata = external_meta_filtered
+#)
+
+seurat_object <- readRDS("/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds")
+
+# Verify the new columns are present
+head(seurat_object@meta.data)
+```
+
+```{r}
+# View the distribution of Mito_pct to determine the cut-off
+VlnPlot(seurat_object, features = "Mito_pct", pt.size = 0.1)
+
+# --- Define Filtering Thresholds (Adjust based on your VlnPlot) ---
+max_mt_percent <- 10  # Example: Filter cells with > 10% mitochondrial counts
+
+# Filter the object
+seurat_filtered <- subset(seurat_object, subset = 
+    Mito_pct < max_mt_percent
+)
+
+print(paste("Cells remaining after Mito filtering:", ncol(seurat_filtered)))
+```
+
+```{r}
+# Normalize data using the default LogNormalize method
+seurat_filtered <- NormalizeData(seurat_filtered, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Find highly variable features (HVGs)
+seurat_filtered <- FindVariableFeatures(seurat_filtered, selection.method = "vst", nfeatures = 2000)
+
+# Optional: Visualize the top variable features
+top10 <- head(VariableFeatures(seurat_filtered), 10)
+VariableFeaturePlot(seurat_filtered)
+LabelPoints(plot = VariableFeaturePlot(seurat_filtered), points = top10, repel = TRUE)
+```
+
+```{r}
+# Scale the data based on the HVGs
+# We skip regressing out effects like Mito_pct here, but it's often a good idea!
+seurat_filtered <- ScaleData(seurat_filtered, features = VariableFeatures(seurat_filtered))
+
+# Run PCA
+seurat_filtered <- RunPCA(seurat_filtered, features = VariableFeatures(object = seurat_filtered), npcs = 50)
+
+# Visualize the PCs to determine the optimal number (e.g., using the Elbow Plot)
+ElbowPlot(seurat_filtered, ndims = 50)
+```
+
+```{r}
+# Set the number of PCs to use for clustering (e.g., 20)
+num_pcs <- 20 
+resolution_value <- 0.5 # A common starting resolution for clustering
+
+# Find Neighbors (Build the KNN Graph)
+seurat_filtered <- FindNeighbors(seurat_filtered, dims = 1:num_pcs)
+
+# Find Clusters (Clustering)
+seurat_filtered <- FindClusters(seurat_filtered, resolution = resolution_value)
+
+# Run UMAP for 2D visualization
+seurat_filtered <- RunUMAP(seurat_filtered, dims = 1:num_pcs)
+
+# Plot the final UMAP colored by the new clusters
+DimPlot(seurat_filtered, reduction = "umap", label = TRUE) + 
+  ggtitle(paste0("UMAP, Resolution = ", resolution_value))
+
+#saveRDS(seurat_filtered, file = "filtered_sc.rds", compress = TRUE)
+```
+
+```{r}
+spatial_counts <- GetAssayData(seurat_obj, assay = "Spatial.016um", layer = "counts")
+sc_counts <- GetAssayData(seurat_filtered, assay = "RNA", layer = "counts")
+
+## 1. Extract Gene Names
+spatial_genes_raw <- rownames(spatial_counts)
+sc_genes_raw <- rownames(sc_counts)
+
+## 2. Aggressive Cleaning and Harmonization
+# a. Remove anything after a period (e.g., EnsEMBL version numbers like '.1', '.2')
+# b. Convert all names to uppercase for case-insensitivity
+spatial_genes_clean <- toupper(gsub("\\..*$", "", spatial_genes_raw))
+sc_genes_clean <- toupper(gsub("\\..*$", "", sc_genes_raw))
+
+# c. Assign the clean names back to the matrices' rownames
+rownames(spatial_counts) <- spatial_genes_clean
+rownames(sc_counts) <- sc_genes_clean
+
+## 3. Determine the Valid Intersection
+common_genes <- intersect(rownames(spatial_counts), rownames(sc_counts))
+
+## 4. Check for Duplicates (Crucial Safety Check)
+# If duplicates exist after cleaning (e.g., ENSG.1 and ENSG.2 both became ENSG), 
+# you should handle them (e.g., aggregate/sum the counts) before proceeding.
+cat("Number of duplicated gene names in spatial data after cleaning:", 
+    sum(duplicated(rownames(spatial_counts))), "\n")
+cat("Number of duplicated gene names in single-cell data after cleaning:", 
+    sum(duplicated(rownames(sc_counts))), "\n")
+# If the output above is 0, proceed to the next step (5).
+
+## 5. Filter the Matrices (The step that previously failed)
+# R will now filter the matrices and automatically put the common genes 
+# in the order of the 'common_genes' vector.
+spatial_counts_filtered <- spatial_counts[common_genes, ]
+sc_counts_filtered <- sc_counts[common_genes, ]
+
+cat("Gene filtering complete. Both filtered matrices now have", 
+    nrow(spatial_counts_filtered), "common genes.\n")
+```
+
+```{r}
+# The dMeltAndSum is the most robust way to aggregate
+spatial_counts_agg <- Matrix.utils::aggregate.Matrix(
+    spatial_counts, 
+    group = rownames(spatial_counts), 
+    fun = "sum"
+)
+
+# Optional: verify the number of rows is now correct (no duplicates)
+cat("Spatial rows before aggregation:", nrow(spatial_counts), "\n")
+cat("Spatial rows after aggregation:", nrow(spatial_counts_agg), "\n")
+```
+
+```{r}
+sc_counts_agg <- Matrix.utils::aggregate.Matrix(
+    sc_counts, 
+    group = rownames(sc_counts), 
+    fun = "sum"
+)
+
+# Optional: verify the number of rows is now correct (no duplicates)
+cat("Single-Cell rows before aggregation:", nrow(sc_counts), "\n")
+cat("Single-Cell rows after aggregation:", nrow(sc_counts_agg), "\n")
+```
+
+```{r}
+# Recalculate common genes using the aggregated matrix row names
+common_genes_final <- intersect(rownames(spatial_counts_agg), rownames(sc_counts_agg))
+
+# Final filtering (this will now work without error and with correct counts)
+spatial_counts_filtered <- spatial_counts_agg[common_genes_final, ]
+sc_counts_filtered <- sc_counts_agg[common_genes_final, ]
+
+cat("Final filtering complete. Both matrices now have", 
+    nrow(spatial_counts_filtered), "correctly aggregated common genes.\n")
+```
+
+```{r}
+# 1. Extract Single-Cell Annotations
+# Adjust 'cell_type_column' if your Seurat metadata column has a different name
+cell_type_column <- "celltype"   #region_prediction
+cell_types <- seurat_filtered@meta.data[[cell_type_column]]
+cell_types <- as.factor(cell_types)
+
+# Ensure the names of the cell types vector match the cell barcodes of the filtered matrix
+names(cell_types) <- colnames(sc_counts_filtered)
+
+# 2. Extract Spatial Coordinates
+# Ensure the coordinates are extracted and ordered to match the spots in the filtered matrix
+coords <- GetTissueCoordinates(seurat_obj)
+coords <- coords[colnames(spatial_counts_filtered), ] # Reorder/filter to match spots
+coords2 <- coords[, c("x", "y")]
+```
+
+```{r}
+## 1. Specify the Cell Type Column 
+sc_meta_data <- seurat_filtered@meta.data
+
+if (!cell_type_column %in% colnames(sc_meta_data)) {
+    stop(paste0("ERROR: Column '", cell_type_column, 
+                "' not found in seurat_filtered@meta.data."))
+}
+
+cell_types_raw <- sc_meta_data[[cell_type_column]]
+
+## 2. Robust Filtering Logic
+unassigned_placeholders <- c("", "NA", "Unassigned", "Unknown", "None", "-")
+
+is_valid_row <- !is.na(cell_types_raw) & 
+                !(as.character(cell_types_raw) %in% unassigned_placeholders)
+
+valid_meta_data <- sc_meta_data[is_valid_row, ]
+
+valid_barcodes <- rownames(valid_meta_data)
+
+if (length(valid_barcodes) == 0) {
+    stop("FATAL ERROR: All cells were filtered out by the 'unassigned_placeholders' check.")
+}
+
+## 3. Final Preparation of Single-Cell Components
+sc_counts_filtered_valid <- sc_counts_filtered[, intersect(colnames(sc_counts_filtered), valid_barcodes)]
+
+final_barcodes <- colnames(sc_counts_filtered_valid)
+
+cell_types <- factor(valid_meta_data[final_barcodes, cell_type_column])
+names(cell_types) <- final_barcodes
+
+if (length(levels(cell_types)) < 2) {
+    stop(paste0("Error: Only ", length(levels(cell_types)), 
+                " cell type(s) remain. RCTD requires at least two cell types."))
+}
+
+cat("Success! Reference data prepared with", length(final_barcodes), 
+    "cells and", length(levels(cell_types)), "cell types.\n")
+
+```
+
+```{r}
+## 4. Prepare colData and SummarizedExperiment
+ref_colData <- data.frame(
+    row.names = final_barcodes,
+    cell_type = cell_types 
+)
+
+reference_experiment <- SummarizedExperiment(
+    assays = list(counts = sc_counts_filtered_valid),
+    colData = ref_colData
+)
+
+all_spatial_meta <- seurat_obj@meta.data
+
+spatial_colData <- all_spatial_meta[colnames(spatial_counts_filtered), ]
+
+cat("Spatial colData created for", nrow(spatial_colData), "spots.\n")
+
+# 3. Create the SpatialExperiment object with the fixed numeric matrix
+spatial_experiment <- SpatialExperiment(
+    assays = list(counts = spatial_counts_filtered),
+    colData = spatial_colData,
+    spatialCoords = as.matrix(coords2) # spatialCoords must be a numeric matrix
+)
+
+cat("SpatialExperiment object created successfully after coordinate conversion!\n")
+saveRDS(spatial_experiment, "../Random data/spatial_experiment.rds")
+```
+
+```{r}
+
+myRCTD <- spacexr::createRctd(
+    spatial_experiment = spatial_experiment,
+    reference_experiment = reference_experiment,
+    cell_type_col = "cell_type"
+ 
+)
+
+# 2. Run the deconvolution
+myRCTD <- spacexr::runRctd(myRCTD)
+
+# --- SAVE RESULT FOR GUT SELECTION TOOL ---
+if (!dir.exists("../Random data")) dir.create("../Random data")
+saveRDS(myRCTD, "../Random data/myRCTD_spatial_bins_results.rds")
+cat("RCTD results saved to ../Random data/myRCTD_spatial_bins_results.rds\n")
+
+cat("RCTD deconvolution complete. Results are stored in 'myRCTD'.\n")
+```
+
+```{r}
+# Extract the main proportion matrix (Cell types x Spots)
+# NOTE: The way you access assays in a SummarizedExperiment/SpatialExperiment is
+# generally with 'assay()' or '@assays$'
+proportions_df <- as.data.frame(assay(myRCTD, "weights"))
+head(proportions_df[, 1:5])
+```
+
+```{r}
+# Extract the spot classification vector
+spot_classes <- colData(myRCTD)$spot_class
+print("Spot Classification Summary:")
+print(table(spot_classes))
+
+# Ensure the classification column is a factor
+colData(myRCTD)$spot_class <- as.factor(colData(myRCTD)$spot_class)
+
+# Use the correct argument: 'annotate', and disable the filter
+plotCoords(myRCTD, annotate = "spot_class", point_size = 1.5, in_tissue = NULL) +
+    ggplot2::ggtitle("RCTD Spot Classifications")
+```
+
+```{r}
+# NEW LINE: Get the list of all cell types from the assay row names
+all_plottable_cell_types <- rownames(assay(myRCTD, "weights"))
+
+# Print the list to the console so you can see them:
+print(all_plottable_cell_types)
+```
+
+```{r}
+# 1. Define the cell type and ensure its proportion data is in colData
+cell_type_to_plot <- "Copper" 
+colData(myRCTD)[[cell_type_to_plot]] <- assay(myRCTD, "weights")[cell_type_to_plot, ]
+
+# 2. Prepare data frame: Combine colData (metadata) and spatialCoords
+plot_data <- data.frame(
+    colData(myRCTD),
+    spatialCoords(myRCTD)
+)
+```
+
+```{r}
+ggplot(plot_data, aes(x = x, y = y, color = !!rlang::sym(cell_type_to_plot))) +
+    geom_point(size = 1.5) +
+    scale_color_viridis_c(name = "Proportion") + # Use a continuous color scale
+    coord_fixed() + # Ensures the spatial aspect ratio is correct
+    theme_void() + # Removes axes and background for a clean spatial look
+    ggtitle(paste0("Proportion of ", cell_type_to_plot))
+```
+
+```{r}
+# 1. Extract the spot classification vector
+spot_classes <- colData(myRCTD)$spot_class
+if (is.null(spot_classes)) {
+    # If it's not in colData
+    if (!is.null(myRCTD@colData@listData$spot_class)) {
+        spot_classes <- myRCTD@colData@listData$spot_class
+    } else {
+        stop("Error: 'spot_class' could not be found in myRCTD@colData.")
+    }
+}
+
+# 2. Define the mapping for cell count approximation
+# Note: For multi, we conservatively use 3, but the true number can be higher.
+cell_count_map <- c(
+    "singlet" = 1,
+    "doublet" = 2,
+    "doublet_certain" = 2,
+    "doublet_uncertain" = 2,
+    "multi" = 3,
+    "multi_certain" = 3,
+    "multi_uncertain" = 3,
+    "reject" = 0,
+    "neg_pred" = 0 # Spots where no cell type was predicted
+)
+
+# 3. Apply the mapping to create the approximated n_cells vector
+approx_n_cells_per_spot <- cell_count_map[as.character(spot_classes)]
+# Handle any NA that might occur if a class is not in the map (shouldn't happen)
+approx_n_cells_per_spot[is.na(approx_n_cells_per_spot)] <- 0
+
+# Store this approximation back into colData for consistency (optional)
+colData(myRCTD)$approx_n_cells <- approx_n_cells_per_spot
+```
+
+```{r}
+# --- Recalculate the estimation using the approximated counts ---
+
+# Calculate the total estimated cell number across the entire dataset
+total_estimated_cells_approx <- sum(approx_n_cells_per_spot)
+
+cat("\n## Estimated Total Cell Number (Approximated)\n")
+cat("Estimated total number of cells in the entire dataset (based on spot_class):", round(total_estimated_cells_approx), "\n")
+cat("Summary of approximated cells per spot:\n")
+print(table(approx_n_cells_per_spot))
+print(summary(approx_n_cells_per_spot))
+
+# 1. Get the proportion matrix (Cell types x Spots)
+proportions_matrix <- assay(myRCTD, "weights_full")
+
+# 2. Use the approximated total number of cells per spot
+n_cells_per_spot_vector <- approx_n_cells_per_spot
+
+# 3. Calculate the cell count matrix: Cell Count = Proportion * Approx_Total_Count
+cell_count_matrix_approx <- sweep(proportions_matrix, MARGIN = 2, STATS = n_cells_per_spot_vector, FUN = "*")
+
+# Calculate the total estimated cell number for each cell type across all spots
+cell_type_counts_approx <- rowSums(cell_count_matrix_approx)
+
+# Convert to a data frame for easy viewing and sorting
+cell_type_counts_df_approx <- data.frame(
+    Cell_Type = names(cell_type_counts_approx),
+    Estimated_Count = cell_type_counts_approx
+)
+
+# Sort by count
+cell_type_counts_df_approx <- cell_type_counts_df_approx[order(cell_type_counts_df_approx$Estimated_Count, decreasing = TRUE), ]
+
+cat("\n## Estimated Cell Number per Cell Type (Approximated)\n")
+# Print the results, rounding to the nearest whole number for cell counts
+cell_type_counts_df_approx$Estimated_Count <- round(cell_type_counts_df_approx$Estimated_Count)
+print(cell_type_counts_df_approx)
+```
+
+# 12. Sub-clustering the Reference for High-Resolution RCTD
+Objective: Generate 3 subclusters per cell type to resolve finer spatial patterns using RCTD.
+
+```{r sc_subclustering_rctd}
+if (exists("seurat_filtered")) {
+    print("Starting sub-clustering of SC reference (k=3)...")
+    
+    ct_col <- "celltype"
+    cell_types <- unique(seurat_filtered[[ct_col, drop = TRUE]])
+    
+    # Initialize container for new labels
+    subcluster_labels_rctd <- character(ncol(seurat_filtered))
+    names(subcluster_labels_rctd) <- colnames(seurat_filtered)
+    
+    for (ct in cell_types) {
+        print(paste("Sub-clustering:", ct))
+        cells_in_ct <- colnames(seurat_filtered)[seurat_filtered[[ct_col]] == ct]
+        
+        # We need enough cells to split into 3
+        n_cells <- length(cells_in_ct)
+        if (n_cells >= 10) {
+            # Extract subset
+            sub_srt <- subset(seurat_filtered, cells = cells_in_ct)
+            
+            # Re-process subset for fine-grained variance
+            sub_srt <- FindVariableFeatures(sub_srt, verbose = FALSE)
+            sub_srt <- ScaleData(sub_srt, verbose = FALSE)
+            
+            # PCA logic: npcs must be less than min(cells, features)
+            # We'll use 10 PCs or n_cells - 1, whichever is smaller
+            n_pcs_to_run <- min(n_cells - 1, 10)
+            
+            sub_srt <- RunPCA(sub_srt, 
+                              features = VariableFeatures(sub_srt), 
+                              npcs = n_pcs_to_run,
+                              verbose = FALSE)
+            
+            # K-means on PCA space
+            set.seed(42)
+            # Use all available PCs for k-means
+            km <- kmeans(sub_srt@reductions$pca@cell.embeddings, centers = 3)
+            
+            # Map back
+            subcluster_labels_rctd[cells_in_ct] <- paste0(ct, "_", km$cluster)
+        } else {
+            # Not enough cells, keep original label
+            subcluster_labels_rctd[cells_in_ct] <- ct
+        }
+    }
+    
+    seurat_filtered$Subcluster_RCTD <- factor(subcluster_labels_rctd)
+    print("Sub-clustering complete.")
+    print(table(seurat_filtered$Subcluster_RCTD))
+}
+```
+
+# 13. High-Resolution RCTD Deconvolution
+Objective: Re-run RCTD using the refined subcluster labels.
+
+```{r run_rctd_subclusters}
+if (exists("seurat_filtered") && exists("spatial_experiment")) {
+    print("Preparing RCTD Reference with Subclusters...")
+    
+    # 1. ROBUST FILTERING: RCTD requires >= 25 cells per cell type
+    cell_counts <- table(seurat_filtered$Subcluster_RCTD)
+    valid_subclusters <- names(cell_counts)[cell_counts >= 25]
+    
+    print(paste("Filtering subclusters. Kept:", length(valid_subclusters), "out of", length(cell_counts)))
+    if (length(valid_subclusters) < 2) {
+        stop("Fatal: Fewer than 2 subclusters have >= 25 cells. RCTD cannot run.")
+    }
+    
+    seurat_filtered_rctd <- subset(seurat_filtered, Subcluster_RCTD %in% valid_subclusters)
+    # Drop unused factor levels
+    seurat_filtered_rctd$Subcluster_RCTD <- factor(seurat_filtered_rctd$Subcluster_RCTD)
+    
+    # 2. Prepare Reference Experiment
+    sc_counts_sub <- GetAssayData(seurat_filtered_rctd, assay = "RNA", layer = "counts")
+    
+    sub_labels <- seurat_filtered_rctd$Subcluster_RCTD
+    # Names remain colnames of the subsetted object
+    
+    ref_colData_sub <- data.frame(
+        row.names = colnames(seurat_filtered_rctd),
+        cell_type = sub_labels
+    )
+    
+    reference_experiment_sub <- SummarizedExperiment(
+        assays = list(counts = sc_counts_sub),
+        colData = ref_colData_sub
+    )
+    
+    # 3. Setup RCTD
+    myRCTD_sub <- spacexr::createRctd(
+        spatial_experiment = spatial_experiment,
+        reference_experiment = reference_experiment_sub,
+        cell_type_col = "cell_type"
+    )
+    
+    # 3. Run RCTD
+    print("Running RCTD (Subclusters)...")
+    myRCTD_sub <- spacexr::runRctd(myRCTD_sub)
+    
+    # 4. Save Results
+    output_dir <- "/home/mattia/Thesis/111125ST_def/Random data"
+    saveRDS(myRCTD_sub, file.path(output_dir, "myRCTD_subclusters.rds"))
+    print("RCTD Subcluster Deconvolution complete.")
+}
+```
+
+# 14. Visualization: RCTD Subclusters
+Objective: Map subcluster proportions back to the tissue.
+
+```{r viz_rctd_subclusters}
+if (exists("myRCTD_sub")) {
+    print("Visualizing Subcluster RCTD Results...")
+    
+    # 1. Spot Class Distribution
+    plotCoords(myRCTD_sub, annotate = "spot_class", point_size = 1.2, in_tissue = NULL) +
+        ggtitle("RCTD Subcluster Classifications")
+    
+    # 2. Batch Abundance Maps (9 per window)
+    all_subclusters <- rownames(assay(myRCTD_sub, "weights"))
+    
+    # Exclude any generic labels if present
+    plot_sub_cols <- setdiff(all_subclusters, "unk")
+    
+    n_cols <- length(plot_sub_cols)
+    batch_size <- 9
+    n_batches <- ceiling(n_cols / batch_size)
+    
+    plot_df_sub <- data.frame(
+        colData(myRCTD_sub),
+        spatialCoords(myRCTD_sub)
+    )
+    
+    for (i in 1:n_batches) {
+        start <- (i - 1) * batch_size + 1
+        end <- min(i * batch_size, n_cols)
+        current_batch <- plot_sub_cols[start:end]
+        
+        print(paste("Plotting Batch", i, ":", paste(current_batch, collapse=", ")))
+        
+        plots <- lapply(current_batch, function(ct) {
+            # Add proportion to plot_df temporarily
+            df_temp <- plot_df_sub
+            df_temp$Prop <- assay(myRCTD_sub, "weights")[ct, rownames(df_temp)]
+            
+            ggplot(df_temp, aes(x = x, y = y, color = Prop)) +
+                geom_point(size = 1.2) +
+                scale_color_viridis_c(option = "magma") +
+                coord_fixed() +
+                theme_void() +
+                ggtitle(ct)
+        })
+        
+        # Combine and print
+        for(p in plots) print(p)
+    }
+}
+```
+
+

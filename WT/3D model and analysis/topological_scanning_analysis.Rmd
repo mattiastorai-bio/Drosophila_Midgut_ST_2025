@@ -1,0 +1,164 @@
+---
+title: "Topological Scanning Analysis (Starvation - 111125ST)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(Seurat)
+library(dplyr)
+library(clusterProfiler)
+library(org.Dm.eg.db) 
+library(GO.db) 
+
+seurat_obj_path <- "/home/mattia/Thesis/111125ST_def/Random data/merged_guts.rds"
+seurat_obj <- readRDS(seurat_obj_path)
+```
+
+## Generate Per-Cell GO Assay
+We convert GO Biological Process terms into a per-cell activity matrix using `AddModuleScore`. This allows us to perform "Differential GO Expression" exactly like standard gene DGE.
+
+```{r generate_go_assay}
+# 1. Fetch all GO-BP terms and their corresponding genes for Drosophila
+cat("Fetching GO-BP terms from org.Dm.eg.db...\n")
+go_data <- as.data.frame(org.Dm.egGO2ALLEGS)
+# Filter for Biological Process (BP)
+go_data <- go_data[go_data$Ontology == "BP", ]
+
+# Convert Entrez IDs to Gene Symbols
+gene_symbols <- select(org.Dm.eg.db, keys = as.character(go_data$gene_id), columns = "SYMBOL", keytype = "ENTREZID")
+go_data$SYMBOL <- gene_symbols$SYMBOL[match(go_data$gene_id, gene_symbols$ENTREZID)]
+go_data <- go_data[!is.na(go_data$SYMBOL), ]
+
+# Group genes by GO term
+go_list <- split(go_data$SYMBOL, go_data$go_id)
+
+# Filter GO terms by size (e.g., between 10 and 200 genes to avoid too broad or too narrow terms)
+go_list <- go_list[sapply(go_list, length) >= 10 & sapply(go_list, length) <= 200]
+cat(paste("Total filtered GO terms to score:", length(go_list), "\n"))
+
+# Due to Seurat's AddModuleScore limitations with massive lists, we process in chunks
+# (In a real massive run, UCell or escape packages might be faster, but AddModuleScore is native)
+cat("Calculating per-cell GO module scores. This may take a few minutes...\n")
+
+# To keep this script lightweight for the test, we could sample a subset of GO terms here, 
+# but we run all filtered terms for the full exhaustive analysis.
+go_scores <- list()
+chunk_size <- 50
+num_chunks <- ceiling(length(go_list) / chunk_size)
+
+for(i in 1:num_chunks) {
+  start_idx <- ((i-1) * chunk_size) + 1
+  end_idx <- min(i * chunk_size, length(go_list))
+  current_chunk <- go_list[start_idx:end_idx]
+  
+  # Calculate module scores
+  seurat_obj <- AddModuleScore(seurat_obj, features = current_chunk, name = "GO_Score_", ctrl = 5)
+  
+  # Extract the newly added score columns
+  new_cols <- paste0("GO_Score_", 1:length(current_chunk))
+  scores_chunk <- seurat_obj@meta.data[, new_cols, drop=FALSE]
+  colnames(scores_chunk) <- names(current_chunk)
+  
+  go_scores[[i]] <- scores_chunk
+  
+  # Remove the temporary columns from metadata to keep it clean
+  seurat_obj@meta.data <- seurat_obj@meta.data[, !colnames(seurat_obj@meta.data) %in% new_cols]
+}
+
+# Combine all chunk scores into a single matrix
+go_matrix <- do.call(cbind, go_scores)
+go_matrix <- t(go_matrix) # Genes (GO Terms) x Cells
+
+# Add as a new Assay to Seurat
+seurat_obj[["GO"]] <- CreateAssayObject(data = go_matrix)
+DefaultAssay(seurat_obj) <- "GO"
+cat("Successfully added 'GO' Assay to the Seurat object!\n")
+```
+
+## Define Sliding Windows
+We systematically divide the gut (10% to 90% pseudotime) into 10% overlapping windows.
+
+```{r define_windows}
+cell_pt <- seurat_obj$Spatial_Pseudotime
+
+# Start: 10, End: 90, Step: 5, Window Size: 10
+starts <- seq(10, 80, by = 5)
+ends <- starts + 10
+
+windows <- lapply(1:length(starts), function(i) c(starts[i], ends[i]))
+names(windows) <- paste0("Win_", starts, "_", ends)
+
+cat(paste("Generated", length(windows), "sliding windows.\n"))
+```
+
+## Exhaustive Pairwise Topological Scan
+We iterate through all pairs of windows separated by at least 10% pseudotime and identify Differentially Expressed GO Terms.
+
+```{r pairwise_scan}
+results_list <- list()
+summary_df <- data.frame(Pair = character(), Shared_GO_Terms = integer(), stringsAsFactors = FALSE)
+
+# Generate pairs
+for (i in 1:(length(windows) - 1)) {
+  for (j in (i + 1):length(windows)) {
+    
+    # Check topological distance (must be >= 10% apart)
+    # End of window 1 is windows[[i]][2]. Start of window 2 is windows[[j]][1].
+    # Distance between them: windows[[j]][1] - windows[[i]][2]
+    dist <- windows[[j]][1] - windows[[i]][2]
+    
+    if (dist >= 10) {
+      pair_name <- paste0(names(windows)[i], "_AND_", names(windows)[j])
+      
+      # Define cells in each segment
+      seg1_cells <- colnames(seurat_obj)[cell_pt >= windows[[i]][1] & cell_pt <= windows[[i]][2] & !is.na(cell_pt)]
+      seg2_cells <- colnames(seurat_obj)[cell_pt >= windows[[j]][1] & cell_pt <= windows[[j]][2] & !is.na(cell_pt)]
+      contact_cells <- c(seg1_cells, seg2_cells)
+      
+      if (length(contact_cells) > 20) {
+        ident_vec <- rep("Rest", ncol(seurat_obj))
+        names(ident_vec) <- colnames(seurat_obj)
+        ident_vec[contact_cells] <- "Contact"
+        Idents(seurat_obj) <- ident_vec
+        
+        # Run DGE on the GO Assay!
+        # Because these are module scores (usually ranging -1 to 1), logfc.threshold needs to be smaller 
+        # compared to raw RNA log counts. We look for highly specific GO terms.
+        markers <- FindMarkers(seurat_obj, ident.1 = "Contact", ident.2 = "Rest", 
+                               assay = "GO",
+                               min.pct = 0, # Module scores are continuous, min.pct doesn't apply well
+                               logfc.threshold = 0.05, 
+                               return.thresh = 0.05, 
+                               only.pos = TRUE)
+        
+        # Enforce expression in both sides (since module scores are continuous, we require a positive average score in both)
+        score_data <- GetAssayData(seurat_obj, assay = "GO", layer = "data")[rownames(markers), , drop=FALSE]
+        mean_seg1 <- rowMeans(score_data[, seg1_cells, drop=FALSE])
+        mean_seg2 <- rowMeans(score_data[, seg2_cells, drop=FALSE])
+        
+        valid_terms <- rownames(markers)[mean_seg1 > 0.05 & mean_seg2 > 0.05]
+        markers <- markers[valid_terms, , drop=FALSE]
+        
+        # Save results
+        if (nrow(markers) > 0) {
+          # Map GO IDs back to readable terms
+          term_names <- Term(GOTERM[rownames(markers)])
+          markers$Term_Name <- term_names
+          
+          results_list[[pair_name]] <- markers
+          summary_df <- rbind(summary_df, data.frame(Pair = pair_name, Shared_GO_Terms = nrow(markers)))
+        } else {
+          summary_df <- rbind(summary_df, data.frame(Pair = pair_name, Shared_GO_Terms = 0))
+        }
+      }
+    }
+  }
+}
+
+cat(paste("Finished scanning", nrow(summary_df), "distant region pairs.\n"))
+cat(paste("Found", sum(summary_df$Shared_GO_Terms > 0), "pairs with significant shared topological GO pathways!\n"))
+
+# Save the summary matrix
+write.csv(summary_df, "/home/mattia/Thesis/111125ST_def/Random data/Topological_Scanning_Summary.csv", row.names = FALSE)
+```

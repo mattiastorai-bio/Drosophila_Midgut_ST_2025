@@ -1,0 +1,444 @@
+---
+title: "Hierarchical Clustering of Regions"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(zoo)
+
+# Clustering and Gap Stat packages
+library(cluster)
+library(factoextra)
+library(dendextend)
+library(rioja)
+```
+
+## 1. Load Data
+```{r load_data}
+if (exists("merged_guts")) {
+    merged_guts_local <- merged_guts
+} else {
+    path_def <- "../../03Slide4/Random data/merged_guts.rds"
+    path_norm <- "../Random data/merged_guts.rds"
+    if (file.exists(path_norm)) {
+        cat("Loading merged_guts from", path_norm, "\n")
+        merged_guts_local <- readRDS(path_norm)
+    } else if (file.exists(path_def)) {
+        cat("Loading merged_guts from", path_def, "\n")
+        merged_guts_local <- readRDS(path_def)
+    } else {
+        stop("merged_guts not found in environment, and merged_guts.rds not found in Random data directory. Please load it manually.")
+    }
+}
+
+# Filter out ambiguous cells, similarly to previous analysis
+is_ambiguous <- grepl("ambiguous", merged_guts_local$Predicted_CellType, ignore.case = TRUE)
+clean_cells <- Cells(merged_guts_local)[!is_ambiguous]
+sub_guts <- subset(merged_guts_local, cells = clean_cells)
+
+cat("✓ Data loaded and cleaned.\n")
+```
+
+## 2. Binning Strategy & Missing Data Handling
+We apply the 2.5% binning strategy (40 bins) to the spatial pseudotime.
+
+```{r binning}
+# Define 40 bins (2.5% resolution)
+n_bins <- 107
+
+# --- Customizable Option ---
+# Set start_bin > 1 to remove early anterior/uninformative bins.
+# Example: 3 will remove bins 1 and 2.
+start_bin <- 7
+# -------------------------
+
+# Identify variable features
+var_genes <- VariableFeatures(sub_guts)
+if(length(var_genes) == 0) {
+    sub_guts <- FindVariableFeatures(sub_guts, nfeatures = 2000, verbose = FALSE)
+    var_genes <- VariableFeatures(sub_guts)
+}
+
+# Bin spatial pseudotime
+sub_guts$Bin <- factor(cut(sub_guts$Spatial_Pseudotime, breaks = n_bins, labels = FALSE), levels = 1:n_bins)
+
+# Calculate mean expression per bin
+exp_mat <- GetAssayData(sub_guts, layer = "data")[var_genes, ]
+bin_means <- t(apply(exp_mat, 1, function(x) tapply(x, sub_guts$Bin, mean, na.rm = TRUE)))
+
+# Handle missing data / tissue breaks
+# Transpose so rows are bins, columns are genes
+bin_mat <- t(bin_means)
+
+# Smoothing over NAs (tissue breaks)
+cat("Assessing tissue breaks and imputing missing bins...\n")
+library(zoo)
+
+# Z-scale per gene (column) and smooth
+bin_scaled <- apply(bin_mat, 2, function(x) {
+    if(all(is.na(x)) || sd(x, na.rm=T) == 0) return(rep(0, length(x)))
+    # Impute NAs with interpolation to cover tissue breaks before scaling
+    x_imputed <- na.approx(x, na.rm = FALSE) 
+    # If NAs at boundaries, carry forward/backward
+    x_imputed <- na.locf(na.locf(x_imputed, na.rm=FALSE), fromLast=TRUE, na.rm=FALSE)
+    
+    # Scale
+    scaled <- (x_imputed - mean(x_imputed, na.rm=T)) / sd(x_imputed, na.rm=T)
+    return(scaled)
+})
+
+# Any remaining NAs (e.g. all 0 genes) can be zeroed out
+bin_scaled[is.na(bin_scaled)] <- 0
+
+# Subset bins if start_bin > 1
+if (start_bin > 1) {
+    cat("Removing bins before bin:", start_bin, "\n")
+    bin_scaled <- bin_scaled[start_bin:nrow(bin_scaled), , drop = FALSE]
+}
+
+cat("✓ Applied 2.5% binning and handled gaps via interpolation.\n")
+```
+
+## 3. Gap Statistic for Optimal Spatial Clusters
+We use `clusGap` to determine the optimal number of clusters, evaluating up to K=10.
+We wrap `rioja::chclust` inside a custom function so `clusGap` can sequentially evaluate K.
+
+```{r gap_stat, fig.width=8, fig.height=5}
+# Distance matrix (Euclidean on scaled profiles)
+dist_mat <- dist(bin_scaled, method = "euclidean")
+
+# Custom clustering function wrapper for clusGap
+# Since CONISS is hierarchical, we cut the tree into k clusters
+coniss_clust_wrapper <- function(x, k) {
+    d <- dist(x, method = "euclidean")
+    ch <- chclust(d, method = "coniss")
+    cl <- cutree(ch, k = k)
+    return(list(cluster = cl))
+}
+
+cat("Calculating Gap Statistic using CONISS constrained clustering (may take a few moments)...\n")
+set.seed(42)
+gap_stat <- clusGap(bin_scaled, FUN = coniss_clust_wrapper, K.max = 10, B = 50)
+
+# Optimal cluster determination using the "firstMax" or "Tibs2001SEmax" method
+# Commonly used is the standard Tibshirani approach
+optimal_k <- maxSE(gap_stat$Tab[, "gap"], gap_stat$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+cat("Optimal number of clusters calculated:", optimal_k, "\n")
+
+# Plot Gap Statistic
+p_gap <- fviz_gap_stat(gap_stat, linecolor = "black", maxSE = list(method = "Tibs2001SEmax", color = "deeppink")) +
+    theme_minimal() +
+    labs(title = "Gap Statistic: Optimal Spatial Clusters",
+         x = "Number of clusters", y = "Gap") +
+    theme(plot.title = element_text(face = "bold", size = 14))
+
+# Save
+if (!dir.exists("../figures/3D_glo")) dir.create("../figures/3D_glo", recursive=TRUE, showWarnings=FALSE)
+ggsave("../figures/3D_glo/Gap_Statistic_Clusters.png", p_gap, width = 6, height = 5)
+
+print(p_gap)
+```
+
+## 4. Spatially Constrained Hierarchical Clustering Profile
+Using the optimal K found above (or manually defining it), we run CONISS to trace strictly contiguous clustering blocks that adhere to midgut morphology constraints.
+
+```{r constrained_clustering, fig.width=10, fig.height=7}
+# Perform hierarchical constrained clustering using CONISS
+spatial_hc <- chclust(dist_mat, method = "coniss")
+
+# Hard-wipe all labels at the root object level so ggplot doesn't forcefully draw them
+spatial_hc$labels <- rep("", length(spatial_hc$order))
+
+# --- Customizable Option: Override optimal K ---
+# Set manual_k to a number (e.g., 5 or 5) to override the mathematical estimation if the Gap statistic is conservative.
+manual_k <- 7 
+# -------------------------
+
+# Use optimal K from Gap Stat or manual override
+k_to_use <- ifelse(!is.null(manual_k), manual_k, ifelse(optimal_k > 1, optimal_k, 5)) 
+
+# Create dendrogram
+dend <- as.dendrogram(spatial_hc)
+
+# Assign colors to clusters
+dend <- color_branches(dend, k = k_to_use)
+
+# Extract cluster assignments for heatmap visualization or backgrounds
+cluster_labels <- cutree(spatial_hc, k = k_to_use)
+
+# Safely extract the cut height as a numeric value
+cut_height <- as.numeric(names(dendextend::heights_per_k.dendrogram(dend)[as.character(k_to_use)]))
+
+p_dend <- ggplot(as.ggdend(dend)) +
+    theme_minimal() +
+    labs(title = "Spatially Constrained Hierarchical Clustering",
+         subtitle = paste("Resolution: 40 Bins (2.5%) | Optimal K =", k_to_use),
+         y = "Height (Dissimilarity)",
+         x = "Anatomical Bin Position (Anterior -> Posterior)") +
+    geom_hline(yintercept = cut_height, linetype = "dashed", color = "deeppink", size = 1) +
+    theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank()
+    )
+
+# Save
+ggsave("../figures/3D_glo/Spatially_Constrained_Dendrogram.png", p_dend, width = 10, height = 7)
+
+print(p_dend)
+```
+
+## 5. Overlaying Regional Backgrounds (Optional Aesthetics)
+To closely match highly polished plots (e.g., adding colored background slices for the regions), we can extract the breakpoints of the clusters and apply rectangles in `ggplot`.
+
+```{r dendro_backgrounds, fig.width=10, fig.height=7}
+# Find boundaries of clusters to draw backing rectangles
+cluster_rle <- rle(cluster_labels)
+ends <- cumsum(cluster_rle$lengths)
+starts <- c(1, ends[-length(ends)] + 1)
+
+# Subtle background colors matching the branches
+bg_colors <- scales::hue_pal()(k_to_use)
+
+rects_df <- data.frame(
+    xmin = starts - 0.5,
+    xmax = ends + 0.5,
+    ymin = -Inf,
+    ymax = max(spatial_hc$height) * 1.05,
+    fill = factor(cluster_rle$values)
+)
+
+# Dutta Regions Math
+region_shift <- 4 # Customizable shift for region label plotting
+dutta_breaks <- c(0, 15, 40, 55, 85, 100) * (n_bins / 100)
+display_breaks <- dutta_breaks - (start_bin - 1) + 0.5 + region_shift
+display_mids <- (display_breaks[-1] + display_breaks[-length(display_breaks)]) / 2
+region_labs <- c("R1", "R2", "R3", "R4", "R5")
+
+valid_regions <- which(display_mids > 0.5 & display_mids < nrow(bin_scaled) + 0.5)
+valid_lines <- display_breaks[display_breaks > 0.5 & display_breaks < nrow(bin_scaled) + 0.5]
+
+# Custom Mutant Subregions Mapping
+sp_breaks <- c(0, 27, 43, 54, 61, 65, 76, 83, 100) * (n_bins / 100)
+sp_breaks_adj <- sp_breaks - (start_bin - 1) + 0.5 + region_shift
+sp_mids <- (sp_breaks_adj[-1] + sp_breaks_adj[-length(sp_breaks_adj)]) / 2
+sp_labs <- c("A1 (aEC)", "A2 (aEC/LFC)", "mEC (1)", "CU", "mEC (2)", "P1 (pEC)", "P2 (pEC)", "P3 (aEC?)")
+valid_sp <- which(sp_mids > 0.5 & sp_mids < nrow(bin_scaled) + 0.5)
+
+# Add as.ggdend(dend) natively rather than empty ggplot to avoid missing trees!
+p_dend_bg <- ggplot(as.ggdend(dend)) +
+    geom_rect(data = rects_df, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, fill=fill), alpha = 0.2, inherit.aes = FALSE) +
+    scale_fill_manual(values = bg_colors, guide = "none") +
+    geom_vline(xintercept = valid_lines, color = "black", linetype = "dotted", size = 0.8) +
+    annotate("text", x = display_mids[valid_regions], y = max(spatial_hc$height) * 1.02, 
+             label = region_labs[valid_regions], fontface = "bold", size = 4) +
+    geom_hline(yintercept = cut_height, linetype = "dashed", color = "deeppink", size = 1) +
+    theme_minimal() +
+    labs(title = "Constrained Hierarchical Clustering with Anatomical Domains",
+         subtitle = paste("CONISS Clustering | 40 Bins (2.5%) | K =", k_to_use),
+         y = "Height", x = "Spradling Subregions & Major Celltypes") +
+    scale_x_continuous(breaks = sp_mids[valid_sp], labels = sp_labs[valid_sp]) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, face = "bold.italic", color = "darkblue"),
+        axis.ticks.x = element_line(color="black"),
+        panel.grid = element_blank()
+    )
+
+ggsave("../figures/3D_glo/Spatially_Constrained_Dendro_Backgrounds.png", p_dend_bg, width = 10, height = 7)
+print(p_dend_bg)
+
+# Standard R plot:
+png("../figures/3D_glo/Constrained_Dendrogram_BaseR.png", width=2500, height=1800, res=300)
+par(mar = c(5, 4, 3, 1)) # Shifted bottom margin lower for Spradling labels
+plot(dend, main = "Constrained Hierarchical Clustering (CONISS)", ylab = "Height", xlab="", leaflab = "none", xaxt = "n")
+rect(starts - 0.5, -100, ends + 0.5, 100, col = adjustcolor(bg_colors, alpha.f = 0.2), border = NA)
+lines(x = c(0, nrow(bin_scaled) + 1), y = rep(cut_height, 2), col="deeppink", lty=2, lwd=2)
+abline(v = valid_lines, col = "black", lty = 3, lwd = 2)
+mtext(region_labs[valid_regions], side = 3, at = display_mids[valid_regions], line = 0.5, font = 2)
+axis(1, at = sp_mids[valid_sp], labels = sp_labs[valid_sp], las = 2, cex.axis = 0.75, font = 3, col.axis="darkblue")
+dev.off()
+
+cat("✓ Clustering plots constructed and saved.\n")
+```
+
+## 6. Domain Signature Gene Identification
+```{r domain_signatures}
+# Map cluster labels (k_to_use clusters) back to bins
+bin_clusters <- data.frame(Bin = as.character(start_bin:n_bins), Cluster = paste0("R", cluster_labels))
+
+# Append to metadata safely
+md <- sub_guts@meta.data
+md$Bin_Char <- as.character(md$Bin)
+md <- left_join(md, bin_clusters, by = c("Bin_Char" = "Bin"))
+sub_guts$Spatial_Domain <- md$Cluster
+
+# Filter out NA (cells in bins < start_bin)
+sub_domains <- subset(sub_guts, subset = !is.na(Spatial_Domain))
+Idents(sub_domains) <- "Spatial_Domain"
+
+cat("Running FindAllMarkers to identify domain signatures...\n")
+markers <- FindAllMarkers(sub_domains, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top20 <- markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+
+cat("✓ Identified top 20 signature genes for each spatial domain.\n")
+
+# Dynamically print the top 20 table for immediate viewing (not saved)
+library(knitr)
+cat("\n--- DOMAIN SIGNATURE GENES (TOP 20) ---\n")
+print(kable(
+    top20 %>% dplyr::select(cluster, gene, avg_log2FC, p_val_adj) %>% arrange(cluster, desc(avg_log2FC)), 
+    format = "pipe"
+))
+```
+
+## 7. Regional Gene Module Trajectories
+```{r gene_modules, fig.width=10, fig.height=6}
+module_list <- split(top20$gene, top20$cluster)
+sub_domains <- AddModuleScore(sub_domains, features = module_list, name = "Domain_Mod_")
+
+mod_cols <- paste0("Domain_Mod_", 1:length(module_list))
+domain_names <- names(module_list)
+
+plot_data <- sub_domains@meta.data %>% 
+    dplyr::select(Spatial_Pseudotime, all_of(mod_cols)) %>%
+    melt(id.vars="Spatial_Pseudotime", variable.name="ModuleRaw", value.name="Score")
+
+plot_data$Domain <- factor(domain_names[match(plot_data$ModuleRaw, mod_cols)], levels = paste0("R", unique(cluster_labels)))
+
+# Calculate boundaries for the vertical dotted lines dynamically across chosen cluster limits
+# Crucially, we calculate this from the single-cell annotations, NOT the melted multi-module tracking data!
+domain_bounds <- sub_domains@meta.data %>% 
+    group_by(Spatial_Domain) %>% 
+    summarize(min_pt = min(Spatial_Pseudotime), max_pt = max(Spatial_Pseudotime)) %>%
+    arrange(min_pt)
+    
+v_lines <- (domain_bounds$max_pt[-nrow(domain_bounds)] + domain_bounds$min_pt[-1]) / 2
+x_mids <- c(0, v_lines, 100)
+x_mids <- (x_mids[-1] + x_mids[-length(x_mids)]) / 2
+
+if (!require("ggsci", character.only = TRUE)) install.packages("ggsci", ask = FALSE)
+if (!require("ggpubr", character.only = TRUE)) install.packages("ggpubr", ask = FALSE)
+
+# Professional publication-grade aesthetic override!
+min_y <- min(plot_data$Score, na.rm=TRUE)
+
+p_modules <- ggplot(plot_data, aes(x=Spatial_Pseudotime, y=Score, color=Domain)) +
+    # Add subtle shaded domain backgrounds alternating sequentially
+    annotate("rect", xmin = c(0, v_lines), xmax = c(v_lines, 100), 
+             ymin = -Inf, ymax = Inf, 
+             fill = rep(c("grey95", "white"), length.out = k_to_use), alpha = 1) +
+    # Clean dashed separation lines
+    geom_vline(xintercept = v_lines, linetype="dashed", color="grey60", size=0.5) +
+    # Draw thicker, premium smoothed lines over the background
+    geom_smooth(method = "loess", span=0.3, se=FALSE, size=1.8, alpha=0.9, lineend="round") +
+    # Map domain labels deeply to the bottom
+    annotate("text", x = x_mids, y = -Inf, 
+             label = domain_bounds$Spatial_Domain, vjust = -0.5, size = 5.5, fontface = "bold", color="grey20") +
+    # Nature Publishing Group (NPG) premium scientific palette
+    scale_color_npg(name = "Related\ndomain:") +
+    # Base ggpubr layout (widely used in journals)
+    theme_pubr(base_size = 14, border = TRUE) +
+    labs(x="Spatial Position (0-100%)", y="Module Score (Loess Fit)") +
+    theme(
+        axis.title = element_text(face="bold"),
+        legend.title = element_text(face="bold"),
+        legend.position = "right",
+        # Add bottom margin padding so the annotation text doesn't clip below axis
+        plot.margin = margin(t=15, r=20, b=25, l=15)
+    ) +
+    scale_x_continuous(breaks = seq(0, 100, by=10), expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(mult = c(0.15, 0.05))) +
+    coord_cartesian(clip = "off")
+
+ggsave("../figures/3D_glo/Regional_Gene_Modules.png", p_modules, width = 9, height = 5)
+print(p_modules)
+```
+
+## 8. Metabolic GO Spatial Enrichment Profile
+```{r go_enrichment, fig.width=8, fig.height=10}
+if (!require("clusterProfiler", character.only = TRUE)) stop("Please install clusterProfiler")
+if (!require("org.Dm.eg.db", character.only = TRUE)) stop("Please install org.Dm.eg.db")
+library(stringr)
+
+# 20 genes is mathematically too small an overlap pool to consistently trigger GO pathways across all districts.
+# We slice deeper to the Top 150 specifically for the programmatic enrichment step so the ontology matching functions cleanly.
+top_go_genes <- markers %>% group_by(cluster) %>% top_n(n = 150, wt = avg_log2FC)
+module_list_go <- split(top_go_genes$gene, top_go_genes$cluster)
+
+cat("Running compareCluster for GO enrichment...\n")
+go_res <- compareCluster(geneCluster = module_list_go, fun = "enrichGO", 
+                         OrgDb = org.Dm.eg.db, keyType = "SYMBOL", 
+                         ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.5, qvalueCutoff = 0.8)
+
+if (!is.null(go_res) && nrow(go_res@compareClusterResult) > 0) {
+    # Broaden the metabolic terms to include specific Drosophila gut digestive/transport pathways!
+    df_go <- go_res@compareClusterResult %>% 
+        filter(grepl("metabol|catabol|biosynthe|digest|transport|lipid|glyco|carbo|amino|acid|water|ion|peptide|protein|hormon|excret", Description, ignore.case=TRUE))
+    
+    go_res@compareClusterResult <- df_go
+    
+    # Simplify removes redundancy mathematically, we wrap it in a tryCatch in case semantic similarity drops too much
+    go_sim <- tryCatch({
+        simplify(go_res, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    }, error = function(e) {
+        cat("Note: Semantic mapping simplification failed, falling back to manual trimming.\n")
+        return(go_res)
+    })
+    
+    df_sim <- go_sim@compareClusterResult
+    
+    # Identify the exact Names of the top 6 driving terms per cluster
+    top_terms <- df_sim %>%
+        group_by(Cluster) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = 6) %>%
+        pull(Description) %>%
+        unique()
+        
+    # Map those top target terms comprehensively across ALL clusters for the dotplot matrix
+    top_go <- df_sim %>% filter(Description %in% top_terms)
+        
+    top_go$GeneRatio_num <- sapply(top_go$GeneRatio, function(x) {
+        p <- as.numeric(strsplit(x, "/")[[1]])
+        p[1] / p[2]
+    })
+    
+    top_go$Description <- str_wrap(top_go$Description, width = 45)
+    
+    top_go$Cluster <- factor(top_go$Cluster, levels = paste0("R", unique(cluster_labels)))
+    
+    # Order Y-axis sequentially spanning structural location mapping and strictness
+    term_order <- top_go %>% 
+        group_by(Description) %>% 
+        summarize(min_p = min(p.adjust), PrimaryCluster = min(as.numeric(Cluster))) %>%
+        arrange(PrimaryCluster, min_p) %>%
+        pull(Description)
+        
+    top_go$Description <- factor(top_go$Description, levels = rev(term_order))
+    
+    p_dot <- ggplot(top_go, aes(x = Cluster, y = Description, size = GeneRatio_num, color = p.adjust)) +
+        geom_point() +
+        scale_color_viridis_c(option = "magma", direction = -1, name = "P_adj") +
+        theme_minimal() +
+        labs(size = "Gene ratio", title = "Highly Condensed Metabolic GO Terms", y = "", x = "") +
+        theme(axis.text.x = element_text(size=12, face="bold"),
+              axis.text.y = element_text(size=10),
+              panel.grid.major.x = element_line(linetype="dotted", color="grey80"),
+              panel.border = element_rect(color="black", fill=NA))
+              
+    ggsave("../figures/3D_glo/Metabolic_GO_Enrichment.png", p_dot, width = 8, height = 10)
+    print(p_dot)
+} else {
+    cat("Warning: No significant GO enrichment results found to plot!\n")
+}
+```
+---
+End of script.

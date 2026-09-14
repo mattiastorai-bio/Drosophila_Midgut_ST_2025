@@ -1,0 +1,354 @@
+---
+title: "Target Gene Spatial Profile Comparison (WT vs Mutant)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(mgcv) # For GAM smoothing
+library(pheatmap)
+library(zoo)
+library(gridExtra)
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Change this variable to your gene of interest
+target_gene <- "wg" 
+```
+
+## 1. Load Data
+We load three `merged_guts.rds` objects: WT (03Slide4), Mutant (03Slide4), and WT (111125ST).
+
+```{r load_data}
+path_mutant <- "../Random data/merged_guts.rds"
+path_wt <- "../Random data/merged_guts_wt.rds"
+path_wt_111 <- "../../111125ST_def/Random data/merged_guts.rds"
+
+if (!file.exists(path_mutant)) stop(paste("Mutant merged_guts.rds not found at", path_mutant))
+if (!file.exists(path_wt)) stop(paste("WT merged_guts_wt.rds not found at", path_wt))
+if (!file.exists(path_wt_111)) stop(paste("WT 111125ST merged_guts.rds not found at", path_wt_111))
+
+message("Loading datasets...")
+seurat_mutant <- readRDS(path_mutant)
+seurat_wt <- readRDS(path_wt)
+seurat_wt_111 <- readRDS(path_wt_111)
+
+# Use the entire merged_guts objects directly without subsetting
+gut_mutant <- seurat_mutant
+gut_wt <- seurat_wt
+gut_wt_111 <- seurat_wt_111
+
+# Remove ambiguous cell types if the annotation exists
+if ("Predicted_CellType" %in% colnames(gut_mutant@meta.data)) {
+  gut_mutant <- subset(gut_mutant, cells = Cells(gut_mutant)[!grepl("ambiguous", gut_mutant$Predicted_CellType, ignore.case = TRUE)])
+}
+if ("Predicted_CellType" %in% colnames(gut_wt@meta.data)) {
+  gut_wt <- subset(gut_wt, cells = Cells(gut_wt)[!grepl("ambiguous", gut_wt$Predicted_CellType, ignore.case = TRUE)])
+}
+if ("Predicted_CellType" %in% colnames(gut_wt_111@meta.data)) {
+  gut_wt_111 <- subset(gut_wt_111, cells = Cells(gut_wt_111)[!grepl("ambiguous", gut_wt_111$Predicted_CellType, ignore.case = TRUE)])
+}
+
+message(paste("WT (03Slide4):", ncol(gut_wt), "cells"))
+message(paste("Mutant (03Slide4):", ncol(gut_mutant), "cells"))
+message(paste("WT (111125ST):", ncol(gut_wt_111), "cells"))
+```
+
+## 2. Extract Expression Data
+
+```{r extract_expression}
+# Ensure the default assay is set appropriately (usually SCT)
+if ("SCT" %in% names(Assays(gut_mutant))) DefaultAssay(gut_mutant) <- "SCT"
+if ("SCT" %in% names(Assays(gut_wt))) DefaultAssay(gut_wt) <- "SCT"
+if ("SCT" %in% names(Assays(gut_wt_111))) DefaultAssay(gut_wt_111) <- "SCT"
+
+# Check if gene exists in all datasets
+gene_in_wt <- target_gene %in% rownames(gut_wt)
+gene_in_mut <- target_gene %in% rownames(gut_mutant)
+gene_in_wt111 <- target_gene %in% rownames(gut_wt_111)
+
+if (!gene_in_wt) warning(paste(target_gene, "not found in WT (03Slide4) dataset."))
+if (!gene_in_mut) warning(paste(target_gene, "not found in Mutant (03Slide4) dataset."))
+if (!gene_in_wt111) warning(paste(target_gene, "not found in WT (111125ST) dataset."))
+if (!gene_in_wt && !gene_in_mut && !gene_in_wt111) stop("Gene not found in any dataset.")
+
+# Fetch Data
+df_wt <- data.frame()
+if (gene_in_wt) {
+  df_wt <- FetchData(gut_wt, vars = c(target_gene, "Spatial_Pseudotime"))
+  df_wt$Condition <- "WT (03Slide4)"
+}
+
+df_mut <- data.frame()
+if (gene_in_mut) {
+  df_mut <- FetchData(gut_mutant, vars = c(target_gene, "Spatial_Pseudotime"))
+  df_mut$Condition <- "Mutant (03Slide4)"
+}
+
+df_wt111 <- data.frame()
+if (gene_in_wt111) {
+  df_wt111 <- FetchData(gut_wt_111, vars = c(target_gene, "Spatial_Pseudotime"))
+  df_wt111$Condition <- "WT (111125ST)"
+}
+
+# Combine
+plot_df <- rbind(df_wt, df_mut, df_wt111)
+colnames(plot_df)[1] <- "Expression"
+
+# Filter out NAs in Spatial_Pseudotime
+plot_df <- plot_df %>% filter(!is.na(Spatial_Pseudotime))
+
+# Optional: Add Log1p expression for better visibility if raw values are sparse
+plot_df$Expression_Log <- log1p(plot_df$Expression)
+
+# Set factor levels for consistent plotting order
+plot_df$Condition <- factor(plot_df$Condition, levels = c("WT (111125ST)", "WT (03Slide4)", "Mutant (03Slide4)"))
+```
+
+## 3. Visualize Spatial Profiles
+
+### Smoothed Expression Trend (GAM)
+Using a Generalized Additive Model (GAM) to fit a smooth curve over the spatial pseudotime (anterior to posterior).
+
+```{r plot_smooth, fig.width=9, fig.height=5}
+p_smooth <- ggplot(plot_df, aes(x = Spatial_Pseudotime, y = Expression, color = Condition, fill = Condition)) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), alpha = 0.2, size = 1.2) +
+  scale_color_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+  scale_fill_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+  coord_cartesian(ylim = c(0, NA)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal() +
+  labs(
+    title = paste("Spatial Expression Profile:", target_gene),
+    subtitle = "Smoothed trend across inferred spatial position",
+    x = "Inferred Spatial Position (Pseudotime)",
+    y = "Normalized Expression"
+  ) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        text = element_text(size = 14),
+        plot.title = element_text(face = "bold"))
+
+print(p_smooth)
+```
+
+### Scatter Plot with LOESS Smoothing
+Showing the individual cellular expression values along with a local regression line.
+
+```{r plot_scatter, fig.width=14, fig.height=5}
+p_scatter <- ggplot(plot_df, aes(x = Spatial_Pseudotime, y = Expression, color = Condition)) +
+  geom_point(alpha = 0.3, size = 1.5, stroke = 0) +
+  geom_smooth(method = "loess", span = 0.3, color = "black", size = 1) +
+  scale_color_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+  facet_wrap(~Condition, ncol = 3) +
+  coord_cartesian(ylim = c(0, NA)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal() +
+  labs(
+    title = paste("Cell-Level Spatial Expression:", target_gene),
+    x = "Inferred Spatial Position (Pseudotime)",
+    y = "Normalized Expression"
+  ) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        text = element_text(size = 14),
+        strip.text = element_text(face = "bold", size = 12))
+
+print(p_scatter)
+```
+
+### Overlaid Scatter Plot with LOESS Smoothing
+Showing both conditions on the same axes to directly compare cell density and local expression trends.
+
+```{r plot_scatter_overlaid, fig.width=9, fig.height=5}
+p_scatter_overlaid <- ggplot(plot_df, aes(x = Spatial_Pseudotime, y = Expression, color = Condition, fill = Condition)) +
+  geom_point(alpha = 0.3, size = 1.5, stroke = 0) +
+  geom_smooth(method = "loess", span = 0.3, size = 1) +
+  scale_color_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+  scale_fill_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+  coord_cartesian(ylim = c(0, NA)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal() +
+  labs(
+    title = paste("Overlaid Cell-Level Spatial Expression:", target_gene),
+    x = "Inferred Spatial Position (Pseudotime)",
+    y = "Normalized Expression"
+  ) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.line.y = element_line(color = "black"),
+        axis.line.x = element_line(color = "black"),
+        text = element_text(size = 14),
+        plot.title = element_text(face = "bold"))
+
+print(p_scatter_overlaid)
+```
+
+## 4. Expression by Cell Type
+Visualizing which inferred cell types primarily express the target gene.
+
+```{r plot_celltype, fig.width=14, fig.height=6}
+# Look for the cell type column
+celltype_col <- "Predicted_CellType"
+if (!celltype_col %in% colnames(gut_wt@meta.data)) {
+  # Fallback if standard col is missing
+  if ("celltype" %in% colnames(gut_wt@meta.data)) celltype_col <- "celltype"
+  else if ("seurat_clusters" %in% colnames(gut_wt@meta.data)) celltype_col <- "seurat_clusters"
+}
+
+if (celltype_col %in% colnames(gut_wt@meta.data) && celltype_col %in% colnames(gut_mutant@meta.data)) {
+  
+  df_wt_ct <- data.frame(
+    Expression = FetchData(gut_wt, vars = target_gene)[[1]],
+    CellType = gut_wt@meta.data[[celltype_col]],
+    Condition = "WT (03Slide4)"
+  )
+  
+  df_mut_ct <- data.frame(
+    Expression = FetchData(gut_mutant, vars = target_gene)[[1]],
+    CellType = gut_mutant@meta.data[[celltype_col]],
+    Condition = "Mutant (03Slide4)"
+  )
+  
+  df_wt111_ct <- data.frame(
+    Expression = FetchData(gut_wt_111, vars = target_gene)[[1]],
+    CellType = gut_wt_111@meta.data[[celltype_col]],
+    Condition = "WT (111125ST)"
+  )
+  
+  plot_df_ct <- rbind(df_wt_ct, df_mut_ct, df_wt111_ct)
+  plot_df_ct <- plot_df_ct[!is.na(plot_df_ct$CellType) & plot_df_ct$CellType != "", ]
+  plot_df_ct$Condition <- factor(plot_df_ct$Condition, levels = c("WT (111125ST)", "WT (03Slide4)", "Mutant (03Slide4)"))
+  
+  p_vln <- ggplot(plot_df_ct, aes(x = CellType, y = Expression, fill = Condition)) +
+    geom_violin(scale = "width", position = position_dodge(width = 0.8), color = "black", alpha = 0.7) +
+    geom_boxplot(width = 0.2, position = position_dodge(width = 0.8), color = "black", outlier.shape = NA, alpha = 0.5) +
+    scale_fill_manual(values = c("WT (111125ST)" = "#4DAF4A", "WT (03Slide4)" = "#377EB8", "Mutant (03Slide4)" = "#E41A1C")) +
+    coord_cartesian(ylim = c(0, NA)) +
+    theme_minimal() +
+    labs(
+      title = paste("Expression by Cell Type:", target_gene),
+      x = "Predicted Cell Type",
+      y = "Normalized Expression"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      text = element_text(size = 14),
+      plot.title = element_text(face = "bold")
+    )
+  
+  print(p_vln)
+} else {
+  message("Cell type column not found. Skipping cell type plot.")
+}
+```
+## 5. Spatial Expression Heatmap
+Visualizing the spatial transitions across the gut for the selected target gene.
+
+```{r spatial_heatmaps, fig.width=14, fig.height=5}
+message("Preparing data for heatmaps...")
+
+# Combine objects temporarily to bin pseudotime
+combined <- merge(gut_wt, y = list(gut_mutant, gut_wt_111), add.cell.ids = c("WT_S4", "Mutant", "WT_111"))
+
+# Set batch assignments based on prefix
+combined$Batch <- dplyr::case_when(
+  grepl("^WT_S4_", Cells(combined)) ~ "WT (03Slide4)",
+  grepl("^Mutant_", Cells(combined)) ~ "Mutant (03Slide4)",
+  grepl("^WT_111_", Cells(combined)) ~ "WT (111125ST)"
+)
+
+# We are only interested in the target_gene
+genes_to_plot <- c(target_gene)
+
+# 1. Binning by Spatial_Pseudotime (0-100)
+# Ensure Bin is defined for all cells
+combined$Bin <- cut(combined$Spatial_Pseudotime, breaks = 100, labels = FALSE)
+
+# 2. Function to calculate smoothed expression averages per bin
+get_smoothed_profiles <- function(seurat_obj, batch_name, genes, n_bins = 100, window = 5) {
+  sub <- subset(seurat_obj, Batch == batch_name)
+  if (ncol(sub) == 0) return(NULL)
+  
+  assay_to_use <- if ("SCT" %in% names(sub@assays)) "SCT" else DefaultAssay(sub)
+  genes <- intersect(genes, rownames(sub[[assay_to_use]]))
+  if (length(genes) == 0) return(NULL)
+  
+  exp_mat <- GetAssayData(sub, assay = assay_to_use, layer = "data")[genes, , drop = FALSE]
+  
+  bin_means <- t(apply(exp_mat, 1, function(x) {
+    res <- tapply(x, sub$Bin, mean, na.rm = TRUE)
+    full_res <- setNames(rep(NA, n_bins), 1:n_bins)
+    full_res[names(res)] <- res
+    return(full_res)
+  }))
+  
+  bin_means <- t(apply(bin_means, 1, function(x) {
+    if (all(is.na(x))) return(rep(0, n_bins))
+    zoo::na.approx(x, xout = 1:n_bins, na.rm = FALSE, rule = 2)
+  }))
+  
+  bin_smoothed <- t(apply(bin_means, 1, function(x) {
+    zoo::rollapply(x, width = window, FUN = mean, fill = "extend")
+  }))
+  colnames(bin_smoothed) <- 1:n_bins
+  rownames(bin_smoothed) <- genes
+  return(bin_smoothed)
+}
+
+message("Calculating smoothed profiles...")
+wt_profiles <- get_smoothed_profiles(combined, "WT (03Slide4)", genes_to_plot)
+mutant_profiles <- get_smoothed_profiles(combined, "Mutant (03Slide4)", genes_to_plot)
+wt111_profiles <- get_smoothed_profiles(combined, "WT (111125ST)", genes_to_plot)
+
+# 4. Heatmap Data Preparation
+scale_rows <- function(x) {
+  res <- t(apply(x, 1, function(y) {
+    if(sd(y) == 0) return(rep(0, length(y)))
+    (y - mean(y)) / sd(y)
+  }))
+  rownames(res) <- rownames(x)
+  return(res)
+}
+
+if (!is.null(wt_profiles) && !is.null(mutant_profiles) && !is.null(wt111_profiles)) {
+  wt_plot <- scale_rows(wt_profiles)
+  mutant_plot <- scale_rows(mutant_profiles)
+  wt111_plot <- scale_rows(wt111_profiles)
+
+  # Combine into a single matrix for plotting together
+  combined_plot <- rbind(wt111_plot, wt_plot, mutant_plot)
+  rownames(combined_plot) <- c(
+    paste(target_gene, "WT (111125ST)"), 
+    paste(target_gene, "WT (03Slide4)"), 
+    paste(target_gene, "Mutant (03Slide4)")
+  )
+
+  # 5. Generate Heatmap
+  col_palette <- colorRampPalette(c("#440154", "#21908C", "#FDE725"))(100) # Viridis
+  break_val <- seq(-2, 2, length.out = 101)
+
+  pheatmap(combined_plot, cluster_rows = FALSE, cluster_cols = FALSE, 
+           show_colnames = FALSE, main = paste("Spatial Expression:", target_gene),
+           color = col_palette, breaks = break_val)
+} else {
+  message(paste("Gene", target_gene, "not found or not enough data to create heatmap."))
+}
+```

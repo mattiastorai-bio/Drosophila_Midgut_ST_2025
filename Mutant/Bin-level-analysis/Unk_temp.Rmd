@@ -1,0 +1,183 @@
+---
+title: "Unk?"
+output: html_document
+date: "2025-11-27"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(hdf5r)
+library(arrow)
+library(anndataR)
+library(rhdf5)
+library(stringr)
+library(SeuratDisk)
+library(data.table)
+library(R.utils)
+library(org.Dm.eg.db)
+library(AnnotationDbi)
+library(Matrix)
+library(spacexr)
+library(Matrix.utils)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(ggspavis)
+library(presto)
+library(clusterProfiler)
+```
+
+```{r}
+# 2. Create the subset object for 'unknown' cells
+unknown_cells <- subset(
+  x = seurat_filtered,
+  subset = celltype_granular == "unk" # Replace 'celltype' if your column has a different name
+)
+
+# Optional: Print the number of cells to confirm the subsetting worked
+print(paste("Number of cells in 'unknown' subset:", ncol(unknown_cells)))
+
+```
+
+```{r}
+# 1. Ensure the 'celltype' column is set as the active identity
+Idents(seurat_filtered) <- "celltype_granular"
+
+# 2. Verify that 'unknown' is one of the identities
+print(levels(seurat_filtered)) # 'unknown' should be in this list
+```
+
+```{r}
+# Find markers for the "unknown" cluster compared to all other cells.
+# min.pct = 0.25 (gene must be expressed in at least 25% of cells in EITHER group)
+# logfc.threshold = 0.25 (require at least a 1.2-fold difference in expression)
+marker_genes_unknown <- FindMarkers(
+  object = seurat_filtered,
+  ident.1 = "unk",   # The cluster we want to characterize
+  ident.2 = NULL,        # Compare against all other identities in the object
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  test.use = "wilcox"
+)
+
+# Optional: Print the dimensions of the resulting data frame
+print(paste("Number of potential marker genes found:", nrow(marker_genes_unknown)))
+```
+
+```{r}
+# 1. Filter for significant markers (adjust p_val_adj threshold as needed, e.g., < 0.05)
+# And sort by the largest positive average log2 fold-change (avg_log2FC)
+top_unique_markers <- marker_genes_unknown %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(desc(avg_log2FC)) %>%
+  head(n = 10)
+
+# Extract the names of the top 10 unique marker genes
+top_10_marker_names <- rownames(top_unique_markers)
+
+top_10_marker_names
+```
+
+```{r}
+significant_upregulated_genes <- marker_genes_unknown %>%
+  filter(p_val_adj < 0.05, avg_log2FC > 0) %>%
+  rownames()
+
+# 3. Convert gene IDs (symbols) to Entrez IDs (required by clusterProfiler)
+entrez_ids <- bitr(
+  geneID = significant_upregulated_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Dm.eg.db
+)
+
+# Optional: Get the list of Entrez IDs for the analysis
+gene_list <- entrez_ids$ENTREZID
+print(paste("Number of significant marker genes for GO analysis:", length(gene_list)))
+```
+
+```{r}
+# Perform GO Enrichment Analysis
+go_results <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.Dm.eg.db,
+  keyType = "ENTREZID",
+  ont = "ALL",           # Run analysis on all three categories (BP, MF, CC)
+  pAdjustMethod = "BH",  # Benjamini-Hochberg correction
+  qvalueCutoff = 0.05,
+  readable = TRUE        # Maps Entrez IDs back to Gene Symbols for readability
+)
+```
+
+```{r}
+# Convert the results to a data frame for easier filtering and plotting
+go_df <- as.data.frame(go_results)
+
+# Filter for the most significant and relevant terms (e.g., top 15 terms)
+# We will focus on terms like "muscle contraction," "sarcomere organization," etc.
+top_go_terms <- go_df %>%
+  arrange(desc(GeneRatio)) %>% # Sort by the ratio of enriched genes
+  head(n = 15)
+
+# Create the Dot Plot visualization
+dotplot(
+  go_results,
+  showCategory = 15,
+  title = "GO Enrichment Analysis of 'Unk' Marker Genes"
+) +
+  scale_color_continuous(name = "Adjusted p-value")
+```
+
+```{r}
+# 1. Ensure the 'celltype' column is set as the active identity
+Idents(seurat_filtered) <- "region_prediction"
+
+# 2. Verify that 'unknown' is one of the identities
+print(levels(seurat_filtered)) 
+```
+
+```{r}
+# Find markers for the "unknown" cluster compared to all other cells.
+# min.pct = 0.25 (gene must be expressed in at least 25% of cells in EITHER group)
+# logfc.threshold = 0.25 (require at least a 1.2-fold difference in expression)
+marker_genes_unknown <- FindMarkers(
+  object = seurat_filtered,
+  ident.1 = "R2",   # The cluster we want to characterize
+  ident.2 = NULL,        # Compare against all other identities in the object
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  test.use = "wilcox"
+)
+
+# Optional: Print the dimensions of the resulting data frame
+print(paste("Number of potential marker genes found:", nrow(marker_genes_unknown)))
+```
+
+```{r}
+# 1. Filter for significant markers (adjust p_val_adj threshold as needed, e.g., < 0.05)
+# And sort by the largest positive average log2 fold-change (avg_log2FC)
+top_unique_markers <- marker_genes_unknown %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(desc(avg_log2FC)) %>%
+  head(n = 10)
+
+# Extract the names of the top 10 unique marker genes
+top_10_marker_names <- rownames(top_unique_markers)
+
+top_10_marker_names
+```
+
+Gene Name,Functional Class,Role/Significance,Inference
+N (Notch),Receptor,"The Notch receptor is highly expressed in ISCs and EBs. It's critical for determining cell fate: low Notch activation leads to differentiation into EE cells, while high Notch activation leads to Enteroblast identity.",Core ISC/EB Marker
+E(spl)mbeta-HLH,Transcription Factor,"Part of the Enhancer of split Complex (E(spl)), these genes are direct targets of Notch signaling and are highly expressed in the EB population.",Key EB Marker
+E(spl)m3-HLH,Transcription Factor,"Another key member of the E(spl) complex, strongly expressed in EBs, and required for proper EB differentiation.",Key EB Marker
+E(spl)malpha-BFM,Transcription Factor,Another E(spl) member. The entire E(spl) family serves as a signature of active Notch signaling and Enteroblast status.,Key EB Marker
+upd2 (Unpaired 2),JAK/STAT Ligand,"A ligand for the JAK/STAT signaling pathway, which is the primary driver of ISC proliferation and renewal. While often secreted by the EE or EC cells in response to damage, high intrinsic expression can mark the ISC or EB themselves.",ISC Proliferation/Marker
+Rbfox1 (RNA-binding Fox 1),RNA-binding Protein,"Involved in RNA splicing and often expressed in neuronal or stem cell lineages. In the midgut, it is a marker for the ISC/EB lineage.",ISC/EB Lineage Marker
+mgl (megalin),Endocytosis/Receptor,A large endocytic receptor; involved in nutrient uptake and signaling. Its high expression in the stem cell lineage can reflect its role in signaling turnover.,Contextual Marker
+GstD3 (Glutathione S-transferase D3),Detoxification Enzyme,"Involved in stress response and detoxification. Often upregulated in highly metabolic or stress-exposed cells, including proliferating cells like the ISC/EB lineage.",Stress/Proliferation Marker
+fru (fruitless),Transcription Factor,"Although classically known for sex-specific neural development, fru expression has been noted in specific lineages in the adult midgut epithelium, possibly related to sex-specific differences in ISC activity.",Contextual Marker
+Hsp68 (Heat shock protein 68),Chaperone Protein,A stress-inducible protein. High baseline expression suggests a high level of protein folding or cellular stress associated with rapid proliferation.,Proliferation/Stress Marker
+

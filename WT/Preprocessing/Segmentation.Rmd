@@ -1,0 +1,518 @@
+---
+title: "Segmentation"
+output: html_document
+date: "2025-12-14"
+---
+```{r}
+library(sf)
+library(dplyr)
+library(arrow)
+library(data.table)
+library(ggplot2)
+library(Matrix)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+```
+
+```{r}
+
+# ==============================================================================
+# I. CONFIGURATION
+# ==============================================================================
+BASE_DIR       <- "/home/mattia/Thesis/111125ST_def/binned_data"
+SPATIAL_DIR    <- file.path(BASE_DIR, "binned_outputs/square_002um/spatial")
+MATRIX_DIR     <- file.path(BASE_DIR, "binned_outputs/square_002um/filtered_feature_bc_matrix")
+
+GEOJSON_FILE   <- file.path(BASE_DIR, "tissue_hires_image.geojson")
+POSITIONS_FILE <- file.path(SPATIAL_DIR, "tissue_positions.parquet")
+
+# ==============================================================================
+# II. LOAD BINS & INVERT AXES
+# ==============================================================================
+message("Loading and inverting bin coordinates...")
+bins_dt <- arrow::read_parquet(POSITIONS_FILE)
+setDT(bins_dt) # Explicitly convert to data.table for the := operator
+
+# Calculate midpoints for the inversion
+x_mid <- (max(bins_dt$pxl_col_in_fullres) + min(bins_dt$pxl_col_in_fullres)) / 2
+y_mid <- (max(bins_dt$pxl_row_in_fullres) + min(bins_dt$pxl_row_in_fullres)) / 2
+
+# Perform the inversion (Flips the tissue orientation)
+bins_dt[, pxl_col_in_fullres := x_mid - (pxl_col_in_fullres - x_mid)]
+bins_dt[, pxl_row_in_fullres := y_mid - (pxl_row_in_fullres - y_mid)]
+
+# Convert to sf object for spatial plotting
+bins_sf <- st_as_sf(bins_dt, coords = c("pxl_col_in_fullres", "pxl_row_in_fullres"), remove = FALSE)
+st_crs(bins_sf) <- NA
+
+# ==============================================================================
+# III. ALIGNMENT PARAMETERS (THE "TRANSFORMATION")
+# ==============================================================================
+# 1. Scale: Use this to grow/shrink the mask. 1.0 = original GeoJSON size.
+manual_scale <- 0.305 
+
+# 2. Rotation: Degrees (positive = counter-clockwise)
+angle_deg    <- 0 
+angle_rad    <- angle_deg * (pi / 180)
+
+# 3. Nudge: Small pixel adjustments to snap the mask onto the heatmap
+x_nudge      <- 539.5  
+y_nudge      <- 35.25 
+
+# Create Rotation Matrix
+R_mat <- matrix(c(cos(angle_rad), -sin(angle_rad), 
+                  sin(angle_rad),  cos(angle_rad)), 2, 2)
+
+# ==============================================================================
+# IV. TRANSFORM MASK (AUTO-CENTERING LOGIC)
+# ==============================================================================
+mask_sf <- st_read(GEOJSON_FILE)
+st_crs(mask_sf) <- NA
+
+# Step 1: Move mask to local origin (0,0) so scaling and rotation happen around its center
+mask_centroid <- st_coordinates(st_centroid(st_union(mask_sf)))
+st_geometry(mask_sf) <- st_geometry(mask_sf) - c(mask_centroid[1], mask_centroid[2])
+
+# Step 2: Apply Scaling and Rotation
+st_geometry(mask_sf) <- st_geometry(mask_sf) * manual_scale * R_mat
+
+# Step 3: Shift mask to the center of the inverted bins + your manual nudge
+st_geometry(mask_sf) <- st_geometry(mask_sf) + (c(x_mid, y_mid) + c(x_nudge, y_nudge))
+
+# ==============================================================================
+# IV.5 SPATIAL JOIN (CRITICAL: DO THIS BEFORE VISUALIZATION TRANSFORMS)
+# ==============================================================================
+# Performing the join here ensures the mask and bins are in the same 'tissue space'
+message("Performing spatial join for 2um bins...")
+
+# Disable S2 for planar data
+old_s2 <- sf_use_s2()
+sf_use_s2(FALSE)
+
+# Repair mask if needed
+mask_sf <- st_make_valid(mask_sf)
+
+# Perform the join
+final_assignment <- st_join(bins_sf, mask_sf, join = st_intersects, left = FALSE)
+
+# Restore S2
+sf_use_s2(old_s2)
+
+# Create lookup table
+lookup_table <- as.data.table(final_assignment)[, .(barcode, id, pxl_col_in_fullres, pxl_row_in_fullres)]
+fwrite(lookup_table, file.path(BASE_DIR, "final_polygon_to_bin_lookup.csv"))
+message(paste("Lookup table exported. Bins assigned:", nrow(lookup_table)))
+
+# ==============================================================================
+# V. VERIFICATION PLOT (UMI DENSITY)
+# ==============================================================================
+message("Reading matrix and generating heatmap...")
+
+# Load UMIs to show the actual tissue structure
+matrix_mtx <- Matrix::readMM(file.path(MATRIX_DIR, "matrix.mtx.gz"))
+if(!inherits(matrix_mtx, "dgCMatrix")) matrix_mtx <- as(matrix_mtx, "dgCMatrix")
+
+barcodes   <- fread(file.path(MATRIX_DIR, "barcodes.tsv.gz"), header = FALSE)$V1
+umi_counts <- data.table(barcode = barcodes, total_umi = Matrix::colSums(matrix_mtx))
+rm(matrix_mtx); gc() # Free RAM immediately
+
+# Sample bins (1 in 20) to keep the plot responsive in WSL
+plot_data <- merge(as.data.table(bins_sf), umi_counts, by = "barcode", all.x = TRUE) %>%
+  .[seq(1, .N, by = 20)] %>% 
+  st_as_sf(coords = c("pxl_col_in_fullres", "pxl_row_in_fullres"))
+
+diag_plot <- ggplot() +
+  # The Tissue "Heatmap"
+  geom_sf(data = plot_data, aes(color = log1p(total_umi)), size = 0.01) +
+  scale_color_viridis_c(option = "magma", name = "log(UMI)") +
+  
+  # The Candidate Mask
+  geom_sf(data = mask_sf, color = "cyan", fill = "cyan", alpha = 0.15, linewidth = 0.4) +
+  
+  coord_sf(datum = NA) +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "black"), 
+        plot.background = element_rect(fill = "black"),
+        panel.grid = element_blank(),
+        text = element_text(color = "white")) +
+  labs(title = "Alignment Verification: Inverted Bins vs. Mask",
+       subtitle = "Cyan: Your Polygons | Magma: UMI Density (Tissue)")
+
+print(diag_plot)
+ggsave(file.path(BASE_DIR, "verification_plot.png"), diag_plot, width = 10, height = 10)
+```
+
+```{r}
+# ==============================================================================
+# PART 1: IMAGE HANDLING & MANUAL TRIM
+# ==============================================================================
+library(tiff)
+library(grid)
+library(jsonlite)
+library(sf)
+
+# 1. --- MANUAL TRIMMING CONFIGURATION (Pixels) ---
+t_top <- 652; t_bottom <- 616; t_left <- 255; t_right <- 1215  
+
+# 2. Load Native TIFF
+img_raw <- readTIFF(file.path(SPATIAL_DIR, "cytassist_image.tif"), as.is = TRUE)
+if (is.list(img_raw)) img <- img_raw[[1]] else img <- img_raw
+if (max(img, na.rm = TRUE) > 1) img <- img / max(img, na.rm = TRUE)
+
+# 3. Apply the Trim
+img_cropped <- img[(1 + t_top):(nrow(img) - t_bottom), (1 + t_left):(ncol(img) - t_right), ]
+
+# 4. Scale Calculations (Robust extraction)
+ca_scale <- tryCatch({
+  s <- as.numeric(scales$tissue_cytassist_scalef[[1]])
+  if(length(s) == 0 || is.na(s)) 1 else s
+}, error = function(e) 1)
+
+# Fullres dimensions of the CROPPED area
+img_w_crop <- ncol(img_cropped) / ca_scale
+img_h_crop <- nrow(img_cropped) / ca_scale
+
+# The center of your crop relative to the original image (Fullres units)
+# This point is our "0,0"
+center_x_orig <- (t_left + (ncol(img) - t_right)) / 2 / ca_scale
+center_y_orig <- (t_top + (nrow(img) - t_bottom)) / 2 / ca_scale
+
+# 5. Flip Image Pixels (Y-axis)
+img_flipped <- img_cropped[nrow(img_cropped):1, , ]
+g_img <- rasterGrob(img_flipped, width = unit(1, "npc"), height = unit(1, "npc"))
+
+# ==============================================================================
+# PART 2: MASK TRANSFORMATION (Translate -> Flip Signs -> Translate)
+# ==============================================================================
+# Use sf's built-in affine transformation math for robustness. 
+# This avoids manual loops that can break internal matrix classes.
+center_orig <- c(center_x_orig, center_y_orig)
+plot_offset <- c(img_w_crop / 2, img_h_crop / 2)
+
+# Sequence: Center -> Flip -> Offset
+st_geometry(mask_sf) <- (st_geometry(mask_sf) - center_orig) * -1 + plot_offset
+
+# ==============================================================================
+# PART 3: FINAL PLOT
+# ==============================================================================
+diag_plot <- ggplot() +
+  annotation_custom(g_img, xmin = 0, xmax = img_w_crop, ymin = 0, ymax = img_h_crop) +
+  geom_sf(data = mask_sf, color = "cyan", fill = NA, linewidth = 0.5) +
+  coord_sf(xlim = c(0, img_w_crop), ylim = c(0, img_h_crop), expand = FALSE, datum = NA) +
+  theme_void() + 
+  theme(panel.background = element_rect(fill = "black"), 
+        plot.background = element_rect(fill = "black"))
+
+print(diag_plot)
+```
+
+```{r}
+# Define filename with the trim settings for record-keeping
+output_name <- paste0("alignment_final_T", t_top, "_B", t_bottom, "_L", t_left, "_R", t_right, ".png")
+
+# Save the ggplot object
+ggsave(
+  filename = file.path(BASE_DIR, output_name),
+  plot = diag_plot,
+  width = 12,
+  height = 12,
+  dpi = 300,
+  bg = "black" # Ensures the background stays dark
+)
+
+message("Plot saved to: ", output_name)
+```
+
+```{r}
+# (Section VII was moved up to Section IV.5 to ensure coordinate matching)
+```
+
+```{r}
+# ==============================================================================
+# 1. LOAD DATA & LOOKUP TABLE
+# ==============================================================================
+# Load the full sparse matrix (if not already in memory)
+counts <- Seurat::Read10X_h5(file.path(BASE_DIR, "binned_outputs/square_002um/filtered_feature_bc_matrix.h5"))
+
+# Load the lookup table created in the previous step
+lookup_table <- fread(file.path(BASE_DIR, "final_polygon_to_bin_lookup.csv"))
+lookup_table <- lookup_table[!is.na(id)] # Keep only bins assigned to a polygon
+
+# ==============================================================================
+# 2. AGGREGATE COUNTS BY POLYGON ID
+# ==============================================================================
+message("Aggregating 2um bins into polygons...")
+
+# Ensure barcodes match the matrix columns
+valid_barcodes <- intersect(lookup_table$barcode, colnames(counts))
+lookup_table <- lookup_table[barcode %in% valid_barcodes]
+
+# Create a sparse mapping matrix (Bins x Polygons)
+# This is a mathematically efficient way to sum columns by group
+bin_idx <- match(lookup_table$barcode, colnames(counts))
+poly_factor <- as.factor(lookup_table$id)
+poly_idx <- as.numeric(poly_factor)
+
+mapper <- sparseMatrix(
+  i = bin_idx,
+  j = poly_idx,
+  x = 1,
+  dims = c(ncol(counts), nlevels(poly_factor))
+)
+
+# Perform the aggregation: Genes x Polygons
+agg_matrix <- counts %*% mapper
+colnames(agg_matrix) <- levels(poly_factor)
+
+# ==============================================================================
+# 3. SEURAT PROCESSING & UMAP
+# ==============================================================================
+message("Creating Seurat object and running UMAP...")
+
+# Create the object (now each 'cell' is one of your polygons)
+poly_seurat <- CreateSeuratObject(counts = agg_matrix, project = "Segmented_Polygons")
+
+# Standard Single-Cell Pipeline
+poly_seurat <- poly_seurat %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  FindNeighbors(dims = 1:20) %>%
+  FindClusters(resolution = 0.8) %>%
+  RunUMAP(dims = 1:20)
+
+# ==============================================================================
+# 4. VISUALIZATION
+# ==============================================================================
+
+# Plot 1: UMAP
+p1 <- DimPlot(poly_seurat, reduction = "umap", label = TRUE) + 
+  ggtitle("UMAP of Segmented Polygons")
+
+# Plot 2: Spatial Cluster Map
+# Link clusters back to spatial coordinates for a final check
+cluster_data <- data.frame(
+  id = colnames(poly_seurat),
+  cluster = Idents(poly_seurat)
+)
+
+# Join cluster info back to the mask for plotting
+mask_with_clusters <- mask_sf %>% left_join(cluster_data, by = "id")
+
+# 1. Define the plot object
+p2 <- ggplot() +
+  geom_sf(data = mask_with_clusters, aes(fill = cluster), color = "white", size = 0.1) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Clusters")
+
+# 2. Save the file to your working directory
+# Using a wide 'width' and shorter 'height' forces a horizontal perspective
+ggsave(
+  filename = file.path(BASE_DIR, "anterior_midgut_plot.png"), 
+  plot = p2, 
+  width = 12,       # Increases horizontal space
+  height = 6,       # Keeps it from being too tall
+  units = "in", 
+  dpi = 300         # High resolution for zooming in on your PC
+)
+
+print(p1)
+print(p2)
+
+# Save the object
+saveRDS(poly_seurat, file.path(BASE_DIR, "segmented_polygons_seurat.rds"))
+```
+
+```{r}
+# Find markers for all clusters
+all_markers <- FindAllMarkers(poly_seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# View top 2 genes per cluster
+top_markers <- all_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+print(top_markers)
+
+# Plot the top markers
+FeaturePlot(poly_seurat, features = unique(top_markers$gene)[1:4])
+```
+
+```{r}
+# Check for a few key anterior markers 
+VlnPlot(poly_seurat, features = c("hth", "Amy-p", "Dl"), slot = "counts")
+```
+
+```{r}
+seurat_object <- readRDS("/home/mattia/Thesis/Single-cell/seurat_ctrl_with_metadata.rds")
+
+# FILTER: Keep only polygons with at least 1 count (ideally more)
+# SCTransform usually needs a minimum of ~50-100 counts to be stable
+SCT_seurat <- subset(poly_seurat, subset = nCount_RNA > 0)
+
+# 1. Re-normalize your Spatial Polygon Object with SCT
+SCT_seurat <- SCTransform(SCT_seurat, verbose = TRUE)
+
+# 2. Ensure your SC Reference is also SCT-normalized
+seurat_object <- SCTransform(seurat_object) 
+
+# 3. Find Anchors using SCT
+anchors <- FindTransferAnchors(
+  reference = seurat_object,
+  query = SCT_seurat,
+  normalization.method = "SCT",
+  reference.assay = "SCT",
+  query.assay = "SCT",
+  dims = 1:20
+)
+
+# 4. Transfer the Labels
+predictions <- TransferData(
+  anchorset = anchors,
+  refdata = seurat_object@meta.data[["celltype"]], # Ensure this column name exists in sc_reference
+  prediction.assay = TRUE,
+  weight.reduction = SCT_seurat[["pca"]],
+  dims = 1:20
+)
+
+# Add scores back to the Seurat object
+SCT_seurat[["predictions"]] <- CreateAssayObject(data = predictions@data)
+```
+
+```{r}
+# 1. Get the prediction scores matrix
+# This assumes your predictions are in an assay called 'predictions'
+prob_matrix <- GetAssayData(SCT_seurat, assay = "predictions", layer = "data")
+
+# 2. Find the index of the max score for each column (polygon)
+# We exclude the 'max' and 'prediction.score.max' rows if they exist
+type_rows <- rownames(prob_matrix)[!grepl("max", rownames(prob_matrix))]
+clean_matrix <- prob_matrix[type_rows, ]
+
+# 3. Identify the most likely cell type per ID
+max_type <- apply(clean_matrix, 2, function(x) type_rows[which.max(x)])
+
+# 4. Create a lookup dataframe
+winning_types <- data.frame(
+  id = names(max_type),
+  top_celltype = max_type,
+  confidence = apply(clean_matrix, 2, max) # Optional: keep the score for transparency
+)
+```
+
+```{r}
+# Join the winning type to your spatial mask
+mask_with_winners <- mask_with_clusters %>%
+  left_join(winning_types, by = "id")
+
+# Plot the categorical map
+p_final <- ggplot() +
+  geom_sf(data = mask_with_winners, aes(fill = top_celltype), color = "white", size = 0.05) +
+  scale_fill_brewer(palette = "Set3", name = "Predicted Type") + # Better for discrete types
+  theme_minimal() +
+  labs(title = "Predicted Cell Type") +
+  theme(legend.position = "bottom")
+
+# Save as a horizontal high-res image to maintain organization
+ggsave(file.path(BASE_DIR, "most_likely_celltypes.png"), p_final, width = 14, height = 6, dpi = 300)
+```
+
+```{r}
+# Global distribution of predicted cell types
+global_summary <- mask_with_winners %>%
+  st_drop_geometry() %>%
+  count(top_celltype) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  arrange(desc(percentage))
+
+print(global_summary)
+```
+
+```{r}
+# We use the X-coordinate of the polygon centroids as a proxy for "Length"
+centroids <- st_coordinates(st_centroid(mask_with_winners))
+mask_with_winners$x_pos <- centroids[, 1]
+
+ggplot(mask_with_winners, aes(x = x_pos, fill = top_celltype)) +
+  geom_density(alpha = 0.6, position = "fill") + 
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Cell Type Proportions Along the Midgut Axis",
+       x = "Anterior (Left) to Posterior (Right)",
+       y = "Relative Proportion") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# Divide the gut into 10 longitudinal bins
+mask_with_winners <- mask_with_winners %>%
+  mutate(bin = ntile(x_pos, 10))
+
+full_length_summary <- mask_with_winners %>%
+  st_drop_geometry() %>%
+  group_by(bin, top_celltype) %>%
+  tally() %>%
+  group_by(bin) %>%
+  mutate(pct = (n / sum(n)) * 100) %>%
+  # Reshape for a clean table
+  tidyr::pivot_wider(id_cols = bin, names_from = top_celltype, values_from = pct, values_fill = 0)
+
+print(full_length_summary)
+```
+
+```{r}
+# 1. Identify the ISC row name
+isc_row <- "ISC" # Ensure this matches your sc_reference exactly
+
+# 2. Extract scores as a named vector
+isc_probs <- SCT_seurat[["predictions"]]@data[isc_row, ]
+
+# 3. Create a lookup table
+isc_lookup <- data.frame(
+  id = names(isc_probs), 
+  isc_score = as.numeric(isc_probs)
+)
+
+# 4. Join to your sf object using the 'id' column
+mask_with_winners <- mask_with_winners %>%
+  left_join(isc_lookup, by = "id")
+
+# 5. Handle any polygons that didn't have a score (the filtered ones)
+mask_with_winners$isc_score[is.na(mask_with_winners$isc_score)] <- 0
+```
+
+```{r}
+# Calculate x-position if not already done
+centroids <- st_coordinates(st_centroid(mask_with_winners))
+mask_with_winners$x_pos <- centroids[, 1]
+
+# Plotting the "Stemness" Gradient
+ggplot(mask_with_winners, aes(x = x_pos, y = isc_score)) +
+  geom_point(aes(color = isc_score), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "gam", color = "black", linetype = "dashed") +
+  scale_color_viridis_c(option = "magma") +
+  theme_minimal() +
+  labs(title = "ISC Score Distribution Across Midgut Length",
+       x = "Anterior ———> Posterior",
+       y = "ISC Probability Score")
+```
+
+```{r}
+isc_summary_table <- mask_with_winners %>%
+  st_drop_geometry() %>%
+  group_by(cluster) %>% # Using your anatomical clusters
+  summarise(
+    Mean_ISC_Score = mean(isc_score, na.rm = TRUE),
+    Total_Polygons = n(),
+    High_Confidence_Count = sum(isc_score > 0.5, na.rm = TRUE)
+  ) %>%
+  mutate(ISC_Density_Ratio = High_Confidence_Count / Total_Polygons) %>%
+  arrange(desc(Mean_ISC_Score))
+
+print(isc_summary_table)
+```
+

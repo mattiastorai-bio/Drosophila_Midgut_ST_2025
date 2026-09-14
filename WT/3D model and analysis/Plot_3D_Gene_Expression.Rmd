@@ -1,0 +1,277 @@
+---
+title: "3D Spatial Gene Expression Plotter"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(rgl)
+library(Rvcg)
+library(Seurat)
+library(dplyr)
+library(viridis)
+
+# Initialize rgl for HTML knitting
+setupKnitr(autoprint = TRUE)
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# Change this variable to plot any gene of interest
+target_gene <- "CG5767" 
+```
+
+## 1. Setup Directories
+Load the Blender 3D models and SWC centrelines.
+
+```{r define_dirs}
+blender_dir <- "/home/mattia/Thesis/3D model"
+swc_dir <- "/mnt/d/BlackieGasparEtAl2024-sourceData/BlackieGasparEtAl2024-sourceData/OregonR/Centrelines"
+```
+
+## 2. Load and Align 3D Meshes
+
+We import the gut mesh and align the M4T centreline perfectly to its center of mass, utilizing the same uniform scaling factor as the established model.
+
+```{r load_meshes}
+# Load Meshes
+gut_mesh    <- vcgImport(file.path(blender_dir, "gut.obj"))
+
+# Load Centreline
+swc_file <- file.path(swc_dir, "M4T.swc")
+centreline <- read.table(swc_file, comment.char = "#")
+colnames(centreline) <- c("id", "type", "x", "y", "z", "radius", "parent")
+
+# Align Centreline to Gut Mesh mathematically
+c_pts <- centreline[, c("x", "y", "z")]
+gut_pts <- t(gut_mesh$vb[1:3, ])
+
+c_center <- colMeans(c_pts)
+gut_center <- colMeans(gut_pts)
+
+# Shift to 0,0,0
+c_aligned <- sweep(c_pts, 2, c_center, "-")
+
+# Scale uniformly by 1.20 (based on previous optimal alignment)
+c_aligned <- c_aligned * 1.20
+
+# Shift to Gut's Center of Mass
+c_aligned <- sweep(c_aligned, 2, gut_center, "+")
+
+# Overwrite with perfectly aligned coordinates
+centreline$x <- c_aligned[, "x"]
+centreline$y <- c_aligned[, "y"]
+centreline$z <- c_aligned[, "z"]
+
+# Calculate cumulative percentage length along the centreline
+pts <- as.matrix(centreline[, c("x", "y", "z")])
+dists <- sqrt(rowSums((pts[-1,] - pts[-nrow(pts),])^2))
+centreline$cum_dist <- c(0, cumsum(dists))
+centreline$pct_length <- centreline$cum_dist / max(centreline$cum_dist)
+```
+
+## 3. Map Transcriptomics Data
+
+We load the single-cell data with transferred spatial pseudotime and map it onto the 3D centreline coordinates.
+
+```{r map_data}
+seurat_path <- "../Random data/sc_with_spatial_scores.rds"
+if (!file.exists(seurat_path)) stop("Seurat object not found.")
+
+seurat_obj <- readRDS(seurat_path)
+
+# Use Smoothed Pseudotime for positional mapping (scale 0-100)
+pt_values <- seurat_obj$Smoothed_Pseudotime
+
+# Filter cells lacking pseudotime
+valid_cells <- !is.na(pt_values)
+seurat_obj <- subset(seurat_obj, cells = Cells(seurat_obj)[valid_cells])
+pt_values <- seurat_obj$Smoothed_Pseudotime
+
+# Interpolation helper function
+interpolate_coord <- function(target_pct, cline) {
+  if (is.na(target_pct)) return(c(NA, NA, NA))
+  
+  idx_after <- which(cline$pct_length >= target_pct)[1]
+  if (is.na(idx_after)) return(as.numeric(cline[nrow(cline), c("x", "y", "z")]))
+  if (idx_after == 1) return(as.numeric(cline[1, c("x", "y", "z")]))
+  
+  idx_before <- idx_after - 1
+  pct_before <- cline$pct_length[idx_before]
+  pct_after <- cline$pct_length[idx_after]
+  
+  ratio <- ifelse(pct_after == pct_before, 0, (target_pct - pct_before) / (pct_after - pct_before))
+  
+  coord_before <- as.numeric(cline[idx_before, c("x", "y", "z")])
+  coord_after <- as.numeric(cline[idx_after, c("x", "y", "z")])
+  
+  return(coord_before + ratio * (coord_after - coord_before))
+}
+
+# Map 0-100 pseudotime to 0.05-0.95 physical length (margins added for biological realism)
+mapped_pcts <- 0.05 + 0.90 * (pt_values / 100)
+
+mapped_coords <- t(sapply(mapped_pcts, interpolate_coord, cline = centreline))
+seurat_obj$Mesh_X <- mapped_coords[, 1]
+seurat_obj$Mesh_Y <- mapped_coords[, 2]
+seurat_obj$Mesh_Z <- mapped_coords[, 3]
+```
+
+## 4. Map Gene Expression to Gut Mesh (Single-Cell)
+
+To completely optimize the 3D rendering, we now project the gene expression directly onto the 3D gut mesh itself rather than drawing thousands of individual spheres. We do this by mathematically smoothing the expression along the pseudotime trajectory using LOESS, and then mapping each gut vertex to its closest point on that trajectory!
+
+```{r extract_expression_and_map}
+# Switch to SCT assay if available
+if ("SCT" %in% Assays(seurat_obj)) {
+  DefaultAssay(seurat_obj) <- "SCT"
+}
+
+if (!target_gene %in% rownames(seurat_obj)) {
+  stop(paste("Target gene", target_gene, "not found in the Seurat object."))
+}
+
+expr_data <- FetchData(seurat_obj, vars = target_gene)[[1]]
+expr_data_log <- log1p(expr_data)
+
+# 1. Smooth expression along pseudotime to create a continuous profile
+lo_sc <- loess(expr_data_log ~ pt_values, span = 0.2, control = loess.control(surface = "direct"))
+
+# 2. Predict expression at each node of the centreline
+# Reverse the mapping formula: mapped_pcts = 0.05 + 0.90 * (pt / 100) -> pt = (pct - 0.05) / 0.90 * 100
+pt_nodes <- (centreline$pct_length - 0.05) / 0.90 * 100
+
+# Clamp pt_nodes to the min/max of pt_values to prevent LOESS extrapolation crashes!
+pt_nodes_sc_clamped <- pmax(min(pt_values), pmin(max(pt_values), pt_nodes))
+node_expr_sc <- predict(lo_sc, newdata = pt_nodes_sc_clamped)
+node_expr_sc[is.na(node_expr_sc)] <- 0
+node_expr_sc[node_expr_sc < 0] <- 0
+
+# 3. For each vertex on the gut mesh, find the closest centreline node
+gut_verts <- t(gut_mesh$vb[1:3, ])
+c_pts <- as.matrix(centreline[, c("x", "y", "z")])
+
+cat("Mapping", nrow(gut_verts), "mesh vertices to centreline...\n")
+nearest_node_idx <- integer(nrow(gut_verts))
+for(i in 1:nrow(gut_verts)) {
+  dsq <- (c_pts[,1] - gut_verts[i,1])^2 + 
+         (c_pts[,2] - gut_verts[i,2])^2 + 
+         (c_pts[,3] - gut_verts[i,3])^2
+  nearest_node_idx[i] <- which.min(dsq)
+}
+
+# 4. Assign smoothed expression to each vertex and colorize
+vert_expr_sc <- node_expr_sc[nearest_node_idx]
+
+color_pal <- viridis(100, option = "magma") 
+max_expr <- max(vert_expr_sc)
+if (max_expr == 0) max_expr <- 1 
+vert_scaled <- (vert_expr_sc - min(vert_expr_sc)) / (max_expr - min(vert_expr_sc))
+vert_scaled[is.na(vert_scaled)] <- 0
+color_idx <- round(vert_scaled * 99) + 1
+
+# Clone mesh to avoid overwriting base for later plots
+gut_mesh_sc <- gut_mesh
+gut_mesh_sc$material$color <- color_pal[color_idx]
+```
+
+## 5. Render 3D Scene (Single-Cell)
+
+Because we eliminated thousands of floating 3D spheres, this renders instantly and perfectly paints the model!
+
+```{r render_scene, rgl=TRUE}
+open3d()
+
+# Base Mesh (now fully colored by gene expression!)
+shade3d(gut_mesh_sc, alpha = 1.0) 
+
+# Centreline
+lines3d(centreline$x, centreline$y, centreline$z, color = "black", lwd = 2, alpha = 0.5)
+
+# Adjust camera view
+aspect3d("iso")
+view3d(theta = 45, phi = 30, zoom = 0.8)
+
+# Add floating title
+text3d(x = min(gut_pts[,1]), y = max(gut_pts[,2]), z = max(gut_pts[,3]), 
+       texts = paste("Gene:", target_gene, "(Single-Cell Projection)"), 
+       col = "black", cex = 2)
+```
+
+## 6. Map Spatial Transcriptomics (ST) Data
+
+We perform the exact same mapping logic for the Spatial Transcriptomics dataset.
+
+```{r map_st_data}
+st_path <- "../Random data/merged_guts.rds"
+if (!file.exists(st_path)) stop("ST object not found.")
+
+st_obj <- readRDS(st_path)
+st_obj <- subset(st_obj, cells = grep("^Gut3_", Cells(st_obj), value = TRUE))
+
+pt_values_st <- st_obj$Spatial_Pseudotime
+valid_spots <- !is.na(pt_values_st)
+st_obj <- subset(st_obj, cells = Cells(st_obj)[valid_spots])
+pt_values_st <- st_obj$Spatial_Pseudotime
+
+# Set correct assay (SCT or Segmented)
+if ("SCT" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "SCT"
+} else if ("Segmented" %in% Assays(st_obj)) {
+  DefaultAssay(st_obj) <- "Segmented"
+}
+
+if (!target_gene %in% rownames(st_obj)) {
+  warning(paste("Target gene", target_gene, "not found in the ST object. Plotting blank values."))
+  expr_data_st <- rep(0, ncol(st_obj))
+} else {
+  expr_data_st <- FetchData(st_obj, vars = target_gene)[[1]]
+}
+
+expr_data_log_st <- log1p(expr_data_st)
+
+# 1. Smooth expression along pseudotime
+lo_st <- loess(expr_data_log_st ~ pt_values_st, span = 0.2, control = loess.control(surface = "direct"))
+
+# 2. Predict expression at each centreline node
+# Clamp to avoid ST LOESS extrapolation crashes
+pt_nodes_st_clamped <- pmax(min(pt_values_st), pmin(max(pt_values_st), pt_nodes))
+node_expr_st <- predict(lo_st, newdata = pt_nodes_st_clamped)
+node_expr_st[is.na(node_expr_st)] <- 0
+node_expr_st[node_expr_st < 0] <- 0
+
+# 3. Assign smoothed expression to each vertex and colorize
+# (We reuse the nearest_node_idx calculated earlier, saving computation time!)
+vert_expr_st <- node_expr_st[nearest_node_idx]
+
+max_expr_st <- max(vert_expr_st)
+if (max_expr_st == 0) max_expr_st <- 1 
+vert_scaled_st <- (vert_expr_st - min(vert_expr_st)) / (max_expr_st - min(vert_expr_st))
+vert_scaled_st[is.na(vert_scaled_st)] <- 0
+color_idx_st <- round(vert_scaled_st * 99) + 1
+
+gut_mesh_st <- gut_mesh
+gut_mesh_st$material$color <- color_pal[color_idx_st]
+```
+
+## 7. Render 3D Scene (ST)
+
+```{r render_scene_st, rgl=TRUE}
+open3d()
+
+# Base Mesh
+shade3d(gut_mesh_st, alpha = 1.0) 
+
+# Centreline
+lines3d(centreline$x, centreline$y, centreline$z, color = "black", lwd = 2, alpha = 0.5)
+
+# Adjust camera view
+aspect3d("iso")
+view3d(theta = 45, phi = 30, zoom = 0.8)
+
+# Add floating title
+text3d(x = min(gut_pts[,1]), y = max(gut_pts[,2]), z = max(gut_pts[,3]), 
+       texts = paste("Gene:", target_gene, "(Spatial Transcriptomics)"), 
+       col = "black", cex = 2)
+```
