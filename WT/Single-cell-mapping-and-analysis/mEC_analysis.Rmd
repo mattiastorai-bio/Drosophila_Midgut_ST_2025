@@ -1,0 +1,161 @@
+---
+title: "mEC Sub-Cluster Analysis & Similarity Mapping"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(htmlwidgets)
+library(pheatmap)
+```
+
+## 1. Load Data
+```{r load_data}
+path_sc <- "../../111125ST_def/Random data/sc_with_spatial_scores.rds"
+if(!file.exists(path_sc)) stop("Cannot locate single-cell object at ", path_sc)
+
+cat("Loading Single Cell Object...\n")
+sc_obj <- readRDS(path_sc)
+
+# Subset for mECs purely based on prior cell classifications
+# Using the user-confirmed 'celltype' metadata column
+mEC_cells <- subset(sc_obj, subset = celltype == "mEC")
+# If 'mEC' is a partial match, use: grepl("mEC", celltype, ignore.case=TRUE)
+cat("Isolated", ncol(mEC_cells), "mEC cells out of", ncol(sc_obj), "total cells.\n")
+```
+
+## 2. Re-Clustering & 3D UMAP Generation
+We re-process the mEC subset uniquely and generate a 3-dimensional UMAP to visualize the structural divide between the two distinct populations.
+
+```{r clustering_3d}
+# Standard internal SC normalization geometry
+# Scaling nfeatures to capture more subtle variance in the mEC pop
+mEC_cells <- FindVariableFeatures(mEC_cells, nfeatures = 3000)
+mEC_cells <- ScaleData(mEC_cells)
+mEC_cells <- RunPCA(mEC_cells, npcs = 30)
+
+# Run UMAP natively (2D for genetic space)
+mEC_cells <- RunUMAP(mEC_cells, dims = 1:20)
+# Decrease k.param slightly to make boundaries sharper
+mEC_cells <- FindNeighbors(mEC_cells, dims = 1:20, k.param = 20)
+
+# Aggressive resolution to capture the split seen by eye
+mEC_cells <- FindClusters(mEC_cells, resolution = 0.8)
+
+# Extract rendering coordinates and inject Space as the 3rd Dimension
+umap_coords <- as.data.frame(Embeddings(mEC_cells, "umap"))
+umap_coords$Space <- mEC_cells$Smoothed_Pseudotime
+umap_coords$Cluster <- as.character(mEC_cells$seurat_clusters)
+
+# Define global output directory constraints
+dir.create("../figures/mEC_Analysis", recursive=TRUE, showWarnings=FALSE)
+
+cat("✓ Re-clustering complete. Defined", length(unique(mEC_cells$seurat_clusters)), "clusters natively.\n")
+
+# 3D Plot for Cluster Imputation (2 Genetic + 1 Spatial Phase)
+p_3d_cluster <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Cluster, colors = c("#E64B35", "#4DBBD5", "#00A087"),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "mEC Sub-Clusters (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_cluster, file = "../figures/mEC_Analysis/3D_UMAP_mEC_Clusters.html")
+p_3d_cluster
+```
+
+```{r analysis}
+## 3. 3D UMAP Feature Projections
+#Visualizing top driving phenotypic parameters (such as structural layout spatiality) directly across the 3D space.
+
+# Visualizing top driving phenotypic parameters across the Hybrid Space
+p_3d_feature <- plot_ly(data = umap_coords, 
+                        x = ~umap_1, y = ~umap_2, z = ~Space, 
+                        color = ~Space, colors = colorRamp(c("navy", "yellow", "firebrick3")),
+                        type = "scatter3d", mode = "markers",
+                        marker = list(size = 3, opacity = 0.8)) %>%
+    layout(title = "mEC Spatial Topography (X/Y: Genetic, Z: Space)",
+           scene = list(xaxis = list(title = "UMAP_1 (Genetic)"),
+                        yaxis = list(title = "UMAP_2 (Genetic)"),
+                        zaxis = list(title = "Smoothed Pseudotime (Space)")))
+
+htmlwidgets::saveWidget(p_3d_feature, file = "../figures/mEC_Analysis/3D_Hybrid_mEC_Pseudotime.html")
+p_3d_feature
+```
+
+## 4. Differential Gene Expression (DGE) 
+Identifying the unique transcription boundaries pushing the limits of the two detected pools.
+
+```{r dge_analysis}
+Idents(mEC_cells) <- "seurat_clusters"
+cat("Running FindAllMarkers to isolate distinct expression limits...\n")
+
+mEC_markers <- FindAllMarkers(mEC_cells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top_mEC <- mEC_markers %>% group_by(cluster) %>% slice_max(n = 15, order_by = avg_log2FC)
+
+write.csv(mEC_markers, "../figures/mEC_Analysis/mEC_Cluster_DGE.csv", row.names=FALSE)
+
+cat("\n--- TOP DIFFERENTIAL MARKERS ---\n")
+library(knitr)
+# Safely handle potential empty marker results
+if(nrow(top_mEC) > 0) {
+    print(kable(top_mEC %>% dplyr::select(cluster, gene, avg_log2FC, p_val_adj), format="pipe"))
+} else {
+    cat("No significant markers found for the current clusters.\n")
+}
+```
+
+## 5. Global Celltype Similarity Matrix
+Computing average expression profiles seamlessly across all functional cell classes inside the original dataset to trace where the specific isolated mEC clusters map.
+
+```{r similarity_matrix, fig.width=10, fig.height=8}
+# Re-integrate the newly modeled mEC identities into the master dataset structurally
+sc_obj$mEC_Split_Identity <- as.character(sc_obj$celltype)
+
+# Safely swap purely the mEC cells for their new structurally defined IDs
+new_ids <- paste0("mEC_Subcluster_", mEC_cells$seurat_clusters)
+sc_obj$mEC_Split_Identity[Cells(mEC_cells)] <- new_ids
+
+Idents(sc_obj) <- "mEC_Split_Identity"
+
+cat("Computing holistic AverageExpression arrays across all structural lineages...\n")
+# Get current default assay to be safe
+def_assay <- DefaultAssay(sc_obj)
+avg_exp <- AverageExpression(sc_obj, assays = def_assay)
+
+# Extract the matrix from the list (Seurat V4/V5 returns a list of matrices)
+if (is.list(avg_exp)) {
+    exp_matrix <- as.matrix(avg_exp[[1]])
+} else {
+    exp_matrix <- as.matrix(avg_exp)
+}
+
+# Ensure there are no NA/Inf values which break correlation
+exp_matrix[is.na(exp_matrix)] <- 0
+
+cat("Calculating Pearson correlation matrix on assay:", names(avg_exp)[1], "\n")
+sim_matrix <- cor(exp_matrix, method = "pearson")
+
+# Trim generic uninformative or ambiguous arrays before plotting
+valid_cols <- !grepl("ambiguous|unknown", colnames(sim_matrix), ignore.case=TRUE)
+clean_matrix <- sim_matrix[valid_cols, valid_cols]
+
+png("../figures/mEC_Analysis/mEC_Similarity_Heatmap.png", width=3200, height=2600, res=300)
+pheatmap(clean_matrix, 
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         display_numbers = FALSE,
+         fontsize_row = 12, fontsize_col = 12,
+         main = "Global Transcriptomic Similarity Matrix (Pearson)")
+dev.off()
+
+cat("✓ Execution completed. Matrices stored securely in figures directory.\n")
+```

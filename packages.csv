@@ -505,6 +505,17 @@ ggplot2,WT/Gut structure analysis/Global_Transcriptional_Comparison_sc.Rmd
 gridExtra,WT/Gut structure analysis/Global_Transcriptional_Comparison_sc.Rmd
 reshape2,WT/Gut structure analysis/Global_Transcriptional_Comparison_sc.Rmd
 viridis,WT/Gut structure analysis/Global_Transcriptional_Comparison_sc.Rmd
+Seurat,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+cluster,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+dendextend,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+dplyr,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+factoextra,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+ggplot2,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+knitr,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+reshape2,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+rioja,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+stringr,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
+zoo,WT/Gut structure analysis/Hierarchical_Clustering_Of_Regions.Rmd
 RColorBrewer,WT/Gut structure analysis/gut3_analysis.Rmd
 Seurat,WT/Gut structure analysis/gut3_analysis.Rmd
 clusterProfiler,WT/Gut structure analysis/gut3_analysis.Rmd
@@ -582,6 +593,13 @@ plotly,WT/Single-cell-mapping-and-analysis/LFC_analysis.Rmd
 Seurat,WT/Single-cell-mapping-and-analysis/generate_renamed_heatmaps.R
 dplyr,WT/Single-cell-mapping-and-analysis/generate_renamed_heatmaps.R
 pheatmap,WT/Single-cell-mapping-and-analysis/generate_renamed_heatmaps.R
+Seurat,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+dplyr,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+ggplot2,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+htmlwidgets,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+knitr,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+pheatmap,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
+plotly,WT/Single-cell-mapping-and-analysis/mEC_analysis.Rmd
 Matrix,WT/Single-cell-mapping-and-analysis/sc_spatial_dec.Rmd
 Matrix.utils,WT/Single-cell-mapping-and-analysis/sc_spatial_dec.Rmd
 Seurat,WT/Single-cell-mapping-and-analysis/sc_spatial_dec.Rmd
